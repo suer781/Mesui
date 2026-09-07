@@ -5,16 +5,25 @@ import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.QrCode2
+import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -28,14 +37,17 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
-import chat.dc.app.R
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import chat.dc.app.R
+import chat.dc.app.nearby.NearbyDiscovery
 import com.google.zxing.ResultPoint
 import com.journeyapps.barcodescanner.BarcodeCallback
 import com.journeyapps.barcodescanner.BarcodeResult
@@ -44,13 +56,114 @@ import kotlinx.coroutines.delay
 import java.security.SecureRandom
 
 /**
- * 添加好友子页（动态分帧二维码）：
- * - 我的码：数据帧与「当场新随机」的噪声帧交错播放（280ms/帧），每两帧画面都不同，
- *   单帧/单张截图不含完整信息
- * - 扫对方的码：相机连续采集，集齐全部数据帧且 ≥3 秒才完成 → 安全码核对 → 蓝牙协商
+ * 进入即请求「发现附近的设备」权限（未授权才弹）。
+ * 出示侧后续用它做 BLE 广播、扫码侧用它做 BLE 扫描/连接（蓝牙传输阶段接入）。
  */
 @Composable
-fun AddFriendScreen() {
+private fun RequestNearbyPermissionOnEntry() {
+    val context = LocalContext.current
+    val discovery = remember { NearbyDiscovery(context) }
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { }
+    LaunchedEffect(Unit) {
+        if (!discovery.hasPermissions()) {
+            launcher.launch(discovery.requiredPermissions())
+        }
+    }
+}
+
+/**
+ * 加好友入口：先选角色。安全约束——「出示我的码」与「扫码添加」绝不同屏，
+ * 要么别人扫你、要么你扫别人，二选一进入各自的独立页。
+ */
+@Composable
+fun AddFriendRoleScreen(onShow: () -> Unit, onScan: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+    ) {
+        Text(
+            stringResource(R.string.add_friend_title),
+            style = MaterialTheme.typography.titleLarge,
+            modifier = Modifier.padding(bottom = 4.dp),
+        )
+        Text(
+            stringResource(R.string.add_friend_role_hint),
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.padding(bottom = 12.dp),
+        )
+        RoleCard(
+            tag = "role_show",
+            icon = Icons.Filled.QrCode2,
+            container = MaterialTheme.colorScheme.primary,
+            title = stringResource(R.string.add_friend_role_show),
+            desc = stringResource(R.string.add_friend_role_show_desc),
+            onClick = onShow,
+        )
+        RoleCard(
+            tag = "role_scan",
+            icon = Icons.Filled.QrCodeScanner,
+            container = MaterialTheme.colorScheme.tertiary,
+            title = stringResource(R.string.add_friend_role_scan),
+            desc = stringResource(R.string.add_friend_role_scan_desc),
+            onClick = onScan,
+        )
+    }
+}
+
+@Composable
+private fun RoleCard(
+    tag: String,
+    icon: ImageVector,
+    container: Color,
+    title: String,
+    desc: String,
+    onClick: () -> Unit,
+) {
+    Card(
+        shape = MaterialTheme.shapes.large,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp)
+            .clickable(onClick = onClick)
+            .testTag(tag),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .background(container, RoundedCornerShape(12.dp)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(icon, contentDescription = null, tint = Color.White)
+            }
+            Column(modifier = Modifier.padding(horizontal = 12.dp)) {
+                Text(title, style = MaterialTheme.typography.titleMedium)
+                Text(
+                    desc,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 「别人扫我」：只显示我的动态码。数据帧与当场新随机的噪声帧交错播放（280ms/帧），
+ * 每两帧画面都不同，单帧/单张截图不含完整信息。
+ */
+@Composable
+fun ShowMyCodeScreen() {
+    RequestNearbyPermissionOnEntry()
     val security = remember { SecureRandom() }
     val myPayload = remember { AddFriendPayload.generate() }
     val sid = remember {
@@ -58,7 +171,59 @@ fun AddFriendScreen() {
     }
     val dataFrames = remember(myPayload, sid) { FrameCodec.split(myPayload, sid) }
     var frameIdx by remember { mutableIntStateOf(0) }
+    var frameBmp by remember { mutableStateOf(QrCodec.encode(dataFrames[0], 480)) }
+    LaunchedEffect(dataFrames) {
+        while (true) {
+            frameIdx += 1
+            // 奇数帧放数据帧（顺序循环），偶数帧放一张当场新随机的噪声帧：
+            // 每两帧画面都不同；采集端靠 f=0 忽略噪声帧
+            val f = if (frameIdx % 2 == 1) {
+                dataFrames[(frameIdx / 2) % dataFrames.size]
+            } else {
+                FrameCodec.noiseFrame(sid, security)
+            }
+            frameBmp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+                QrCodec.encode(f, 480)
+            }
+            delay(280)
+        }
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            stringResource(R.string.add_friend_role_show),
+            style = MaterialTheme.typography.titleLarge,
+            modifier = Modifier.padding(bottom = 8.dp),
+        )
+        Text(stringResource(R.string.add_friend_show_hint), style = MaterialTheme.typography.bodyMedium)
+        Image(
+            bitmap = frameBmp.asImageBitmap(),
+            contentDescription = stringResource(R.string.add_friend_qr_desc),
+            modifier = Modifier
+                .size(240.dp)
+                .padding(vertical = 8.dp)
+                .testTag("qr_image"),
+        )
+        Text(
+            stringResource(R.string.add_friend_pending_core),
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(top = 12.dp),
+        )
+    }
+}
 
+/**
+ * 「我扫别人」：只开相机采集对方动态码，集齐全部数据帧且 ≥3 秒才完成。
+ * 完成后的核对/蓝牙连接在后续阶段接入。
+ */
+@Composable
+fun ScanToAddScreen() {
+    RequestNearbyPermissionOnEntry()
     val context = LocalContext.current
     var cameraGranted by remember {
         mutableStateOf(
@@ -74,25 +239,6 @@ fun AddFriendScreen() {
     var collectorState by remember { mutableStateOf<FrameCollector.State?>(null) }
     val peerPayload = collectorState?.takeIf { it.complete }?.payload
 
-    // 280ms/帧，QR 编码较重：离主线程编码，位图仅在换帧时重建
-    var frameBmp by remember { mutableStateOf(QrCodec.encode(dataFrames[0], 480)) }
-    LaunchedEffect(dataFrames) {
-        while (true) {
-            frameIdx += 1
-            // 奇数帧放数据帧（顺序循环），偶数帧放一张当场新随机的噪声帧：
-            // 每两帧画面都不同，肉眼是持续变动的图案；采集端靠 f=0 忽略噪声帧
-            val f = if (frameIdx % 2 == 1) {
-                dataFrames[(frameIdx / 2) % dataFrames.size]
-            } else {
-                FrameCodec.noiseFrame(sid, security)
-            }
-            frameBmp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
-                QrCodec.encode(f, 480)
-            }
-            delay(280)
-        }
-    }
-
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -101,24 +247,14 @@ fun AddFriendScreen() {
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
-            text = stringResource(R.string.add_friend_title),
+            stringResource(R.string.add_friend_role_scan),
             style = MaterialTheme.typography.titleLarge,
-            modifier = Modifier.padding(bottom = 12.dp),
+            modifier = Modifier.padding(bottom = 8.dp),
         )
-        Text(stringResource(R.string.add_friend_show_hint), style = MaterialTheme.typography.bodyMedium)
-        Image(
-            bitmap = frameBmp.asImageBitmap(),
-            contentDescription = stringResource(R.string.add_friend_qr_desc),
-            modifier = Modifier
-                .size(240.dp)
-                .padding(vertical = 8.dp)
-                .testTag("qr_image"),
-        )
-
         Text(
             stringResource(R.string.add_friend_scan),
             style = MaterialTheme.typography.titleSmall,
-            modifier = Modifier.padding(top = 8.dp, bottom = 4.dp),
+            modifier = Modifier.padding(bottom = 4.dp),
         )
         when {
             peerPayload != null -> Card(modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) {

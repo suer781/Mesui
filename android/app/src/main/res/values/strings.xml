@@ -21,7 +21,12 @@
     <string name="nearby_bonded">已配对</string>
     <string name="nearby_rssi">信号 %1$d dBm</string>
     <string name="add_friend_title">添加好友</string>
-    <string name="add_friend_show_hint">让对方扫描这个码（也把你的码给对方扫）</string>
+    <string name="add_friend_role_hint">选择添加方式：出示你的码让对方扫，或扫描对方的码</string>
+    <string name="add_friend_role_show">出示我的码</string>
+    <string name="add_friend_role_show_desc">让对方扫描你的动态码来添加你</string>
+    <string name="add_friend_role_scan">扫码添加</string>
+    <string name="add_friend_role_scan_desc">扫描对方的动态码来添加对方</string>
+    <string name="add_friend_show_hint">让对方扫描这个码</string>
     <string name="add_friend_qr_desc">我的加好友二维码</string>
     <string name="add_friend_scan">扫描对方的动态码</string>
     <string name="add_friend_grant_camera">授权相机开始扫描</string>
