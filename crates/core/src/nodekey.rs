@@ -1,11 +1,11 @@
-//! 节点密钥轮换（风险登记 B2）——模式移植自微信支付平台证书轮换：
-//! - 轮换公告由**长期身份密钥**签名（对应微信支付对平台证书的签发担保），
-//!   公告里带单调递增 `serial`（对应 `Wechatpay-Serial`）
-//! - 新旧密钥并行过渡窗（对应旧证书 5 年有效期的并行接受期）
+//! 节点密钥轮换：
+//! - 轮换公告由**长期身份密钥**签名，
+//!   公告里带单调递增 `serial`
+//! - 新旧密钥并行过渡窗
 //! - 联系人侧维护密钥环（key ring），按 serial 选钥匙、按有效期淘汰
 //!
-//! 语义：`node_key` 是本周期 iroh 节点公钥（拨号地址），与长期身份解耦
-//! （A1 决议）。追踪者最多跟到一个过渡窗内的临时节点。
+//! 语义：`node_key` 是本周期 iroh 节点公钥（拨号地址），与长期身份解耦。
+//! 追踪者最多跟到一个过渡窗内的临时节点。
 
 use crate::identity::{verify, Identity, NodeId};
 use crate::{CoreError, Result};
@@ -15,10 +15,10 @@ use std::collections::HashMap;
 
 /// 过渡窗默认时长：旧节点密钥在接受期内仍可拨（只读语义），之后淘汰。
 pub const DEFAULT_OVERLAP_MS: u64 = 7 * 24 * 60 * 60 * 1000; // 7 天
-/// 公告有效期上限（审计 B3）：身份钥一次失窃不得铸「百年公告」，
-/// 且撤销依赖同钥——短有效期天然限制失窃损失窗口。
+/// 公告有效期上限：身份钥一次失窃不得铸「百年公告」，
+/// 且撤销依赖同钥——短有效期限制失窃损失窗口。
 pub const MAX_VALIDITY_MS: u64 = 30 * 24 * 60 * 60 * 1000; // 30 天
-/// 红队 red10 修复：单身份公告缓存上限（防递增 serial 无界吃内存）
+/// 单身份公告缓存上限（防递增 serial 无界吃内存）
 pub const MAX_ANNOUNCEMENTS_PER_IDENTITY: usize = 32;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -27,7 +27,7 @@ pub struct NodeKeyAnnouncement {
     pub identity: NodeId,
     /// 本周期的 iroh 节点公钥（拨号地址的锚）
     pub node_key: NodeId,
-    /// 单调递增，收方按 serial 判新旧（Wechatpay-Serial 对应物）
+    /// 单调递增，收方按 serial 判新旧
     pub serial: u64,
     pub not_before_ms: u64,
     pub not_after_ms: u64,
@@ -103,7 +103,7 @@ impl NodeKeyRing {
     }
 
     /// 收到公告：先验签再入环。同 serial 视为重发覆盖；serial 不高于已知的直接丢弃。
-    /// 红队 red10 修复：单身份公告数上限——恶意联系人连发递增 serial 的合法公告
+    /// 单身份公告数上限——恶意联系人连发递增 serial 的合法公告
     /// 不再能无界吃内存（超出即逐出最旧，最高 serial 始终保留）。
     pub fn upsert(&mut self, ann: &NodeKeyAnnouncement, now_ms: u64) -> Result<()> {
         ann.verify()?;
@@ -136,7 +136,7 @@ impl NodeKeyRing {
         Ok(())
     }
 
-    /// 当前应拨的节点密钥：取**最高的未过期 serial**（微信支付同款「按 serial 取钥匙」）。
+    /// 当前应拨的节点密钥：取**最高的未过期 serial**。
     pub fn current(&self, identity: &NodeId, now_ms: u64) -> Option<&NodeId> {
         self.entries
             .get(identity)?
@@ -146,8 +146,8 @@ impl NodeKeyRing {
             .map(|e| &e.node_key)
     }
 
-    /// 审计 A2：导出全部公告供持久化（调用方写 SQLCipher/文件）。
-    /// 恢复后 serial 单调性由 upsert 的「拒绝低 serial」规则天然维持。
+    /// 导出全部公告供持久化（调用方写 SQLCipher/文件）。
+    /// 恢复后 serial 单调性由 upsert 的「拒绝低 serial」规则维持。
     pub fn state(&self) -> Vec<NodeKeyAnnouncement> {
         self.entries.values().flatten().cloned().collect()
     }

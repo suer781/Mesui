@@ -16,7 +16,7 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 
 /**
- * 相机已授权分支的运行时验证（用户真机命中的分支，此前无测试覆盖）：
+ * 相机已授权分支的运行时验证：
  * 授权后添加好友页必须出现取景器，且整页可滚动不裁剪。
  */
 @RunWith(RobolectricTestRunner::class)

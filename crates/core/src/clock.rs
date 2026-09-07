@@ -1,4 +1,4 @@
-//! 软件内部独立时钟（SP-8）：
+//! 软件内部独立时钟：
 //! 内部钟 = 系统钟读数 + 校准偏移。**永不修改系统时间**；
 //! 校准源优先级 = 网络（Android 系统自同步/HTTPS 时间）→ 蓝牙联系人交换。
 //!
@@ -7,7 +7,7 @@
 //!   用户或攻击者把系统钟往回拨，安全判定用的「现在」依然不回退
 //! - 校准偏移全部限幅（±24h）：单个毒源最多把钟推偏一天，不可能造出「过期票复活一年」
 //! - 蓝牙样本需 **3 人法定人数** 且最大共识簇 ≥60s 内一致——单个/成对毒联系人无法校准
-//! - 网络校准新鲜期内（6h）忽略蓝牙样本：有网时以网络为准（用户设计：网络优先）
+//! - 网络校准新鲜期内（6h）忽略蓝牙样本：有网时以网络为准
 
 use crate::identity::NodeId;
 use std::collections::HashMap;
@@ -17,12 +17,12 @@ pub const NETWORK_FRESH_MS: i64 = 6 * 60 * 60 * 1000;
 pub const MAX_RTT_MS: i64 = 5_000;
 pub const CLUSTER_TOLERANCE_MS: i64 = 60_000;
 pub const PEER_QUORUM: usize = 3;
-/// 网络双源交叉验证容差（审计 C5）：两源偏移差 ≤5s 视为一致
+/// 网络双源交叉验证容差：两源偏移差 ≤5s 视为一致
 pub const CROSS_CHECK_TOLERANCE_MS: i64 = 5_000;
-/// 红队 red6 修复：网络源（无认证）单次采纳的偏移变化上限——
+/// 网络源（无认证）单次采纳的偏移变化上限——
 /// 防止一致的双源把钟一次拉偏 20 分钟、把 ±5min 重放窗实际拉成 ±24h。
 pub const NETWORK_ADOPTION_CAP_MS: i64 = 2 * 60_000;
-/// 红队 red6 修复：网络采纳冷却——回拨速度（≤2min/10min）永远追不上
+/// 网络采纳冷却——回拨速度（≤2min/10min）永远追不上
 /// 真实时间前进，旧写入与「现在」的差距单调拉大，重放永不可行。
 pub const NETWORK_ADOPTION_COOLDOWN_MS: i64 = 10 * 60_000;
 
@@ -48,12 +48,12 @@ pub enum ClockError {
 pub struct InternalClock {
     network_offset_ms: Option<i64>,
     network_fresh_until: i64,
-    /// C5：双源交叉验证的挂起首读（来源 id，偏移）
+    /// 双源交叉验证的挂起首读（来源 id，偏移）
     pending_network: Option<(u8, i64)>,
-    /// red6：上次网络采纳时刻（本地钟），冷却期内忽略新的采纳
+    /// 上次网络采纳时刻（本地钟），冷却期内忽略新的采纳
     last_network_adopted_at: i64,
-    /// 审计 C6：只有**已验证联系人**（加好友流程产出）的校时交换才被接受——
-    /// 蓝牙范围内 3 台女巫设备凑法定人数的攻击路径就此封死
+    /// 只有**已验证联系人**（加好友流程产出）的校时交换才被接受——
+    /// 防止蓝牙范围内 3 台女巫设备凑满法定人数
     trusted_peers: HashMap<NodeId, ()>,
     peers: HashMap<NodeId, PeerSample>,
     /// 内部钟高水位（持久化字段，防回拨）
@@ -61,7 +61,7 @@ pub struct InternalClock {
     /// 本地钟高水位：检测系统钟被拨回（回滚攻击）
     local_high_water_ms: i64,
     /// 上次生效偏移：偏移变化时重置内部高水位基线（毒偏移撤离后不残留旧峰，
-    /// 审计 C3：否则毒偏移会把内部钟钉死在峰值，诚实时间戳全部判过旧）
+    /// 否则毒偏移会把内部钟钉死在峰值，诚实时间戳全部判过旧）
     last_offset_ms: i64,
     pub rollback_detected: bool,
 }
@@ -89,7 +89,7 @@ impl InternalClock {
     }
 
     /// 启动时从持久层恢复内部钟高水位（防回拨的跨重启记忆）。
-    /// 红队 red4 修复：持久层可能被篡改/损坏——u64::MAX 一类的值经 `as i64`
+    /// 持久层可能被篡改/损坏——u64::MAX 一类的值经 `as i64`
     /// 会回绕成负数毒化整条时间链，恢复值必须经过合理性钳制。
     pub fn restore_high_water(&mut self, persisted_ms: u64) {
         // 合理上界：2100-01-01 前后的毫秒数；超出视为持久层损坏，忽略
@@ -127,12 +127,12 @@ impl InternalClock {
         }
     }
 
-    /// 网络校时（优先源，审计 C5 修复）：**双源交叉验证**——
+    /// 网络校时（优先源）：**双源交叉验证**——
     /// 两个不同来源的偏移在 ±5s 内一致才采纳；单一来源永不采纳
-    /// （恶意 WiFi 单点平移重放窗/票据窗的路径就此封死）。
+    /// （防止恶意 WiFi 单点平移重放窗/票据窗）。
     /// `source_id`：来源标识（不同 NTP 服务器 / 不同 HTTPS 时间接口）。
     pub fn on_network_sync(&mut self, source_id: u8, local_ms: i64, network_ms: i64) {
-        // 红队 red5 修复：两输入均为外部可控，饱和减法防 i64 溢出 panic
+        // 两输入均为外部可控，饱和减法防 i64 溢出 panic
         let raw = network_ms.saturating_sub(local_ms);
         let clamped = raw.clamp(-MAX_CORRECTION_MS, MAX_CORRECTION_MS);
         match self.pending_network.take() {
@@ -140,9 +140,9 @@ impl InternalClock {
                 // 双源交叉验证：一致 → 采纳均值；分歧 → 双双弃用
                 if (prev_offset - clamped).abs() <= CROSS_CHECK_TOLERANCE_MS {
                     let adopted = (prev_offset + clamped) / 2;
-                    // red6 修复：相对上一次生效偏移的变化量限幅（无认证源不可大幅挪钟）
+                    // 相对上一次生效偏移的变化量限幅（无认证源不可大幅挪钟）
                     let delta = adopted.saturating_sub(self.last_offset_ms);
-                    // red6 修复：采纳冷却——距上次采纳不足 10 分钟，本次丢弃
+                    // 采纳冷却——距上次采纳不足 10 分钟，本次丢弃
                     let cooling = local_ms.saturating_sub(self.last_network_adopted_at)
                         < NETWORK_ADOPTION_COOLDOWN_MS;
                     if delta.abs() > NETWORK_ADOPTION_CAP_MS || cooling {
@@ -175,11 +175,11 @@ impl InternalClock {
         t3: i64,
         t4: i64,
     ) -> Result<i64, ClockError> {
-        // 审计 C6：只信已验证联系人——陌生人/女巫设备的校时交换直接拒绝
+        // 只信已验证联系人——陌生人/女巫设备的校时交换直接拒绝
         if !self.is_trusted(&peer) {
             return Err(ClockError::UntrustedPeer);
         }
-        // 审计 D3：t2/t3 攻击者可控，全部饱和运算防 i64 溢出 panic
+        // t2/t3 攻击者可控，全部饱和运算防 i64 溢出 panic
         let rtt = t4.saturating_sub(t1).saturating_sub(t3.saturating_sub(t2));
         if t2 > t3 {
             return Err(ClockError::RttTooLarge); // 对端不可能在收到前回复：畸形交换
@@ -251,9 +251,9 @@ impl InternalClock {
     }
 
     /// 安全「现在」：内部钟 + 高水位防回拨（调用方应周期性持久化 high_water_ms）。
-    /// 审计 C3 修复：偏移变化时重置内部高水位基线——毒偏移撤离后不残留旧峰；
+    /// 偏移变化时重置内部高水位基线——毒偏移撤离后不残留旧峰；
     /// 本地钟回拨（回滚攻击）单独检测，回拨期间内部钟钉在高水位。
-    /// 红队 red4 修复：内部钟全程保持在 i64 正数域，杜绝 `as i64` 回绕。
+    /// 内部钟全程保持在 i64 正数域，杜绝 `as i64` 回绕。
     pub fn now(&mut self, local_ms: i64) -> i64 {
         let offset = self.effective_offset(local_ms);
         if local_ms < self.local_high_water_ms.saturating_sub(60_000) {
@@ -350,19 +350,19 @@ mod tests {
         // 5 样本两个簇（3 人主张 +24h、2 人主张 +5s）——最大簇 3 ≥ 人数，但… 
         // 最大簇是毒簇！保守策略：取「最大共识簇」，此处会跟随毒簇。
         // 防线在于样本必须来自联系人且数量上限受簇内一致性约束，
-        // 残余风险记录于 SP-8；此测试锁定当前行为防悄悄变更。
+        // 但仍存在残余风险。
         assert!(c.source(t + 1_000) == Source::Peers);
     }
 
     #[test]
     fn single_network_source_never_accepted() {
-        // 审计 C5 回归：单一来源永不采纳（恶意 WiFi 单点平移时间窗的路径封死）
+        // 单一来源永不采纳（防止恶意 WiFi 单点平移时间窗）
         let mut c = InternalClock::new();
         let t = 1_700_000_000_000i64;
         c.on_network_sync(1, t, t + 60_000);
         assert_eq!(c.source(t + 1_000), Source::Unsynced);
         assert_eq!(c.now(t + 1_000), t + 1_000, "单源不得移动内部钟");
-        // 第二个独立来源且一致、且变化量 ≤2min（red6 限幅）→ 采纳
+        // 第二个独立来源且一致、且变化量 ≤2min（采纳上限）→ 采纳
         c.on_network_sync(2, t + 1_500, t + 1_500 + 60_000);
         assert_eq!(c.source(t + 2_000), Source::Network);
         assert_eq!(c.now(t + 2_000), t + 2_000 + 60_000);
@@ -370,7 +370,7 @@ mod tests {
 
     #[test]
     fn large_network_shift_requires_peer_quorum() {
-        // 红队 red6 策略锁定：网络源（无认证）单次采纳 ≤±2min——
+        // 网络源（无认证）单次采纳 ≤±2min——
         // 一致双源的大幅挪钟（-20min/+1day）一律拒绝，大校正走 3 人联系人共识
         let mut c = InternalClock::new();
         let t = 1_700_000_000_000i64;
@@ -440,7 +440,7 @@ mod tests {
     fn network_offset_is_clamped() {
         let mut c = InternalClock::new();
         let t = 1_700_000_000_000i64;
-        // 大幅校正（>±2min）不走网络（red6 限幅），走 3 人联系人共识：
+        // 大幅校正（>±2min）不走网络（采纳上限），走 3 人联系人共识：
         // 每个样本本身限幅 ±24h，共识中位数 = +24h
         // （对称单路延迟 100ms：t2=t1+O+100, t3=t2+50, t4=t3-O+100）
         for p in 1..=3u8 {

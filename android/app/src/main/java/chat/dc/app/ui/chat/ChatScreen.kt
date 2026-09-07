@@ -45,7 +45,7 @@ import java.util.Locale
 private data class Message(val text: String, val sent: Boolean, val time: String)
 
 /**
- * 聊天会话页（Telegram 式气泡）：接收=左侧 surfaceVariant，发送=右侧 primaryContainer。
+ * 聊天会话页气泡：接收=左侧 surfaceVariant，发送=右侧 primaryContainer。
  * 核心数据接入前无会话/消息可显示，展示引导空态；输入栏保留，发送仅写入本页内存。
  */
 @Composable
@@ -144,7 +144,7 @@ fun ChatScreen(onBack: () -> Unit, onAddFriend: () -> Unit) {
                 shape = RoundedCornerShape(24.dp),
                 maxLines = 4,
                 colors = OutlinedTextFieldDefaults.colors(
-                    // P2/P3：极简 chrome——未聚焦无边框，用容器色分层
+                    // 极简 chrome——未聚焦无边框，用容器色分层
                     unfocusedBorderColor = androidx.compose.ui.graphics.Color.Transparent,
                     unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant,
                     focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant,

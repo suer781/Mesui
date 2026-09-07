@@ -54,7 +54,7 @@ fun NearbyScreen() {
 
     val enableBtLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
-    ) { discovery.refreshState() /* 蓝牙开启结果回填状态（残留#5 修复） */ }
+    ) { discovery.refreshState() /* 蓝牙开启结果回填状态 */ }
 
     DisposableEffect(Unit) {
         discovery.refreshState()

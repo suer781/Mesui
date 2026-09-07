@@ -22,7 +22,7 @@ pub enum PayloadKind {
 
 /// 传输信封。字段刻意最小化，减少元数据暴露面。
 ///
-/// **审计 C4 修订（SP-7 外层化名）**：`sender` 字段语义按路径分流——
+/// `sender` 字段语义按路径分流——
 /// - 联系人信箱路径：填长期身份公钥（收件方可验）
 /// - 人群转发/陌生人路径：**必须填来源轮换节点密钥**（化名），长期身份
 ///   永不出现在外层——绑定关系只存在于内层密文（Signal 会话）
@@ -51,7 +51,7 @@ impl Envelope {
     pub fn from_cbor(bytes: &[u8]) -> Result<Self> {
         let e: Envelope = ciborium::de::from_reader(bytes)
             .map_err(|ev| CoreError::Cbor(ev.to_string()))?;
-        // 审计 D3：单播与群播互斥——两字段同时存在即畸形信封
+        // 单播与群播互斥——两字段同时存在即畸形信封
         if e.group.is_some() && e.recipient.is_some() {
             return Err(CoreError::Cbor("envelope cannot be both unicast and group".into()));
         }
@@ -100,7 +100,7 @@ pub struct Dedup {
 
 impl Dedup {
     pub fn new(cap: usize) -> Self {
-        // 审计 D3：容量 0 会让去重完全失效，强制下限 1
+        // 容量 0 会让去重完全失效，强制下限 1
         Self { seen: std::collections::HashMap::new(), order: std::collections::VecDeque::new(), cap: cap.max(1) }
     }
 

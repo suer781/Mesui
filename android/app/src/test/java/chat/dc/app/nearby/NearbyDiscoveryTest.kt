@@ -85,7 +85,7 @@ class NearbyDiscoveryTest {
             android.Manifest.permission.BLUETOOTH_SCAN,
             android.Manifest.permission.BLUETOOTH_CONNECT,
         )
-        d.stopScan() // 未开始扫描就停止：不得抛异常（B 修复的回归验证）
+        d.stopScan() // 未开始扫描就停止：不得抛异常
         assertEquals(NearbyDiscovery.Status.SCANNED, d.state.first().status)
         assertEquals(Build.VERSION.SDK_INT, Build.VERSION_CODES.TIRAMISU)
     }

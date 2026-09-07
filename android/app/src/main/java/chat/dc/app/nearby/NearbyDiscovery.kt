@@ -59,7 +59,7 @@ class NearbyDiscovery(private val context: Context) {
 
     fun requiredPermissions(): Array<String> =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // 审计残留#2：ADVERTISE 必须在授权流程内申请，否则「允许被发现」静默失效
+            // ADVERTISE 必须在授权流程内申请，否则「允许被发现」静默失效
             arrayOf(
                 Manifest.permission.BLUETOOTH_SCAN,
                 Manifest.permission.BLUETOOTH_CONNECT,
@@ -76,7 +76,7 @@ class NearbyDiscovery(private val context: Context) {
     fun bluetoothEnabled(): Boolean = adapter?.isEnabled == true
 
     /** 进入页面时同步一次状态（不启动任何动作）：
-     *  修复运行时验证发现的 bug——初始 IDLE 态下用户看不到任何权限引导。 */
+     *  初始 IDLE 态下用户看不到任何权限引导。 */
     fun refreshState() {
         _state.update {
             when {
@@ -105,7 +105,7 @@ class NearbyDiscovery(private val context: Context) {
         }
 
         override fun onScanFailed(errorCode: Int) {
-            // 审计残留#1 修复：失败必须与「正常停止」可区分，UI 才有反馈
+            // 失败必须与「正常停止」可区分，UI 才有反馈
             _state.update { it.copy(status = Status.SCAN_FAILED) }
         }
     }
@@ -184,7 +184,7 @@ class NearbyDiscovery(private val context: Context) {
             .build()
         val data = android.bluetooth.le.AdvertiseData.Builder()
             .addServiceUuid(ParcelUuid(SERVICE_UUID))
-            // 安全约束（风险登记 B4）：不广播设备名——那会把手机蓝牙名（常含真名）
+            // 安全约束：不广播设备名——那会把手机蓝牙名（常含真名）
             // 透露给任何扫描者；对端靠服务 UUID 过滤即可
             .setIncludeDeviceName(false)
             .build()

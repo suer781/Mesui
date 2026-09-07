@@ -44,10 +44,10 @@ import kotlinx.coroutines.delay
 import java.security.SecureRandom
 
 /**
- * 添加好友子页（SP-3 v3，动态分帧二维码）：
- * - 我的码：数据帧 + 噪声帧循环播放（400ms/帧），单帧/单张截图不含完整信息
- * - 扫对方的码：相机连续采集，集齐全部数据帧且 ≥3 秒才完成
- *   → 安全码核对 → 蓝牙协商（阶段 4 接入 RFCOMM 后自动发起）
+ * 添加好友子页（动态分帧二维码）：
+ * - 我的码：数据帧与「当场新随机」的噪声帧交错播放（280ms/帧），每两帧画面都不同，
+ *   单帧/单张截图不含完整信息
+ * - 扫对方的码：相机连续采集，集齐全部数据帧且 ≥3 秒才完成 → 安全码核对 → 蓝牙协商
  */
 @Composable
 fun AddFriendScreen() {
@@ -56,9 +56,7 @@ fun AddFriendScreen() {
     val sid = remember {
         ByteArray(4).also(security::nextBytes).joinToString("") { "%02x".format(it) }
     }
-    val cycle = remember(myPayload, sid) {
-        FrameCodec.split(myPayload, sid) + FrameCodec.noiseFrame(sid, security)
-    }
+    val dataFrames = remember(myPayload, sid) { FrameCodec.split(myPayload, sid) }
     var frameIdx by remember { mutableIntStateOf(0) }
 
     val context = LocalContext.current
@@ -76,16 +74,22 @@ fun AddFriendScreen() {
     var collectorState by remember { mutableStateOf<FrameCollector.State?>(null) }
     val peerPayload = collectorState?.takeIf { it.complete }?.payload
 
-    // 动态码每 400ms 换帧，但 QR 编码较重：离主线程编码，位图仅在换帧时重建
-    var frameBmp by remember { mutableStateOf(QrCodec.encode(cycle[0], 480)) }
-    LaunchedEffect(cycle) {
+    // 280ms/帧，QR 编码较重：离主线程编码，位图仅在换帧时重建
+    var frameBmp by remember { mutableStateOf(QrCodec.encode(dataFrames[0], 480)) }
+    LaunchedEffect(dataFrames) {
         while (true) {
-            frameIdx = (frameIdx + 1) % cycle.size
-            val f = cycle[frameIdx]
+            frameIdx += 1
+            // 奇数帧放数据帧（顺序循环），偶数帧放一张当场新随机的噪声帧：
+            // 每两帧画面都不同，肉眼是持续变动的图案；采集端靠 f=0 忽略噪声帧
+            val f = if (frameIdx % 2 == 1) {
+                dataFrames[(frameIdx / 2) % dataFrames.size]
+            } else {
+                FrameCodec.noiseFrame(sid, security)
+            }
             frameBmp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
                 QrCodec.encode(f, 480)
             }
-            delay(400)
+            delay(280)
         }
     }
 
@@ -180,7 +184,8 @@ fun AddFriendScreen() {
                             R.string.add_friend_progress,
                             st.collected,
                             st.total,
-                            st.elapsedMs / 1000.0,
+                            // 时间门槛满足后秒数封顶在阈值，不再无限上涨
+                            st.elapsedMs.coerceAtMost(FrameCodec.MIN_COLLECT_MS) / 1000.0,
                         ),
                         style = MaterialTheme.typography.bodySmall,
                     )

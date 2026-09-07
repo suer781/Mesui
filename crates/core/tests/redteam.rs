@@ -1,10 +1,8 @@
-//! 红队攻击套件（redteam.rs）——作者 security_bruteforce.rs 未覆盖的攻击面。
-//!
-//! 与作者套件的本质差异：作者做的是「单次调用的暴力输入」（乱码/变异/位翻转），
-//! 本套件做「跨调用状态机序列 + 整数边界 + 缓存驱逐链 + 逻辑组合」攻击。
+//! 红队攻击套件（redteam.rs）：覆盖 security_bruteforce.rs 未覆盖的攻击面——
+//! 跨调用状态机序列、整数边界、缓存驱逐链与逻辑组合攻击。
 //!
 //! 断言约定：每个测试断言「攻击必须失败 / 系统必须存活」。
-//! 测试失败（RED）= 攻击成功 = 真实漏洞；通过（GREEN）= 系统扛住该类攻击。
+//! 测试失败 = 攻击成功 = 真实漏洞；通过 = 系统扛住该类攻击。
 //! 全部确定性：身份一律 from_seed，无 sleep、无真实时钟依赖。
 //!
 //! 攻击序列中「重复推送同一票据/同一输入」是重放攻击的本体形态，属故意写法：
@@ -49,10 +47,9 @@ fn quiet_panic<R>(f: impl FnOnce() -> R) -> std::thread::Result<R> {
     r
 }
 
-// ════════════════════════════ RED 候选：缓存驱逐链 ════════════════════════════
+// ════════════════════════════ 缓存驱逐链 ════════════════════════════
 
-/// RED-1【NonceCache 驱逐重放】：nonce 缓存是 RAM 内 FIFO 有界队列。
-/// 作者只测了「同 nonce 直接重放被拒」，没测「先灌满再重放」。
+/// NonceCache 驱逐重放：nonce 缓存是 RAM 内 FIFO 有界队列。
 /// 攻击者只需窃听合法流量：合法发送者在一个 ±5min 重放窗内发出 cap+1 条消息，
 /// 最旧 nonce 被挤出，随后原样重放最旧那条合法写入 → MAC 对、窗口对、nonce 已被
 /// 驱逐 → verify_inbound 全流程放行，同一条消息被投递两次。
@@ -75,10 +72,10 @@ fn red1_nonce_cache_fifo_eviction_replay() {
     );
 }
 
-/// RED-2【RelayGuard 多来源驱逐重放】：作者测过「单来源灌票挤不掉活票」
-/// （每来源限 4 槽），但攻击者拥有无限密钥对：用 N 个不同来源各签 1 张
+/// RelayGuard 多来源驱逐重放：单来源灌票挤不掉活票（每来源限 4 槽），
+/// 但攻击者拥有无限密钥对：用 N 个不同来源各签 1 张
 /// 「满 TTL(2h)」票，而全局逐出策略踢「最快过期」——合法活票（剩余寿命短）
-/// 永远先被踢。作者自己的 max_entries=8 配置即可击穿。
+/// 永远先被踢。max_entries=8 配置即可击穿。
 #[test]
 fn red2_relay_guard_multi_origin_eviction_replay() {
     let challenge = [0xAA; 32];
@@ -93,7 +90,7 @@ fn red2_relay_guard_multi_origin_eviction_replay() {
         challenge,
     );
     live.sign(&victim).unwrap();
-    let mut guard = RelayGuard::new(8); // 与作者 cache_flood 测试同配置
+    let mut guard = RelayGuard::new(8); // 与 cache_flood 测试同配置
     assert!(guard.accept(&live, NOW, challenge), "活票首次必须接受");
     assert!(!guard.accept(&live, NOW, challenge), "基线：同票立即重放必须拒绝");
 
@@ -124,7 +121,7 @@ fn red2_relay_guard_multi_origin_eviction_replay() {
     );
 }
 
-/// RED-3【转正为回归测试】：票 issued_at 现已校验（not_before 语义）——
+/// 票 issued_at 现已校验（not_before 语义）——
 /// 未来签发的票在 verify 层即被拒，无法占据槽位，也无法复活重放。
 #[test]
 fn red3_future_issued_ticket_rejected_at_verify() {
@@ -160,14 +157,14 @@ fn red3_future_issued_ticket_rejected_at_verify() {
     assert!(guard.accept(&legit, NOW, challenge), "合法票正常入环");
 }
 
-// ════════════════════════════ RED 候选：时钟整数边界 ════════════════════════════
+// ════════════════════════════ 时钟整数边界 ════════════════════════════
 
-/// RED-4【restore_high_water 未校验 u64::MAX → 回滚钳制返回 -1】：
+/// restore_high_water 未校验 u64::MAX → 回滚钳制返回 -1：
 /// 高水位从持久层恢复（崩溃恢复路径），无任何上界校验。
 /// 恢复 u64::MAX 后触发回滚检测时，`internal_high_water_ms as i64` 回绕成 -1：
 /// 「安全时钟」返回负值；调用方 cast 回 u64 即 u64::MAX → mailbox.verify 判一切
-/// 过旧而全拒（DoS），queue 的 now+delay 溢出（见 RED-8），record_seen 存负值
-/// （见 RED-7）——一处未校验输入污染整条时间安全链。
+/// 过旧而全拒（DoS），queue 的 now+delay 溢出，record_seen 存负值——
+/// 一处未校验输入污染整条时间安全链。
 #[test]
 fn red4_clock_restore_high_water_wrap_negative() {
     let mut c = InternalClock::new();
@@ -178,7 +175,7 @@ fn red4_clock_restore_high_water_wrap_negative() {
     assert!(c.high_water_ms() < u64::MAX, "RED: 高水位被未校验持久值污染并会被再次持久化");
 }
 
-/// RED-5【on_network_sync 减法溢出 panic】：raw = network_ms - local_ms 是裸 i64
+/// on_network_sync 减法溢出 panic：raw = network_ms - local_ms 是裸 i64
 /// 减法。网络时间源（NTP 无认证，报文字段攻击者可控）给出 i64::MAX，
 /// 系统钟被设到 1970 前（负 local_ms）→ debug 构建直接 panic = 远程可触发的崩溃。
 #[test]
@@ -190,10 +187,9 @@ fn red5_clock_network_sync_overflow_panic() {
     assert!(r.is_ok(), "RED: on_network_sync 对极端 i64 输入 panic（减法溢出未用 saturating）");
 }
 
-/// RED-6【双源一致回拨 → ±5min 重放窗实际变为 ±24h】：C5 双源交叉验证只防
+/// 双源一致回拨 → ±5min 重放窗实际变为 ±24h：双源交叉验证只防
 /// 「单源」，两个未认证 NTP 源在同一路径上同样报 -20min 即达成一致并采纳。
 /// 回拨后，20 分钟前嗅探的合法写入重新落入 ±5min 窗口 → 重放复活。
-/// 作者测了「单源不采纳」「双源分歧双拒」，没测「双源一致作恶」与重放窗的联动。
 #[test]
 fn red6_clock_backward_shift_revives_old_writes() {
     let secret = derive_mailbox_secret(b"redteam-r6", &[7; 32], 1);
@@ -218,12 +214,12 @@ fn red6_clock_backward_shift_revives_old_writes() {
     );
 }
 
-// ════════════════════════════ RED 候选：队列整数边界 ════════════════════════════
+// ════════════════════════════ 队列整数边界 ════════════════════════════
 
-/// RED-7【record_seen 的 u64→i64 铸造 + 例行裁剪 = 去重蒸发】：
-/// now_ms=u64::MAX（RED-4 毒化时钟的下游产物）经 `as i64` 存成 seen_ms=-1；
+/// record_seen 的 u64→i64 铸造 + 例行裁剪 = 去重蒸发：
+/// now_ms=u64::MAX（毒化时钟的下游产物）经 `as i64` 存成 seen_ms=-1；
 /// 下一次例行 prune_seen(0)（「保留全部正常时间戳」）按 seen_ms<0 把它删掉，
-/// 同一 msg_id 立即可被再次接受 = 持久层重放防线瞬间蒸发。
+/// 同一 msg_id 立即可被再次接受 = 持久层重放防线失效。
 #[test]
 fn red7_queue_seen_ms_negative_prune_replay() {
     let db = Db::open(std::path::Path::new(":memory:"), None).unwrap();
@@ -236,9 +232,9 @@ fn red7_queue_seen_ms_negative_prune_replay() {
     );
 }
 
-/// RED-8【fail_and_reschedule 的 now_ms+delay u64 溢出 panic】：
+/// fail_and_reschedule 的 now_ms+delay u64 溢出 panic：
 /// `(now_ms + delay) as i64` 是裸 u64 加法。now_ms 来自毒化时钟链
-/// （RED-4 的 -1 cast 回 u64::MAX）时 debug 构建 panic = 状态机线程崩溃。
+/// （-1 cast 回 u64::MAX）时 debug 构建 panic = 状态机线程崩溃。
 #[test]
 fn red8_queue_fail_reschedule_u64_overflow_panic() {
     let db = Db::open(std::path::Path::new(":memory:"), None).unwrap();
@@ -255,7 +251,7 @@ fn red8_queue_fail_reschedule_u64_overflow_panic() {
     assert!(r.is_ok() && r2.is_ok(), "RED: now_ms=u64::MAX 时 fail_and_reschedule 溢出 panic（now+delay 未用 saturating_add）");
 }
 
-/// RED-9【sent_at_ms = u64::MAX → created_ms = -1 → 队列插队】：
+/// sent_at_ms = u64::MAX → created_ms = -1 → 队列插队：
 /// enqueue 把攻击者可控的 sent_at_ms 直接 `as i64` 存为排序键 created_ms。
 /// u64::MAX 回绕成 -1，ORDER BY created_ms 让它排到全部合法消息之前：
 /// 任何把外来信封转投出站队列的路径（人群转发逐跳重投）都会被攻击者插队，
@@ -277,9 +273,9 @@ fn red9_queue_sent_at_priority_inversion() {
     );
 }
 
-// ════════════════════════════ RED 候选：无界状态 ════════════════════════════
+// ════════════════════════════ 无界状态 ════════════════════════════
 
-/// RED-10【NodeKeyRing 无容量上限】：upsert 只按过期淘汰（30 天窗），
+/// NodeKeyRing 无容量上限：upsert 只按过期淘汰（30 天窗），
 /// 单身份条目数无上限。任何一个恶意/失窃联系人都能用自己的长期钥连续签发
 /// 「serial 递增、30 天有效」的合法公告——签名全绿、全部入环、内存无界增长。
 /// MAX_VALIDITY_MS 限制了单条公告寿命，却没限制条数（防「百年公告」没防「百万公告」）。
@@ -300,7 +296,7 @@ fn red10_nodekey_ring_unbounded_growth() {
     );
 }
 
-/// RED-11【NaN 指标绕过负载治理】：governor.set_load(NaN) 经 clamp 原样传播，
+/// NaN 指标绕过负载治理：governor.set_load(NaN) 经 clamp 原样传播，
 /// load_share 两个比较分支全 false 落入 smoothstep(NaN)=NaN，f64::min 丢弃 NaN
 /// → 按「满载 15%」放行；adaptive 的 msg_rate=NaN 同理使 demanded 永远 Light。
 /// 喂入侧一旦出现 0/0（除零 bug 或被污染的指标通道），降档与升档同时失明。
@@ -322,8 +318,8 @@ fn red11_nan_metrics_bypass_load_governance() {
     );
 }
 
-/// RED-12【CBOR 无界递归】：未知字段值是深嵌套不定长数组，ciborium 反序列化
-/// IgnoredAny 逐层递归。作者 fuzz 只喂 ≤120 字节随机片——递归深度攻击需要
+/// CBOR 无界递归：未知字段值是深嵌套不定长数组，ciborium 反序列化
+/// IgnoredAny 逐层递归。≤120 字节的随机片 fuzz 覆盖不到——递归深度攻击需要
 /// 特构的深层嵌套结构。断言：必须返回 Err 而不是打爆栈（stack overflow 会
 /// abort 整个进程，不可捕获）。
 #[test]
@@ -370,9 +366,9 @@ fn red12_cbor_deep_nesting_must_not_crash() {
     let _ = dc_core::envelope::Envelope::from_cbor(&b3);
 }
 
-// ════════════════════════════ GREEN：作者未测但系统扛住 ════════════════════════════
+// ════════════════════════════ 系统扛住的攻击面 ════════════════════════════
 
-/// GREEN-1【票窗形状完备性】：TTL 上限对 issued/expiry 的极端摆位全部成立。
+/// 票窗形状完备性：TTL 上限对 issued/expiry 的极端摆位全部成立。
 #[test]
 fn green1_relay_ticket_window_shapes_rejected() {
     let origin = identity(0x0B);
@@ -384,13 +380,13 @@ fn green1_relay_ticket_window_shapes_rejected() {
     };
     assert!(mk(NOW, NOW + MAX_TICKET_TTL_MS + 1, [1; 16]).verify(NOW, [1; 32]).is_err(), "TTL 超上限必拒");
     assert!(mk(0, 3_600_000, [2; 16]).verify(NOW, [1; 32]).is_err(), "远古票必拒");
-    // 红队 red3 修复后：未来签发（issued > now+2min 偏移）在 verify 层被拒——
-    // 更新此行预期：NOW+1h 签发 > NOW+2min 容差 → 拒（旧版接受是漏洞前提）
+    // 未来签发（issued > now+2min 偏移）在 verify 层被拒——
+    // NOW+1h 签发 > NOW+2min 容差 → 拒（旧版接受是漏洞前提）
     assert!(mk(NOW + 3_600_000, NOW + 3_600_000, [3; 16]).verify(NOW, [1; 32]).is_err(), "未来签发必拒");
     assert!(mk(NOW, NOW + 3_600_000, [4; 16]).verify(NOW, [1; 32]).is_ok(), "正常票必须通过");
 }
 
-/// GREEN-2【RelayGuard 零容量不挂死】：容量 0 被钳到 1，逐出循环有界。
+/// RelayGuard 零容量不挂死：容量 0 被钳到 1，逐出循环有界。
 #[test]
 fn green2_relay_guard_zero_capacity_bounded() {
     let origin = identity(0x0D);
@@ -402,15 +398,15 @@ fn green2_relay_guard_zero_capacity_bounded() {
     };
     let mut guard = RelayGuard::new(0);
     assert!(guard.accept(&mk([1; 16]), NOW, [1; 32]));
-    // red2 修复后的 fail-closed 语义：容量 1 已被活条目占满，且条目与当前
+    // fail-closed 语义：容量 1 已被活条目占满，且条目与当前
     // 挑战同纪元（不可逐出）→ 后续新票一律拒绝，直到原条目过期（≤2h+偏移）。
     // 这是有意的权衡：防重放完整性 > 新票可用性。
     assert!(!guard.accept(&mk([2; 16]), NOW, [1; 32]));
-    // 同指纹重放自然也被拒（条目仍在缓存中）
+    // 同指纹重放同样被拒（条目仍在缓存中）
     assert!(!guard.accept(&mk([1; 16]), NOW, [1; 32]));
 }
 
-/// GREEN-3【未注册陌生发送者默认拒绝】。
+/// 未注册陌生发送者默认拒绝。
 #[test]
 fn green3_governor_unregistered_sender_denied() {
     let mut g = RelayGovernor::new(120);
@@ -419,7 +415,7 @@ fn green3_governor_unregistered_sender_denied() {
     assert!(!g.allow_recv(&stranger, 1000));
 }
 
-/// GREEN-4【信封极端字段存活】：u64::MAX 时间戳、None/Some 组合、64KB body。
+/// 信封极端字段存活：u64::MAX 时间戳、None/Some 组合、64KB body。
 #[test]
 fn green4_envelope_extreme_fields_survive() {
     let e = Envelope {
@@ -441,7 +437,7 @@ fn green4_envelope_extreme_fields_survive() {
     assert_eq!(Envelope::from_cbor(payload).unwrap(), e);
 }
 
-/// GREEN-5【serial u64::MAX 单调性】：顶格 serial 之后任何低 serial 无法回退。
+/// serial u64::MAX 单调性：顶格 serial 之后任何低 serial 无法回退。
 #[test]
 fn green5_nodekey_serial_u64max_monotonic() {
     let peer = identity(0x10);
@@ -458,7 +454,7 @@ fn green5_nodekey_serial_u64max_monotonic() {
     assert!(!ring.accepts(&peer.node_id(), &node_low, NOW + 1000));
 }
 
-/// GREEN-6【Dedup 容量 0 仍去重】。
+/// Dedup 容量 0 仍去重。
 #[test]
 fn green6_dedup_zero_capacity_still_dedups() {
     let mut d = Dedup::new(0);
@@ -468,7 +464,7 @@ fn green6_dedup_zero_capacity_still_dedups() {
     assert_eq!(d.len(), 1);
 }
 
-/// GREEN-7【库文件真实加密 + PRAGMA key 注入转义】：
+/// 库文件真实加密 + PRAGMA key 注入转义：
 /// 文件头不得是明文 SQLite 魔数；单引号形态的 key 必须按字面量处理。
 #[test]
 fn green7_db_file_actually_encrypted_and_key_injection_escaped() {
@@ -502,7 +498,7 @@ fn green7_db_file_actually_encrypted_and_key_injection_escaped() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// GREEN-8【坏 MAC 轰炸不得污染 nonce 缓存】：MAC 门在 nonce 消耗之前，
+/// 坏 MAC 轰炸不得污染 nonce 缓存：MAC 门在 nonce 消耗之前，
 /// 攻击者不能用同 nonce 的坏 MAC 写入预先耗尽合法写入的重放配额。
 #[test]
 fn green8_bad_mac_does_not_pollute_nonce_cache() {

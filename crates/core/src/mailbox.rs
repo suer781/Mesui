@@ -1,23 +1,23 @@
-//! 信箱桶门禁（风险登记 B1）——模式移植自微信支付 APIv3：
+//! 信箱桶门禁：
 //! - 每对联系人在 Signal 握手时派生 mailbox secret（本模块输入即握手产物）
 //! - 写桶必须附规范化签名串的 MAC + 钥匙版本 serial + 时间戳 + nonce
 //! - 中继只验 MAC，不解内容；验签不过 = 在桶门口拒绝，不入库
-//! - 防重放：±5 分钟时间窗（微信支付同款量级）+ nonce 去重缓存（调用方持有）
+//! - 防重放：±5 分钟时间窗 + nonce 去重缓存（调用方持有）
 //!
-//! 红线重申：本模块只用 keyed-BLAKE3 做认证，不发明任何新原语。
+//! 本模块只用 keyed-BLAKE3 做认证，不发明任何新原语。
 
 use crate::envelope::Envelope;
 use crate::identity::NodeId;
 use crate::{CoreError, Result};
 use serde::{Deserialize, Serialize};
 
-/// 重放窗口（微信支付官方 SDK 校验时间偏差同为 ±5 分钟量级）。
+/// 重放窗口（±5 分钟）。
 pub const REPLAY_WINDOW_MS: u64 = 5 * 60 * 1000;
 
-/// 桶地址 = **256 位随机值**（SP-1 v9.1，经二维码/介绍信分发）。
-/// 审计 B2 修订：不再由身份派生——防止服务方按身份枚举/串联桶。
+/// 桶地址 = **256 位随机值**（经二维码/介绍信分发）。
+/// 不再由身份派生——防止服务方按身份枚举/串联桶。
 /// 稳定跨节点密钥轮换（轮换只影响 iroh 拨号地址，不影响桶）；
-/// 桶 ID 公开可查存在性，但写入要 MAC、读取要鉴权（B1）。
+/// 桶 ID 公开可查存在性，但写入要 MAC、读取要鉴权。
 pub fn generate_bucket_address() -> Result<[u8; 32]> {
     let mut out = [0u8; 32];
     getrandom::fill(&mut out).map_err(|e| CoreError::Entropy(e.to_string()))?;
@@ -42,11 +42,11 @@ pub fn derive_mailbox_secret(
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct BucketWrite {
     pub envelope: Envelope,
-    /// 钥匙版本（Wechatpay-Serial 对应物）：收方按 serial 选 mailbox secret
+    /// 钥匙版本：收方按 serial 选 mailbox secret
     pub serial: u32,
     /// 防重放随机数（熵源生成，配合时间窗去重）
     pub nonce: [u8; 16],
-    /// 发送方时间戳——仅用于重放窗口（B5：不作任何其他安全判定输入）
+    /// 发送方时间戳——仅用于重放窗口（不作任何其他安全判定输入）
     pub ts_ms: u64,
     pub mac: [u8; 32],
 }
@@ -74,8 +74,8 @@ impl BucketWrite {
         w
     }
 
-    /// 规范化签名串（对齐微信支付 `timestamp\nnonce\nbody\n` 模式）：
-    /// 绑定版本、nonce、时间与**信封全部字段**（审计 C2：此前漏绑
+    /// 规范化签名串：
+    /// 绑定版本、nonce、时间与**信封全部字段**（此前漏绑
     /// group/kind/sent_at_ms/ttl_hops，recipient=None 时整字段不绑定）。
     fn mac_input(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(160 + self.envelope.body.len());
@@ -114,8 +114,8 @@ impl BucketWrite {
             .as_bytes()
     }
 
-    /// 中继/收件人侧验证：MAC（常量时间比较，D1）+ 重放窗口。
-    /// nonce 去重由调用方查 NonceCache（A1）。
+    /// 中继/收件人侧验证：MAC（常量时间比较）+ 重放窗口。
+    /// nonce 去重由调用方查 NonceCache。
     pub fn verify(&self, secret: &[u8; 32], now_ms: u64) -> Result<()> {
         let expected = self.compute_mac(secret);
         let diff = self
@@ -135,7 +135,7 @@ impl BucketWrite {
     }
 }
 
-/// 红队 red1 重设计：重放防线从「nonce FIFO」改为「msg_id 过期台账」。
+/// 重放防线从「nonce FIFO」改为「msg_id 过期台账」。
 /// FIFO 驱逐是可攻击的——窗内合法流量会把旧 nonce 挤出，嗅探重放即复活。
 /// 新语义：
 /// - 键 = **msg_id**（MAC 已保证其真实性；比 nonce 更有意义的重放标识）
@@ -182,7 +182,7 @@ impl NonceCache {
     }
 }
 
-/// SP-1 官方入站流程（审计 A3：顺序在代码里强制，阶段 5 不得自行重排）：
+/// 官方入站流程（顺序在代码里强制，阶段 5 不得自行重排）：
 /// 1. MAC 验证 → 2. 时间窗 → 3. nonce 缓存。
 ///
 /// 去重**必须后于**验签——先去重会让攻击者用重复响应探测 msg_id 存在性。
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn nonce_cache_detects_replay_across_serial_space() {
-        // 红队 red1 重设计后：键 = msg_id，条目带过期，只逐过期条
+        // 键 = msg_id，条目带过期，只逐过期条
         let mut c = NonceCache::new(1000);
         let id: crate::envelope::MsgId = [9; 16];
         assert!(c.check_and_insert(&id, 1000, 1000));
@@ -295,7 +295,7 @@ mod tests {
         e.group = Some([4; 32]);
         let w = BucketWrite::seal(e.clone(), &secret, 1, 1000, [1; 16]);
         w.verify(&secret, 1000).unwrap();
-        // 审计 C2 回归：翻转此前未绑定的字段必须破坏 MAC
+        // 翻转此前未绑定的字段必须破坏 MAC
         let mut w2 = w.clone();
         w2.envelope.kind = PayloadKind::SessionMgmt;
         assert!(w2.verify(&secret, 1000).is_err());

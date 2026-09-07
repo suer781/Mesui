@@ -43,7 +43,7 @@ pub struct ProxyCfg {
     pub mode: ProxyMode,
     pub host: String,
     pub port: u16,
-    /// 分通道例外：列在此处的通道不走代理（如蓝牙/局域网天然免代理）。
+    /// 分通道例外：列在此处的通道不走代理（如蓝牙/局域网免代理）。
     pub bypass: Vec<ChannelKind>,
 }
 
@@ -57,8 +57,8 @@ impl Default for ProxyCfg {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeServiceCfg {
     pub enabled: bool,
-    /// 服务范围（SP-7 三档）：0=关闭, 1=仅直接联系人,
-    /// 2=联系人+二度, 3=任何人（限额人群转发，走 SP-7 转发票+治理器）
+    /// 服务范围（三档）：0=关闭, 1=仅直接联系人,
+    /// 2=联系人+二度, 3=任何人（限额人群转发，走转发票+治理器）
     pub scope: u8,
     pub only_when_charging: bool,
     pub only_on_unmetered: bool,

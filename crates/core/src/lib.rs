@@ -1,7 +1,7 @@
 //! dc-core：去中心化聊天 Rust 核心。
 //!
 //! 分层：身份 / 熵源 → 信封与去重 → 自适应策略 → 加密队列 → 传输（iroh）。
-//! 铁律：密码学原语全部来自第三方库，本 crate 只做编排与胶水。
+//! 密码学原语全部来自第三方库，本 crate 只做编排与胶水。
 
 pub mod adaptive;
 pub mod clock;
@@ -20,7 +20,7 @@ pub mod queue;
 
 #[cfg(feature = "signal")]
 pub mod signal_backend {
-    /// Spike A 探针：证明 signalapp/libsignal 官方 monorepo git 依赖可构建链接。
+    /// 探针：证明 signalapp/libsignal 官方 monorepo git 依赖可构建链接。
     pub fn build_probe() -> &'static str {
         "libsignal-protocol (signalapp/libsignal) built via git dependency"
     }

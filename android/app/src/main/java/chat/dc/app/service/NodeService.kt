@@ -10,8 +10,8 @@ import chat.dc.app.R
 
 /**
  * 前台服务：Rust 节点（iroh endpoint + 信箱桶 + 联系人间中继）与蓝牙
- * 链路的常驻宿主。Briar 同款保活策略：常驻通知，用户可关（默认开）。
- * 阶段 5 接入 UniFFI 核心句柄后实现真正逻辑；当前为占位。
+ * 链路的常驻宿主。保活策略：常驻通知，用户可关（默认开）。
+ * 接入 UniFFI 核心句柄后实现真正逻辑；当前为占位。
  */
 class NodeService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
@@ -43,7 +43,7 @@ class NodeService : Service() {
 
     private fun buildNotification(): Notification =
         Notification.Builder(this, NODE_CHANNEL_ID)
-            // 用户要求：常驻通知只显示应用名，无第二行内容
+            // 常驻通知只显示应用名，无第二行内容
             .setContentTitle(getText(R.string.app_name))
             .setSmallIcon(applicationInfo.icon)
             .setOngoing(true)

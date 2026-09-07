@@ -1,4 +1,4 @@
-//! Spike B：iroh 两 endpoint 进程内对连。
+//! iroh 两 endpoint 进程内对连。
 //! 验证：按公钥(endpoint id)寻址 + 直连 UDP + QUIC 双向流收发。
 //! 阶段 5 的远程通道以此为地基；relay 全禁用保证测试确定性。
 
