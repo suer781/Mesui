@@ -1,0 +1,37 @@
+[package]
+name = "dc-core"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "去中心化聊天核心：身份 / 熵源 / CBOR 信封 / 自适应策略 / 加密队列 / 传输"
+
+# 功能分层：默认全开；--no-default-features 可只验证纯逻辑层
+[features]
+default = ["db", "compress", "signal", "iroh-net"]
+db = ["dep:rusqlite"]                    # SQLCipher 加密本地库
+compress = ["dep:zstd"]                  # 中/重载档批量压缩
+signal = ["dep:libsignal-protocol"]      # Signal 官方 monorepo（git 依赖）
+iroh-net = ["dep:iroh"]                  # P2P 管道（QUIC 打洞 + 中继）
+ffi = ["dep:uniffi"]                     # UniFFI Kotlin 绑定（Android 集成时开）
+
+[dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ciborium = "0.2"
+blake3 = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+getrandom = "0.3"
+rusqlite = { version = "0.32", optional = true, features = ["bundled-sqlcipher"] }
+zstd = { version = "0.13", optional = true }
+# signalapp/libsignal 官方 monorepo。原计划 git 依赖 + rev 锁定，
+# 但本机网络对 GitHub 全量克隆限速（GFW），改为「浅抓取锁定 commit + path 依赖」：
+# third_party/libsignal 已 fetch-by-SHA 至 eb7864c4d15435ee33681ce828930d9a4296f155，
+# HEAD 哈希即信任锚（内容篡改会破坏哈希链，无法伪装同 commit）。
+# 网络条件允许时切回: { git = "https://github.com/signalapp/libsignal", rev = "eb7864c..." }
+libsignal-protocol = { path = "../../third_party/libsignal/rust/protocol", optional = true }
+iroh = { version = "1", optional = true }
+uniffi = { version = "0.29", optional = true, features = ["build"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time"] }

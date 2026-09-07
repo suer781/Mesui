@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 节点网格：中心节点 + 四方对等节点 + 连线，呼应「人人即节点」 -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.5"
+        android:pathData="M54,54 L30,30 M54,54 L78,30 M54,54 L30,78 M54,54 L78,78" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,47a7,7 0 1,0 0.001,0z" />
+    <path
+        android:fillColor="#B3FFFFFF"
+        android:pathData="M30,24a6,6 0 1,0 0.001,0z M78,24a6,6 0 1,0 0.001,0z M30,72a6,6 0 1,0 0.001,0z M78,72a6,6 0 1,0 0.001,0z" />
+</vector>

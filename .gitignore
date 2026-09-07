@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+*.db
+*.db-journal
+local.properties
+.gradle/
+build/
+app/build/
+.idea/
+*.iml
+.DS_Store
+# 安全扫描插件的状态/基线/报告（自动生成，不入库）
+.mimosa/
+**/.mimosa/
+.zcode/
+third_party/

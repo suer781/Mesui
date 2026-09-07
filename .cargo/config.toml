@@ -1,0 +1,14 @@
+# 本项目路径含中文，GNU ld 在非 ASCII 路径下无法打开 object 文件，
+# target 统一指到纯 ASCII 路径（源码位置不受影响）
+[build]
+target-dir = "C:/Users/13682/cargo-target/dc-chat"
+
+[target.x86_64-pc-windows-gnu]
+# 用 MSYS2 的 gcc 作为链接驱动（CRT/运行时一致）；当初换 rust-lld 是为了
+# 绕开中文路径，现 target-dir 已是纯 ASCII，gcc 链接更稳
+linker = "x86_64-w64-mingw32-gcc"
+
+# SQLCipher（bundled-sqlcipher）链接本机 OpenSSL；Android 阶段改用 vendored
+[env]
+OPENSSL_DIR = "C:/Users/13682/msys64/mingw64"
+
