@@ -26,6 +26,9 @@ pub mod signal_backend {
     }
 }
 
+#[cfg(feature = "signal")]
+pub mod handshake;
+
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
