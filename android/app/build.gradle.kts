@@ -9,7 +9,12 @@ plugins {
 // Windows 编码墙之四：test worker 的 @argfile 由 java.exe 启动器在 JVM 启动前按
 // ANSI(GBK) 解码，classpath 中的中文路径会变乱码 → 所有测试类 CNFE（jar 缓存路径
 // 全 ASCII 所以不炸）。把构建目录迁到纯 ASCII 路径，让 classpath 不含任何中文。
-layout.buildDirectory.set(File("C:/Users/13682/dc-build/app"))
+// 仅 Windows 生效：该变通针对 GBK 编码墙，Linux CI 项目路径纯 ASCII 无此问题；
+// 且 "C:/..." 在 Linux 上是相对路径，会把产物挪进项目树内的畸形目录，
+// 偏离默认 outputs 路径（CI 的 artifact 上传会找不到 APK）。
+if (System.getProperty("os.name").lowercase().contains("windows")) {
+    layout.buildDirectory.set(File(System.getProperty("user.home"), "dc-build/app"))
+}
 
 android {
     namespace = "chat.dc.app"
