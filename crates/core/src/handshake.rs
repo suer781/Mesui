@@ -14,21 +14,20 @@ use crate::{CoreError, Result};
 use futures::executor::block_on;
 use libsignal_protocol::{
     kem, message_decrypt, message_encrypt, process_prekey_bundle, CiphertextMessage,
-    CiphertextMessageType, DeviceId, Direction, Fingerprint, IdentityChange, IdentityKey,
-    IdentityKeyPair, IdentityKeyStore, InMemSignalProtocolStore, KeyPair, KyberPreKeyId,
-    KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle, PreKeyId, PreKeyRecord, PreKeySignalMessage,
-    PreKeyStore, ProtocolAddress, SignalMessage, SignedPreKeyId, SignedPreKeyRecord,
-    SignedPreKeyStore, Timestamp,
+    CiphertextMessageType, DeviceId, Direction, Fingerprint, GenericSignedPreKey, IdentityChange,
+    IdentityKey, IdentityKeyPair, IdentityKeyStore, InMemSignalProtocolStore, KeyPair,
+    KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle, PreKeyId, PreKeyRecord,
+    PreKeySignalMessage, PreKeyStore, ProtocolAddress, SignalMessage, SignedPreKeyId,
+    SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
 };
-use rand::rngs::OsRng;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// SAS Fingerprint 参数：libsignal 版本 2、Signal 惯用 5200 次迭代。
 const SAS_VERSION: u32 = 2;
 const SAS_ITERATIONS: u32 = 5200;
 
-/// 本应用固定单设备，device_id 恒为 1。
-const DEVICE_ID: u32 = 1;
+/// 本应用固定单设备，device_id 恒为 1（libsignal DeviceId::new 收 u8）。
+const DEVICE_ID: u8 = 1;
 
 fn crypto_err<E: std::fmt::Display>(e: E) -> CoreError {
     CoreError::Crypto(e.to_string())
@@ -60,7 +59,7 @@ pub struct Device {
 impl Device {
     /// 生成新设备：预生成长期身份密钥对（TOFU 的信任根），随机 registration_id。
     pub fn generate(name: &str) -> Result<Self> {
-        let mut rng = OsRng;
+        let mut rng = rand::rng();
         let identity = IdentityKeyPair::generate(&mut rng);
         let mut reg = [0u8; 4];
         getrandom::fill(&mut reg).map_err(|e| CoreError::Entropy(e.to_string()))?;
@@ -83,7 +82,7 @@ impl Device {
     /// 被扫方(Bob)：生成并存储一组预密钥(一次性 + 签名 + Kyber)，产出可编入 QR 的 PreKeyBundle。
     /// 签名预密钥与 Kyber 预密钥都由长期身份钥签名，扫码方 process 时验签。
     pub fn prekey_bundle(&mut self) -> Result<PreKeyBundle> {
-        let mut rng = OsRng;
+        let mut rng = rand::rng();
         let identity_pair = block(self.store.get_identity_key_pair())?;
 
         let pre_key = KeyPair::generate(&mut rng);
@@ -132,7 +131,7 @@ impl Device {
     /// 扫码方(Alice)：用 Bob 的 PreKeyBundle 跑 PQXDH 建立会话。
     /// 内部会验签名预密钥/Kyber 预密钥的身份签名，并按 TOFU 校验对方身份。
     pub fn process_bundle(&mut self, remote: &ProtocolAddress, bundle: &PreKeyBundle) -> Result<()> {
-        let mut rng = OsRng;
+        let mut rng = rand::rng();
         block(process_prekey_bundle(
             remote,
             &self.address,
@@ -146,7 +145,7 @@ impl Device {
 
     /// 发一条消息（Double Ratchet 自动换钥）。返回 (线格式类型字节, 密文)。
     pub fn encrypt(&mut self, remote: &ProtocolAddress, plaintext: &[u8]) -> Result<(u8, Vec<u8>)> {
-        let mut rng = OsRng;
+        let mut rng = rand::rng();
         let msg = block(message_encrypt(
             plaintext,
             remote,
@@ -166,7 +165,7 @@ impl Device {
         msg_type: u8,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>> {
-        let mut rng = OsRng;
+        let mut rng = rand::rng();
         let cm = match msg_type {
             3 => CiphertextMessage::PreKeySignalMessage(
                 PreKeySignalMessage::try_from(ciphertext).map_err(crypto_err)?,
