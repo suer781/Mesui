@@ -15,7 +15,7 @@ crate-type = ["cdylib", "lib"]
 default = ["db", "compress", "signal", "iroh-net"]
 db = ["dep:rusqlite"]                    # SQLCipher 加密本地库
 compress = ["dep:zstd"]                  # 中/重载档批量压缩
-signal = ["dep:libsignal-protocol"]      # Signal 官方 monorepo（git 依赖）
+signal = ["dep:libsignal-protocol", "dep:rand", "dep:futures"]  # Signal 官方 monorepo（vendored）+ 握手所需 RNG/executor
 iroh-net = ["dep:iroh"]                  # P2P 管道（QUIC 打洞 + 中继）
 ffi = ["dep:uniffi"]                     # UniFFI Kotlin 绑定（Android 集成时开）
 # 交叉编译 Android 等无系统 OpenSSL 的目标时用：SQLCipher 的 C 编译需要
@@ -37,6 +37,10 @@ zstd = { version = "0.13", optional = true }
 # （fetch-by-SHA 至 eb7864c4d15435ee33681ce828930d9a4296f155，HEAD 哈希即信任锚）；
 # CI 上由 workflow 浅抓取同 SHA 到工作区内 third_party/ 路径（build.yml 处理）。
 libsignal-protocol = { path = "../../third_party/libsignal/rust/protocol", optional = true }
+# rand 版本须与 libsignal 一致（0.9），否则 Rng/CryptoRng trait 不是同一类型；
+# futures 提供 block_on 驱动 libsignal 的 ?Send async trait。
+rand = { version = "0.9", optional = true }
+futures = { version = "0.3", optional = true }
 iroh = { version = "1", optional = true }
 uniffi = { version = "0.29", optional = true, features = ["build"] }
 
