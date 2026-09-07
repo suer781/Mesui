@@ -36,14 +36,21 @@
     <string name="contacts_entry_qr">扫码或出示动态码</string>
     <string name="contacts_entry_nearby">蓝牙扫描附近节点</string>
     <string name="chat_input_hint">输入消息</string>
+    <string name="chat_title_placeholder">新会话</string>
+    <string name="empty_messages_title">还没有会话</string>
+    <string name="empty_messages_hint">添加好友后，就可以在这里开始聊天</string>
+    <string name="empty_contacts_title">还没有联系人</string>
+    <string name="empty_contacts_hint">扫描对方的动态码，添加第一位联系人</string>
+    <string name="empty_chat_title">还没有消息</string>
+    <string name="empty_chat_hint">添加好友并连接后，消息会显示在这里</string>
+    <string name="empty_action_add_friend">去添加好友</string>
     <string name="me_name">我</string>
-    <string name="me_node_id">节点 7f3a…9c2b（长期身份指纹前段）</string>
+    <string name="me_status_placeholder">尚未设置个人资料</string>
     <string name="me_node_running">运行中</string>
     <string name="me_row_security">隐私与安全</string>
     <string name="me_row_node">节点服务</string>
     <string name="me_row_storage">数据与存储</string>
     <string name="me_row_about">关于</string>
-    <string name="me_footer">绝对 P2P · 无账号 · 无中心服务器 · AGPL-3.0</string>
     <string name="me_badge_unwired">未接入</string>
     <string name="search_hint">搜索</string>
 </resources>

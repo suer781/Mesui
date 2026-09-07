@@ -83,7 +83,15 @@ jobs:
           CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
           cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
             -o android/app/src/main/jniLibs \
-            build --release --lib -p dc-core --features vendored-openssl
+            build --release --lib -p dc-core --features vendored-openssl,ffi
+
+      - name: Rust 核心测试
+        env:
+          OPENSSL_DIR: /tmp/openssl-dummy
+        run: |
+          mkdir -p /tmp/openssl-dummy/include /tmp/openssl-dummy/lib
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+          cargo test --lib -p dc-core --features vendored-openssl
 
       # ================= Kotlin / APK =================
 

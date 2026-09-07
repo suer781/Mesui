@@ -9,14 +9,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material3.Badge
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -32,10 +30,9 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import chat.dc.app.R
-import chat.dc.app.ui.DemoData
-import chat.dc.app.ui.components.InitialsAvatar
+import chat.dc.app.ui.components.EmptyState
 
-/** 消息主 tab：搜索（真实过滤）+ 会话列表（头像/预览/时间/未读徽标）。 */
+/** 消息主 tab：搜索框 + 引导空态（核心数据接入前不放演示会话）。 */
 @Composable
 fun MessagesScreen(onOpenChat: (String) -> Unit, onOpenAddFriend: () -> Unit = {}) {
     var query by remember { mutableStateOf("") }
@@ -93,47 +90,14 @@ fun MessagesScreen(onOpenChat: (String) -> Unit, onOpenAddFriend: () -> Unit = {
                 .padding(horizontal = 16.dp)
                 .testTag("search"),
         )
-        val shown = DemoData.conversations.filter {
-            query.isBlank() || it.name.contains(query, ignoreCase = true) ||
-                it.preview.contains(query, ignoreCase = true)
-        }
-        LazyColumn {
-            items(shown, key = { it.id }) { c ->
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .animateItem()
-                        .clickable { onOpenChat(c.id) }
-                        .padding(horizontal = 16.dp, vertical = 10.dp)
-                        .testTag("chat_${c.id}"),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    InitialsAvatar(c.name)
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(horizontal = 12.dp),
-                    ) {
-                        Text(c.name, style = MaterialTheme.typography.titleMedium)
-                        Text(
-                            c.preview,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                        )
-                    }
-                    Column(horizontalAlignment = Alignment.End) {
-                        Text(
-                            c.time,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        if (c.unread > 0) {
-                            Badge(modifier = Modifier.padding(top = 6.dp)) { Text(c.unread.toString()) }
-                        }
-                    }
-                }
-            }
-        }
+        // 核心数据接入前没有会话可列出：展示引导空态，而不是演示数据
+        EmptyState(
+            icon = Icons.Filled.ChatBubbleOutline,
+            title = stringResource(R.string.empty_messages_title),
+            hint = stringResource(R.string.empty_messages_hint),
+            actionText = stringResource(R.string.empty_action_add_friend),
+            onAction = onOpenAddFriend,
+            modifier = Modifier.weight(1f),
+        )
     }
 }

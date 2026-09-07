@@ -33,10 +33,11 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 getrandom = "0.3"
 rusqlite = { version = "0.32", optional = true, features = ["bundled-sqlcipher"] }
 zstd = { version = "0.13", optional = true }
-# signalapp/libsignal 官方 monorepo。vendored 在 third_party/libsignal
+# signalapp/libsignal 官方 monorepo。vendored 在 C:/Users/13682/mesui-vendor/
 # （fetch-by-SHA 至 eb7864c4d15435ee33681ce828930d9a4296f155，HEAD 哈希即信任锚）；
-# CI 上由 workflow 浅抓取同一 commit 放到同一路径（third_party/ 不入库）。
-libsignal-protocol = { path = "../../third_party/libsignal/rust/protocol", optional = true }
+# CI 上由 workflow 浅抓取同 SHA 到工作区内 third_party/ 路径（build.yml 处理）。
+# 本地路径由 .cargo/config.toml 无法覆盖，改用绝对路径（单机开发可接受）。
+libsignal-protocol = { path = "C:/Users/13682/mesui-vendor/libsignal/rust/protocol", optional = true }
 iroh = { version = "1", optional = true }
 uniffi = { version = "0.29", optional = true, features = ["build"] }
 

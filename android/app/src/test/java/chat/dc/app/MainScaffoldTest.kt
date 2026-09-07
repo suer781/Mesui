@@ -24,12 +24,16 @@ class MainScaffoldTest {
     val compose = createAndroidComposeRule<MainActivity>()
 
     @Test
-    fun messages_tab_opens_chat_with_bubbles_and_input() {
-        compose.onNodeWithTag("chat_c1").performClick()
+    fun messages_tab_shows_empty_state_without_demo_data() {
+        // DemoData 清零：消息页展示引导空态，不再渲染演示会话与气泡
+        compose.onNodeWithText("还没有会话").assertExists()
+        compose.onNodeWithText("阿明").assertDoesNotExist()
+        compose.onNodeWithText("现在方便说吗？").assertDoesNotExist()
+        compose.onNodeWithTag("new_chat").assertExists()
+        // 空态行动按钮 → 添加好友子页
+        compose.onNodeWithText("去添加好友").performClick()
         compose.waitForIdle()
-        compose.onNodeWithTag("chat_input").assertExists()
-        compose.onNodeWithTag("chat_send").assertExists()
-        compose.onNodeWithText("现在方便说吗？").assertExists()
+        compose.onNodeWithTag("qr_image").assertExists()
     }
 
     @Test

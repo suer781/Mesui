@@ -10,9 +10,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material3.Icon
@@ -26,11 +26,9 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import chat.dc.app.R
-import chat.dc.app.ui.DemoData
-import chat.dc.app.ui.components.InitialsAvatar
-import chat.dc.app.ui.components.SectionHeader
+import chat.dc.app.ui.components.EmptyState
 
-/** 联系人主 tab：功能入口卡片（图标+底色）+ 字母分组好友列表。 */
+/** 联系人主 tab：功能入口卡片（图标+底色）+ 联系人列表空态（核心数据接入前不放演示联系人）。 */
 @Composable
 fun ContactsScreen(onOpenNearby: () -> Unit, onOpenAddFriend: () -> Unit, onOpenChat: (String) -> Unit) {
     Column(modifier = Modifier.fillMaxSize()) {
@@ -61,33 +59,15 @@ fun ContactsScreen(onOpenNearby: () -> Unit, onOpenAddFriend: () -> Unit, onOpen
                     onClick = onOpenNearby,
                 )
             }
-            // 字母分组好友
-            val grouped = DemoData.contacts.groupBy { it.letter }.toSortedMap()
-            grouped.forEach { (letter, list) ->
-                item(key = "header_$letter") { SectionHeader(letter.toString()) }
-                items(list, key = { it.id }) { contact ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { onOpenChat(contact.id) }
-                            .padding(horizontal = 16.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        InitialsAvatar(contact.name, size = 44, corner = 12)
-                        Column(
-                            modifier = Modifier
-                                .weight(1f)
-                                .padding(horizontal = 12.dp),
-                        ) {
-                            Text(contact.name, style = MaterialTheme.typography.bodyLarge)
-                            Text(
-                                contact.status,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                }
+            // 核心数据接入前没有联系人可列出：展示引导空态，而不是演示数据
+            item {
+                EmptyState(
+                    icon = Icons.Filled.People,
+                    title = stringResource(R.string.empty_contacts_title),
+                    hint = stringResource(R.string.empty_contacts_hint),
+                    actionText = stringResource(R.string.empty_action_add_friend),
+                    onAction = onOpenAddFriend,
+                )
             }
         }
     }

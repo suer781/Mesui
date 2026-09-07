@@ -69,7 +69,7 @@ fun MeScreen(onOpenAddFriend: () -> Unit) {
             ) {
                 Text(stringResource(R.string.me_name), style = MaterialTheme.typography.titleLarge)
                 Text(
-                    stringResource(R.string.me_node_id),
+                    stringResource(R.string.me_status_placeholder),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -97,14 +97,6 @@ fun MeScreen(onOpenAddFriend: () -> Unit) {
         SectionCard {
             SettingRow(Icons.Filled.Info, stringResource(R.string.me_row_about), badge = stringResource(R.string.me_badge_unwired))
         }
-        Text(
-            stringResource(R.string.me_footer),
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(20.dp),
-        )
     }
 }
 

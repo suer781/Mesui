@@ -14,6 +14,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -34,29 +35,28 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import chat.dc.app.R
-import chat.dc.app.ui.DemoData
+import chat.dc.app.ui.components.EmptyState
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+/** 单条气泡消息（仅本页内存展示，不落盘；真实收发待核心接入后走信封+队列）。 */
+private data class Message(val text: String, val sent: Boolean, val time: String)
+
 /**
  * 聊天会话页（Telegram 式气泡）：接收=左侧 surfaceVariant，发送=右侧 primaryContainer。
- * 发送仅写入本地演示列表；真实收发在阶段 2 核心接入后走信封+队列。
+ * 核心数据接入前无会话/消息可显示，展示引导空态；输入栏保留，发送仅写入本页内存。
  */
 @Composable
-fun ChatScreen(contactId: String, onBack: () -> Unit) {
-    val conversation = DemoData.conversations.firstOrNull { it.id == contactId }
-        ?: DemoData.conversations.first()
+fun ChatScreen(onBack: () -> Unit, onAddFriend: () -> Unit) {
     val scope = rememberCoroutineScope()
-    val messages = remember(contactId) {
-        mutableStateOf(DemoData.chatDemo[contactId].orEmpty())
-    }
+    val messages = remember { mutableStateOf<List<Message>>(emptyList()) }
     var draft by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 
     Column(modifier = Modifier.fillMaxSize().imePadding()) {
-        // 顶栏
+        // 顶栏：会话名待真实联系人数据接入后显示，先以占位标题呈现
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -66,55 +66,62 @@ fun ChatScreen(contactId: String, onBack: () -> Unit) {
             IconButton(onClick = onBack, modifier = Modifier.testTag("chat_back")) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null)
             }
-            Column {
-                Text(conversation.name, style = MaterialTheme.typography.titleMedium)
-                Text(
-                    text = "端到端加密 · 通道自动协商",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
+            Text(
+                stringResource(R.string.chat_title_placeholder),
+                style = MaterialTheme.typography.titleMedium,
+            )
         }
-        // 气泡列表
-        LazyColumn(
-            state = listState,
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth(),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            items(messages.value.size) { i ->
-                val m = messages.value[i]
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .animateItem(),
-                    horizontalArrangement = if (m.sent) Arrangement.End else Arrangement.Start,
-                ) {
-                    val screenWidth = LocalConfiguration.current.screenWidthDp
-                    Surface(
-                        color = if (m.sent) {
-                            MaterialTheme.colorScheme.primaryContainer
-                        } else {
-                            MaterialTheme.colorScheme.surfaceVariant
-                        },
-                        shape = RoundedCornerShape(
-                            topStart = 18.dp,
-                            topEnd = 18.dp,
-                            bottomStart = if (m.sent) 18.dp else 4.dp,
-                            bottomEnd = if (m.sent) 4.dp else 18.dp,
-                        ),
-                        modifier = Modifier.widthIn(max = (screenWidth * 0.78f).dp),
+        if (messages.value.isEmpty()) {
+            EmptyState(
+                icon = Icons.Filled.ChatBubbleOutline,
+                title = stringResource(R.string.empty_chat_title),
+                hint = stringResource(R.string.empty_chat_hint),
+                actionText = stringResource(R.string.empty_action_add_friend),
+                onAction = onAddFriend,
+                modifier = Modifier.weight(1f),
+            )
+        } else {
+            // 气泡列表
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                items(messages.value.size) { i ->
+                    val m = messages.value[i]
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .animateItem(),
+                        horizontalArrangement = if (m.sent) Arrangement.End else Arrangement.Start,
                     ) {
-                        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-                            Text(m.text, style = MaterialTheme.typography.bodyLarge)
-                            Text(
-                                m.time,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.align(Alignment.End),
-                            )
+                        val screenWidth = LocalConfiguration.current.screenWidthDp
+                        Surface(
+                            color = if (m.sent) {
+                                MaterialTheme.colorScheme.primaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.surfaceVariant
+                            },
+                            shape = RoundedCornerShape(
+                                topStart = 18.dp,
+                                topEnd = 18.dp,
+                                bottomStart = if (m.sent) 18.dp else 4.dp,
+                                bottomEnd = if (m.sent) 4.dp else 18.dp,
+                            ),
+                            modifier = Modifier.widthIn(max = (screenWidth * 0.78f).dp),
+                        ) {
+                            Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                                Text(m.text, style = MaterialTheme.typography.bodyLarge)
+                                Text(
+                                    m.time,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.align(Alignment.End),
+                                )
+                            }
                         }
                     }
                 }
@@ -147,7 +154,7 @@ fun ChatScreen(contactId: String, onBack: () -> Unit) {
                 onClick = {
                     if (draft.isNotBlank()) {
                         val time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
-                        messages.value = messages.value + DemoData.Message(draft.trim(), sent = true, time = time)
+                        messages.value = messages.value + Message(draft.trim(), sent = true, time = time)
                         draft = ""
                         scope.launch { listState.scrollToItem(messages.value.size - 1) }
                     }

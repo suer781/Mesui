@@ -150,7 +150,10 @@ fun MainScaffold() {
             },
         ) {
             composable("messages") {
-                MessagesScreen(onOpenChat = { id -> navController.navigate("chat/$id") })
+                MessagesScreen(
+                    onOpenChat = { id -> navController.navigate("chat/$id") },
+                    onOpenAddFriend = { navController.navigate("add_friend") },
+                )
             }
             composable("contacts") {
                 ContactsScreen(
@@ -167,9 +170,11 @@ fun MainScaffold() {
             composable(
                 route = "chat/{contactId}",
                 arguments = listOf(navArgument("contactId") { type = NavType.StringType }),
-            ) { entry ->
-                val contactId = entry.arguments?.getString("contactId") ?: "c1"
-                ChatScreen(contactId = contactId, onBack = { navController.popBackStack() })
+            ) {
+                ChatScreen(
+                    onBack = { navController.popBackStack() },
+                    onAddFriend = { navController.navigate("add_friend") },
+                )
             }
         }
     }
