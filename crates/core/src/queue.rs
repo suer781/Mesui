@@ -43,7 +43,7 @@ impl Db {
     /// 打开（或创建）加密库。`key` 为 Some 时启用 SQLCipher；
     /// key 必须是 hex/base64 等无引号字符（Kotlin 侧 Keystore 派生后 hex 编码传入）。
     pub fn open(path: &std::path::Path, key: Option<&str>) -> Result<Self> {
-        // 审计 D2：strict_crypto——文件库禁止无密钥静默明文（内存库供测试豁免）
+        // strict_crypto——文件库禁止无密钥静默明文（内存库供测试豁免）
         if key.is_none() && path != std::path::Path::new(":memory:") {
             return Err(CoreError::Db(
                 "refusing to create unencrypted database: key required (strict mode)".into(),
@@ -63,7 +63,7 @@ impl Db {
         Ok(Self { conn })
     }
 
-    /// 红队 red7/red9 修复：外部可控的 u64 时间戳入 i64 列前必须钳制——
+    /// 外部可控的 u64 时间戳入 i64 列前必须钳制——
     /// `u64::MAX as i64` 会变成 -1（排序插队/被 prune 立即清除/重放复活）。
     fn clamp_ms(v: u64) -> i64 {
         i64::try_from(v).unwrap_or(i64::MAX)
@@ -132,7 +132,7 @@ impl Db {
             return Ok(true);
         }
         let delay = policy.next_delay_ms(attempts)?;
-        // 红队 red8 修复：now_ms + delay 在 u64 域饱和，再钳制进 i64 列
+        // now_ms + delay 在 u64 域饱和，再钳制进 i64 列
         let next_attempt = Self::clamp_ms(now_ms.saturating_add(delay));
         self.conn
             .execute(
@@ -206,7 +206,7 @@ impl Db {
     }
 
     /// 收件去重：返回 true = 首次见到（应投递），false = 重复（静默丢弃）。
-    /// 红队 red7 修复：now_ms 钳制进 i64 正数域——u64::MAX 入库会变 -1，
+    /// now_ms 钳制进 i64 正数域——u64::MAX 入库会变 -1，
     /// 随后的 prune_seen(0) 立即删除该记录，构成「重放复活」链。
     pub fn record_seen(&self, msg_id: &MsgId, now_ms: u64) -> Result<bool> {
         let n = self
@@ -219,7 +219,7 @@ impl Db {
         Ok(n == 1)
     }
 
-    /// 审计 A3：裁剪过期去重记录（保留窗口必须 ≥ 最大消息投递延迟，
+    /// 裁剪过期去重记录（保留窗口必须 ≥ 最大消息投递延迟，
     /// 否则旧消息可能被二次接受——调用方窗口不得小于 7 天）。
     pub fn prune_seen(&self, before_ms: u64) -> Result<usize> {
         let n = self

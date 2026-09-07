@@ -1,7 +1,7 @@
 //! 自适应负载引擎：按实时指标自动切换档位（轻载/中载/重载）。
 //! 切换发生在策略层（算法/拓扑），不在语言层——切换零丢失由信封 UUID 去重保证。
 //!
-//! 边界（v9 架构复审决议）：档位**只影响传输策略**（扇出拓扑/批量/压缩/心跳），
+//! 边界：档位**只影响传输策略**（扇出拓扑/批量/压缩/心跳），
 //! 不切换加密协议——群加密协议由建群时定死（隐私群 pairwise / 效率群 OpenMLS），
 //! 因为 pairwise→MLS 是需全群 rekey 的协议迁移，不能当状态机换挡。
 
@@ -79,7 +79,7 @@ impl PolicyEngine {
 
     fn demanded(&self, m: Metrics) -> Tier {
         let t = &self.thresholds;
-        // 红队 red11 修复：非有限速率（NaN/Inf）fail-closed 视为极端负载——
+        // 非有限速率（NaN/Inf）fail-closed 视为极端负载——
         // 异常指标宁可过度配（Heavy），绝不 fail-open 到轻载
         let rate = if m.msg_rate.is_finite() { m.msg_rate } else { f32::INFINITY };
         let high_load = m.group_size > t.group_medium || rate > t.rate_medium;
@@ -96,7 +96,7 @@ impl PolicyEngine {
 
     /// 喂入新指标，返回本采样周期应生效的档位。
     /// 升档即时（宁可过度配，可跳级）；降档**逐级**——每持续低载一个
-    /// demote_samples 周期降一级（Heavy→Medium→Light），暴力验证锁定的契约。
+    /// demote_samples 周期降一级（Heavy→Medium→Light）。
     pub fn observe(&mut self, m: Metrics) -> Tier {
         if self.locked.is_some() {
             return self.current();

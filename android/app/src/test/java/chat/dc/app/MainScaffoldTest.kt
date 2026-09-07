@@ -25,7 +25,7 @@ class MainScaffoldTest {
 
     @Test
     fun messages_tab_shows_empty_state_without_demo_data() {
-        // DemoData 清零：消息页展示引导空态，不再渲染演示会话与气泡
+        // 消息页展示引导空态，不再渲染演示会话与气泡
         compose.onNodeWithText("还没有会话").assertExists()
         compose.onNodeWithText("阿明").assertDoesNotExist()
         compose.onNodeWithText("现在方便说吗？").assertDoesNotExist()

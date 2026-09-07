@@ -38,7 +38,7 @@ fun ContactsScreen(onOpenNearby: () -> Unit, onOpenAddFriend: () -> Unit, onOpen
             modifier = Modifier.padding(horizontal = 20.dp, vertical = 14.dp),
         )
         LazyColumn {
-            // 功能入口（微信排版结构：列表顶部的图标行）
+            // 功能入口（列表顶部的图标行）
             item {
                 EntryRow(
                     icon = { Icon(Icons.Filled.PersonAdd, null, tint = Color.White) },
@@ -82,7 +82,7 @@ private fun EntryRow(
     tag: String,
     onClick: () -> Unit,
 ) {
-    // P3/P8：入口卡片化（色阶容器 + 20dp 大圆角，无边框无阴影）
+    // 入口卡片化（色阶容器 + 20dp 大圆角，无边框无阴影）
     androidx.compose.material3.Card(
         colors = androidx.compose.material3.CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceVariant,

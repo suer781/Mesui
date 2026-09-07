@@ -34,8 +34,8 @@ import chat.dc.app.R
 import chat.dc.app.ui.components.InitialsAvatar
 
 /**
- * 「我的」主 tab：个人资料卡 + 设置分区列表（排版结构参考微信，样式原创）。
- * 各行均为入口占位；设置中心十二类随阶段 8 完整接入。
+ * 「我的」主 tab：个人资料卡 + 设置分区列表。
+ * 各行均为入口占位；设置中心十二类待接入。
  */
 @Composable
 fun MeScreen(onOpenAddFriend: () -> Unit) {
@@ -44,7 +44,7 @@ fun MeScreen(onOpenAddFriend: () -> Unit) {
             .fillMaxSize()
             .verticalScroll(rememberScrollState()),
     ) {
-        // 个人资料卡（P6 水生渐变：primaryContainer→tertiaryContainer 柔和底）
+        // 个人资料卡（水生渐变：primaryContainer→tertiaryContainer 柔和底）
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -123,7 +123,7 @@ private fun SettingRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { /* 阶段 8 接入设置子页 */ }
+            .clickable { /* 待接入设置子页 */ }
             .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

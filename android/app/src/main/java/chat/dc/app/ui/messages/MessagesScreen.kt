@@ -48,7 +48,7 @@ fun MessagesScreen(onOpenChat: (String) -> Unit, onOpenAddFriend: () -> Unit = {
                 style = MaterialTheme.typography.headlineMedium,
                 modifier = Modifier.weight(1f),
             )
-            // P8 收纳：新会话入口 = 添加好友（联系人来自这里）
+            // 收纳：新会话入口 = 添加好友（联系人来自这里）
             Box(
                 modifier = Modifier
                     .size(40.dp)

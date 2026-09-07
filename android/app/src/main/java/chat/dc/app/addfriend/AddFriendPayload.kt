@@ -7,11 +7,11 @@ import com.google.zxing.qrcode.QRCodeWriter
 import java.security.SecureRandom
 
 /**
- * 加好友二维码载荷（SP-3 v2：二维码取代 NFC 成为带外引导通道）。
+ * 加好友二维码载荷（二维码取代 NFC 成为带外引导通道）。
  *
  * 载荷 = dc://add URI：身份公钥 + 当前节点密钥 + 随机信箱桶 + 单次 bootstrap token。
  * token 是带外秘密：后续蓝牙/网络首条消息必须携带它的派生确认（防中间人顶替），
- * 且单次有效。身份↔节点密钥的绑定只在双方 Signal 会话内生效（A1 决议）。
+ * 且单次有效。身份↔节点密钥的绑定只在双方 Signal 会话内生效。
  */
 data class AddFriendPayload(
     val identity: ByteArray,
@@ -25,7 +25,7 @@ data class AddFriendPayload(
     }
 
     fun fingerprintGroups(): String {
-        // 占位指纹：真实 1024 位指纹来自 Rust 核心（阶段 2 UniFFI 接入）
+        // 占位指纹：真实 1024 位指纹来自 Rust 核心（UniFFI 接入）
         val all = identity + nodeKey + token
         return all.take(16).joinToString("") { "%02x".format(it) }
             .chunked(8)
@@ -37,7 +37,7 @@ data class AddFriendPayload(
 
         fun generate(security: SecureRandom = SecureRandom()): AddFriendPayload {
             fun random(n: Int) = ByteArray(n).also(security::nextBytes)
-            // 阶段 2 前 identity/nodeKey 为占位长度；token 384 bit 为规格要求
+            // identity/nodeKey 为占位长度；token 384 bit 为规格要求
             return AddFriendPayload(random(32), random(32), random(32), random(48))
         }
 
@@ -82,7 +82,7 @@ object QrCodec {
 }
 
 /**
- * 动态分帧二维码（SP-3 v3，模式为公开的 animated-QR airgap 技术）：
+ * 动态分帧二维码：
  * 载荷切成 N 个数据帧循环播放，混入随机噪声帧——单帧/单张截图不含完整信息；
  * 扫描端**持续采集，集齐全部数据帧且经过 ≥[MIN_COLLECT_MS] 才算完成**，
  * 完成后才允许进入蓝牙协商。
@@ -132,7 +132,7 @@ object FrameCodec {
 
 /** 扫描端采集状态机：锁定首个会话、集齐 + 时长门槛（时钟注入，可测）。
  *  锁定语义：先到先锁，异会话帧全部忽略（防污染）；被抢先锁死时调 [reset] 重扫。
- *  假载荷顶替由安全码比对兜底（SP-3 第 5 步），采集层不做真伪判断。 */
+ *  假载荷顶替由安全码比对兜底，采集层不做真伪判断。 */
 class FrameCollector(private val minCollectMs: Long = FrameCodec.MIN_COLLECT_MS) {
     data class State(
         val collected: Int,

@@ -1,4 +1,4 @@
-//! 人群转发票（SP-7 限额陌生人中继）：时间加盐防重放。
+//! 人群转发票（限额陌生人中继）：时间加盐防重放。
 //!
 //! 威胁：中继者读不到信封内文（无法按 msg_id 去重），嗅探到的合法投递
 //! 可被无限重放——每份副本都占用中继的限额与内存，把正规流量挤死。
@@ -22,7 +22,7 @@ pub const MAX_TICKET_TTL_MS: u64 = 2 * 60 * 60 * 1000; // 2 小时
 
 #[derive(Clone, Debug)]
 pub struct RelayTicket {
-    /// 目的地 = 收件方当前**轮换节点密钥**（陌生人永远见不到长期身份，A1）
+    /// 目的地 = 收件方当前**轮换节点密钥**（陌生人永远见不到长期身份）
     pub dest_node_key: NodeId,
     /// 来源节点密钥（签署者）
     pub origin_node_key: NodeId,
@@ -98,7 +98,7 @@ impl RelayTicket {
         if self.expiry_ms.saturating_sub(self.issued_at_ms) > MAX_TICKET_TTL_MS {
             return Err(CoreError::Crypto("ticket ttl exceeds cap".into()));
         }
-        // 红队 red3 修复：未来生效的票（issued_at ≫ now）不得占用缓存槽
+        // 未来生效的票（issued_at ≫ now）不得占用缓存槽
         let skew = 2 * 60 * 1000;
         if self.issued_at_ms > now_ms + skew {
             return Err(CoreError::Crypto("ticket issued in the future".into()));
@@ -120,9 +120,9 @@ impl RelayTicket {
 }
 
 /// 中继侧防重放闸门：票据缓存按过期时间逐出（**永不整体清空**——防灌满重放），
-/// 含挑战绑定与基础限额。P0 修复后无独立计数簿记——来源占用数从 seen 现算，
+/// 含挑战绑定与基础限额。无独立计数簿记——来源占用数从 seen 现算，
 /// 永不与实际状态失同步。
-/// 红队 red2 修复：缓存值含**挑战哈希**——旧挑战的条目已不可能通过 verify
+/// 缓存值含**挑战哈希**——旧挑战的条目已不可能通过 verify
 /// （纯死重），accept 时优先逐出它们，当前挑战的活条目尽量保全。
 pub struct RelayGuard {
     seen: HashMap<[u8; 32], (u64, NodeId, [u8; 32])>, // 票指纹 → (expiry, 来源钥, 挑战)
@@ -134,14 +134,14 @@ const MAX_SLOTS_PER_ORIGIN: usize = 4;
 
 impl RelayGuard {
     pub fn new(max_entries: usize) -> Self {
-        // 审计 P2 修复：容量 0 会让逐出循环空转死循环，强制下限 1
+        // 容量 0 会让逐出循环空转死循环，强制下限 1
         Self {
             seen: HashMap::new(),
             max_entries: max_entries.max(1),
         }
     }
 
-    /// 当前某来源在缓存中的占用数——**从 seen 现算**（审计 P0 修复：
+    /// 当前某来源在缓存中的占用数——**从 seen 现算**（
     /// 独立计数簿记在 retain 逐出时不同步，曾造成死循环 DoS）
     fn origin_count(&self, origin: &NodeId) -> usize {
         self.seen.values().filter(|(_, o, _)| o == origin).count()
@@ -163,7 +163,7 @@ impl RelayGuard {
         }
         // 1) 逐出已过期票据
         self.seen.retain(|_, (exp, _, _)| *exp + 2 * 60 * 1000 > now_ms);
-        // 2) 红队 red2 修复：逐出旧挑战的死条目（它们对新握手已无保护价值）
+        // 2) 逐出旧挑战的死条目（它们对新握手已无保护价值）
         self.seen.retain(|_, (_, _, ch)| *ch == expected_challenge);
         // 3) 单来源限占：洪泛只挤占攻击者自己的槽位（计数现算，循环必有界）
         while self.origin_count(&ticket.origin_node_key) >= MAX_SLOTS_PER_ORIGIN {
@@ -178,7 +178,7 @@ impl RelayGuard {
             };
             self.seen.remove(&fp);
         }
-        // 4) 全局容量：先逐旧挑战死条目，仍满则**拒绝新票**（红队 red2 修复：
+        // 4) 全局容量：先逐旧挑战死条目，仍满则**拒绝新票**（
         //    不逐出当前挑战的活条目——防重放完整性优先于新票可用性；
         //    拒绝是有界可用性损失（≤2h 过期 drained），逐出是无界重放复活）
         while self.seen.len() >= self.max_entries {
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn cache_flood_cannot_evict_live_ticket() {
-        // C1/red2 回归：同一挑战纪元内，多来源洪泛垃圾票试图挤掉合法活票的
+        // 同一挑战纪元内，多来源洪泛垃圾票试图挤掉合法活票的
         // 防重放指纹。修复后策略 = 活条目绝不逐出、满员即 fail-closed 拒新——
         // 重放保护完整性优先于新票可用性。
         let (_, live) = ticket(1000, [1; 32], [4; 16]);

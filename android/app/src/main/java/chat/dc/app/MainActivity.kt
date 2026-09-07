@@ -44,7 +44,7 @@ import chat.dc.app.ui.messages.MessagesScreen
 import chat.dc.app.ui.theme.DCChatTheme
 
 /**
- * 底部导航三主 tab：消息 / 联系人 / 我的（排版结构参考微信，样式原创）。
+ * 底部导航三主 tab：消息 / 联系人 / 我的。
  * 每个功能区一律独立子页面，不在主页面堆砌功能。
  */
 class MainActivity : ComponentActivity() {
@@ -65,7 +65,7 @@ class MainActivity : ComponentActivity() {
 
     /** 「人人即节点」：进入应用即启动前台服务（用户可关）。
      *  通知权限被拒也照常启动——服务照跑，只是常驻通知不显示。
-     *  残留#4 修复：启动动作只在权限回调里执行一次，避免双启动。 */
+     *  启动动作只在权限回调里执行一次，避免双启动。 */
     private fun ensureNodeService() {
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -127,7 +127,7 @@ fun MainScaffold() {
             }
         },
     ) { innerPadding ->
-        // P1 速度感（Telegram）：全导航统一 200ms 淡入轻移，退场更快（150ms）
+        // 全导航统一 200ms 淡入轻移，退场更快（150ms）
         NavHost(
             navController = navController,
             startDestination = "messages",
