@@ -24,12 +24,9 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 getrandom = "0.3"
 rusqlite = { version = "0.32", optional = true, features = ["bundled-sqlcipher"] }
 zstd = { version = "0.13", optional = true }
-# signalapp/libsignal 官方 monorepo。原计划 git 依赖 + rev 锁定，
-# 但本机网络对 GitHub 全量克隆限速（GFW），改为「浅抓取锁定 commit + path 依赖」：
-# third_party/libsignal 已 fetch-by-SHA 至 eb7864c4d15435ee33681ce828930d9a4296f155，
-# HEAD 哈希即信任锚（内容篡改会破坏哈希链，无法伪装同 commit）。
-# 网络条件允许时切回: { git = "https://github.com/signalapp/libsignal", rev = "eb7864c..." }
-libsignal-protocol = { path = "../../third_party/libsignal/rust/protocol", optional = true }
+# signalapp/libsignal 官方 monorepo。vendored 在 mesui-vendor/libsignal
+# （fetch-by-SHA 至 eb7864c4d15435ee33681ce828930d9a4296f155，HEAD 哈希即信任锚）。
+libsignal-protocol = { path = "C:/Users/13682/mesui-vendor/libsignal/rust/protocol", optional = true }
 iroh = { version = "1", optional = true }
 uniffi = { version = "0.29", optional = true, features = ["build"] }
 
