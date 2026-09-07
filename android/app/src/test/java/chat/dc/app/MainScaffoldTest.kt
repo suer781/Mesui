@@ -30,10 +30,11 @@ class MainScaffoldTest {
         compose.onNodeWithText("阿明").assertDoesNotExist()
         compose.onNodeWithText("现在方便说吗？").assertDoesNotExist()
         compose.onNodeWithTag("new_chat").assertExists()
-        // 空态行动按钮 → 添加好友子页
+        // 空态行动按钮 → 添加好友「选角色」入口（出示/扫码二选一，不同屏）
         compose.onNodeWithText("去添加好友").performClick()
         compose.waitForIdle()
-        compose.onNodeWithTag("qr_image").assertExists()
+        compose.onNodeWithTag("role_show").assertExists()
+        compose.onNodeWithTag("role_scan").assertExists()
     }
 
     @Test
@@ -46,14 +47,32 @@ class MainScaffoldTest {
     }
 
     @Test
-    fun add_friend_flow_renders_dynamic_qr() {
+    fun add_friend_role_show_renders_dynamic_qr_only() {
         compose.onNodeWithTag("tab_contacts").performClick()
         compose.waitForIdle()
         compose.onNodeWithTag("open_add_friend").performClick()
         compose.waitForIdle()
-        // 动态码在滚动（无相机权限 → 显示授权按钮而非取景器）
+        // 入口是选角色页：出示与扫码绝不同屏
+        compose.onNodeWithTag("role_show").assertExists()
+        compose.onNodeWithTag("role_scan").assertExists()
+        // 选「出示我的码」→ 只有动态码，没有取景器
+        compose.onNodeWithTag("role_show").performClick()
+        compose.waitForIdle()
         compose.onNodeWithTag("qr_image").assertExists()
+        compose.onNodeWithTag("scan_view").assertDoesNotExist()
+    }
+
+    @Test
+    fun add_friend_role_scan_without_camera_shows_grant_button() {
+        compose.onNodeWithTag("tab_contacts").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithTag("open_add_friend").performClick()
+        compose.waitForIdle()
+        // 选「扫码添加」→ 无相机权限时显示授权按钮，且没有「我的动态码」
+        compose.onNodeWithTag("role_scan").performClick()
+        compose.waitForIdle()
         compose.onNodeWithTag("grant_camera").assertExists()
+        compose.onNodeWithTag("qr_image").assertDoesNotExist()
     }
 
     @Test

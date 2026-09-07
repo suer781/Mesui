@@ -34,7 +34,9 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
-import chat.dc.app.addfriend.AddFriendScreen
+import chat.dc.app.addfriend.AddFriendRoleScreen
+import chat.dc.app.addfriend.ShowMyCodeScreen
+import chat.dc.app.addfriend.ScanToAddScreen
 import chat.dc.app.nearby.NearbyScreen
 import chat.dc.app.ui.chat.ChatScreen
 import chat.dc.app.ui.contacts.ContactsScreen
@@ -166,7 +168,15 @@ fun MainScaffold() {
                 MeScreen(onOpenAddFriend = { navController.navigate("add_friend") })
             }
             composable("nearby") { NearbyScreen() }
-            composable("add_friend") { AddFriendScreen() }
+            // 加好友入口先选角色，出示码与扫码是两个独立页，绝不同屏（安全）
+            composable("add_friend") {
+                AddFriendRoleScreen(
+                    onShow = { navController.navigate("add_friend_show") },
+                    onScan = { navController.navigate("add_friend_scan") },
+                )
+            }
+            composable("add_friend_show") { ShowMyCodeScreen() }
+            composable("add_friend_scan") { ScanToAddScreen() }
             composable(
                 route = "chat/{contactId}",
                 arguments = listOf(navArgument("contactId") { type = NavType.StringType }),

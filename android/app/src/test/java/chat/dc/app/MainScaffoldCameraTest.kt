@@ -38,6 +38,9 @@ class MainScaffoldCameraTest {
         compose.waitForIdle()
         compose.onNodeWithTag("open_add_friend").performClick()
         compose.waitForIdle()
+        // 入口先选角色：进入「扫码添加」独立页
+        compose.onNodeWithTag("role_scan").performClick()
+        compose.waitForIdle()
         compose.onNodeWithTag("scan_view").assertExists()
         compose.onNodeWithText("对准对方滚动的动态码，保持约 3 秒即可读全").assertExists()
         // 页面尾部的提示文本也必须存在：配合 verticalScroll，小屏不得裁掉内容
