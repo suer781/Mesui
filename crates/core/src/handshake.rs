@@ -17,9 +17,10 @@ use libsignal_protocol::{
     CiphertextMessageType, DeviceId, Direction, Fingerprint, GenericSignedPreKey, IdentityChange,
     IdentityKey, IdentityKeyPair, IdentityKeyStore, InMemSignalProtocolStore, KeyPair,
     KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle, PreKeyId, PreKeyRecord,
-    PreKeySignalMessage, PreKeyStore, ProtocolAddress, SignalMessage, SignedPreKeyId,
+    PreKeySignalMessage, PreKeyStore, ProtocolAddress, PublicKey, SignalMessage, SignedPreKeyId,
     SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
 };
+use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// SAS Fingerprint 参数：libsignal 版本 2、Signal 惯用 5200 次迭代。
@@ -282,6 +283,81 @@ pub fn verify_first_message_mac(
     Ok(())
 }
 
+/// PreKeyBundle 的上线格式：QR 分帧 / 蓝牙字节通道承载它。
+/// 用公开 getter 抽字段（id 类型 derive 了 Into<u32>，公钥/身份钥走各自 serialize），
+/// CBOR 打包；对端用 PreKeyBundle::new 精确重建，字段一一对应。
+#[derive(Serialize, Deserialize)]
+struct WirePreKeyBundle {
+    registration_id: u32,
+    device_id: u8,
+    pre_key_id: Option<u32>,
+    pre_key_public: Option<Vec<u8>>,
+    signed_pre_key_id: u32,
+    signed_pre_key_public: Vec<u8>,
+    signed_pre_key_signature: Vec<u8>,
+    kyber_pre_key_id: u32,
+    kyber_pre_key_public: Vec<u8>,
+    kyber_pre_key_signature: Vec<u8>,
+    identity_key: Vec<u8>,
+}
+
+/// 把 PreKeyBundle 序列化成可放进 QR / 走蓝牙的字节。
+pub fn bundle_to_wire(bundle: &PreKeyBundle) -> Result<Vec<u8>> {
+    let w = WirePreKeyBundle {
+        registration_id: bundle.registration_id().map_err(crypto_err)?,
+        device_id: u8::from(bundle.device_id().map_err(crypto_err)?),
+        pre_key_id: bundle.pre_key_id().map_err(crypto_err)?.map(u32::from),
+        pre_key_public: bundle
+            .pre_key_public()
+            .map_err(crypto_err)?
+            .map(|k| k.serialize().to_vec()),
+        signed_pre_key_id: u32::from(bundle.signed_pre_key_id().map_err(crypto_err)?),
+        signed_pre_key_public: bundle
+            .signed_pre_key_public()
+            .map_err(crypto_err)?
+            .serialize()
+            .to_vec(),
+        signed_pre_key_signature: bundle.signed_pre_key_signature().map_err(crypto_err)?.to_vec(),
+        kyber_pre_key_id: u32::from(bundle.kyber_pre_key_id().map_err(crypto_err)?),
+        kyber_pre_key_public: bundle
+            .kyber_pre_key_public()
+            .map_err(crypto_err)?
+            .serialize()
+            .to_vec(),
+        kyber_pre_key_signature: bundle.kyber_pre_key_signature().map_err(crypto_err)?.to_vec(),
+        identity_key: bundle.identity_key().map_err(crypto_err)?.serialize().to_vec(),
+    };
+    let mut buf = Vec::with_capacity(2048);
+    ciborium::ser::into_writer(&w, &mut buf).map_err(|e| CoreError::Cbor(e.to_string()))?;
+    Ok(buf)
+}
+
+/// 从 QR / 蓝牙收到的字节重建 PreKeyBundle（扫码方 process 之前的入口）。
+pub fn bundle_from_wire(bytes: &[u8]) -> Result<PreKeyBundle> {
+    let w: WirePreKeyBundle =
+        ciborium::de::from_reader(bytes).map_err(|e| CoreError::Cbor(e.to_string()))?;
+    let pre_key = match (w.pre_key_id, w.pre_key_public) {
+        (Some(id), Some(pk)) => Some((
+            PreKeyId::from(id),
+            PublicKey::try_from(pk.as_slice()).map_err(crypto_err)?,
+        )),
+        _ => None,
+    };
+    PreKeyBundle::new(
+        w.registration_id,
+        DeviceId::new(w.device_id).map_err(crypto_err)?,
+        pre_key,
+        SignedPreKeyId::from(w.signed_pre_key_id),
+        PublicKey::try_from(w.signed_pre_key_public.as_slice()).map_err(crypto_err)?,
+        w.signed_pre_key_signature,
+        KyberPreKeyId::from(w.kyber_pre_key_id),
+        kem::PublicKey::deserialize(&w.kyber_pre_key_public).map_err(crypto_err)?,
+        w.kyber_pre_key_signature,
+        IdentityKey::decode(&w.identity_key).map_err(crypto_err)?,
+    )
+    .map_err(crypto_err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,5 +480,67 @@ mod tests {
         let mut tampered = ct.to_vec();
         tampered[0] ^= 1;
         assert!(verify_first_message_mac(&token, &bucket, &tampered, &mac).is_err());
+    }
+
+    /// 上线格式往返：bundle 序列化成字节再重建，仍能正常 process 并收发。
+    #[test]
+    fn bundle_wire_roundtrip_usable() {
+        let mut alice = Device::generate("a").unwrap();
+        let mut bob = Device::generate("b").unwrap();
+        let alice_addr = alice.address().clone();
+        let bob_addr = bob.address().clone();
+        let wire = bundle_to_wire(&bob.prekey_bundle().unwrap()).unwrap();
+        alice
+            .process_bundle(&bob_addr, &bundle_from_wire(&wire).unwrap())
+            .unwrap();
+        let (t, ct) = alice.encrypt(&bob_addr, b"roundtrip").unwrap();
+        assert_eq!(bob.decrypt(&alice_addr, t, &ct).unwrap(), b"roundtrip");
+    }
+
+    /// 端到端连接流程（模拟「扫码拼接 + 蓝牙字节通道」）：
+    /// Bob 出示 bundle → 上线格式 → Alice 扫码拼接后重建并跑 PQXDH →
+    /// 首条消息带 token-MAC（Bob 先验 MAC 再解密）→ 双向 SAS 一致（用户肉眼比对）→
+    /// TOFU pin 对方长期钥 → 之后双向 Double Ratchet 加密聊天。
+    #[test]
+    fn full_connection_flow_over_wire() {
+        let token = [0x5Au8; 48];
+        let bucket = [0x3Cu8; 32];
+
+        let mut alice = Device::generate("alice-uuid").unwrap();
+        let mut bob = Device::generate("bob-uuid").unwrap();
+        let alice_addr = alice.address().clone();
+        let bob_addr = bob.address().clone();
+
+        // 1) Bob 出示：bundle → QR/蓝牙字节；2) Alice 扫码拼接后重建，跑 PQXDH
+        let wire = bundle_to_wire(&bob.prekey_bundle().unwrap()).unwrap();
+        alice
+            .process_bundle(&bob_addr, &bundle_from_wire(&wire).unwrap())
+            .unwrap();
+
+        // 3) Alice 发首条握手消息 + token-MAC；Bob 先验带外 MAC 再解密
+        let (t1, ct1) = alice.encrypt(&bob_addr, b"handshake hello").unwrap();
+        let mac = first_message_mac(&token, &bucket, &ct1);
+        verify_first_message_mac(&token, &bucket, &ct1, &mac).unwrap();
+        assert_eq!(bob.decrypt(&alice_addr, t1, &ct1).unwrap(), b"handshake hello");
+
+        // 4) 双方各自算 SAS：必须一致（否则说明被中间人，用户比对 6 位短码即可发现）
+        let aik = alice.identity_key().unwrap();
+        let bik = bob.identity_key().unwrap();
+        let (_, a6) = sas_code(b"alice", &aik, b"bob", &bik).unwrap();
+        let (_, b6) = sas_code(b"bob", &bik, b"alice", &aik).unwrap();
+        assert_eq!(a6, b6, "连接后两端 SAS 必须一致");
+
+        // 5) 比对通过 → TOFU pin 对方长期钥（此后重连免扫码）
+        alice.pin_identity(&bob_addr, &bik).unwrap();
+        bob.pin_identity(&alice_addr, &aik).unwrap();
+
+        // 6) 之后双向 Double Ratchet 加密聊天
+        let (t2, ct2) = bob.encrypt(&alice_addr, b"hi alice, connected").unwrap();
+        assert_eq!(
+            alice.decrypt(&bob_addr, t2, &ct2).unwrap(),
+            b"hi alice, connected"
+        );
+        let (t3, ct3) = alice.encrypt(&bob_addr, b"msg after connect").unwrap();
+        assert_eq!(bob.decrypt(&alice_addr, t3, &ct3).unwrap(), b"msg after connect");
     }
 }
