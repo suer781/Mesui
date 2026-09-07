@@ -5,11 +5,87 @@ on:
     branches: [main]
   workflow_dispatch:
 
+env:
+  # libsignal vendored 锚点，与 crates/core/Cargo.toml 注释一致（HEAD 哈希即信任锚）
+  LIBSIGNAL_REV: eb7864c4d15435ee33681ce828930d9a4296f155
+  # third_party/iroh 与 third_party/iroh-relay 的版本（本地 vendored 副本同源，
+  # 与 Cargo.lock 对应）；CI 从 crates.io 取同版本发布包源码
+  IROH_VERSION: "1.1.0"
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+
+      # ================= Rust 核心（NDK 交叉编译，先于 Kotlin） =================
+
+      - name: 安装 Rust stable + Android 目标
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      # 依赖编译缓存（iroh/libsignal 体积大，三个 ABI 冷编译约 30+ 分钟）
+      - name: 缓存 Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/core
+
+      - name: 安装 cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: 安装 protoc（libsignal 后量子棘轮的 protobuf 代码生成需要）
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: 定位预装 Android NDK
+        run: |
+          if [ -z "${ANDROID_NDK_HOME:-}" ]; then
+            NDK_ROOT="${ANDROID_NDK_ROOT:-}"
+            if [ -z "$NDK_ROOT" ]; then
+              NDK_ROOT="$(ls -d "${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"/ndk/* 2>/dev/null | head -1)"
+            fi
+            echo "ANDROID_NDK_HOME=$NDK_ROOT" >> "$GITHUB_ENV"
+            echo "使用 NDK: $NDK_ROOT"
+          else
+            echo "使用预装 NDK: $ANDROID_NDK_HOME"
+          fi
+
+      # third_party/ 不入库（.gitignore），CI 上按本地同布局补齐：
+      # - libsignal：fetch-by-SHA 浅抓取（全量 clone 数百 MB，会被限速拖死）
+      # - iroh / iroh-relay：crates.io 发布包展开成 [patch.crates-io] 指向的目录；
+      #   发布包字段已内联（无工作区继承），展开即用。Linux 交叉编译 Android 为
+      #   ELF，无 windows-gnu 的 PE 导出表 65535 上限问题，无需本地那套清单改动。
+      - name: 补齐 vendored 依赖（third_party）
+        run: |
+          mkdir -p third_party/libsignal
+          git init -q third_party/libsignal
+          git -C third_party/libsignal remote add origin https://github.com/signalapp/libsignal
+          git -C third_party/libsignal fetch -q --depth 1 origin "$LIBSIGNAL_REV"
+          git -C third_party/libsignal checkout -q --detach FETCH_HEAD
+
+          mkdir -p third_party/iroh third_party/iroh-relay
+          curl -fsSL "https://static.crates.io/crates/iroh/iroh-${IROH_VERSION}.crate" \
+            | tar xz -C third_party/iroh --strip-components=1
+          curl -fsSL "https://static.crates.io/crates/iroh-relay/iroh-relay-${IROH_VERSION}.crate" \
+            | tar xz -C third_party/iroh-relay --strip-components=1
+
+      # 交叉编译 Rust 核心到三个 ABI，libdc_core.so 输出到 jniLibs。
+      # 仓库 .cargo/config.toml 的 [env] OPENSSL_DIR 指向本机 MSYS2（Linux 上不
+      # 存在），libsqlite3-sys 构建脚本会在进入 vendored 分支前因 include 目录
+      # 不存在而 panic；这里改指到空目录满足存在性检查，真实头文件与链接由
+      # vendored-openssl 特性（openssl-src，用 cargo-ndk 注入的 NDK 工具链）提供。
+      - name: cargo-ndk 交叉编译 Rust 核心
+        env:
+          # 覆盖配置里的 Windows 专用 OPENSSL_DIR（真实环境变量优先于 config [env]）
+          OPENSSL_DIR: /tmp/openssl-dummy
+        run: |
+          mkdir -p /tmp/openssl-dummy/include /tmp/openssl-dummy/lib
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
+            -o android/app/src/main/jniLibs \
+            build --release --lib -p dc-core --features vendored-openssl
+
+      # ================= Kotlin / APK =================
 
       - name: 设置 JDK 17
         uses: actions/setup-java@v5

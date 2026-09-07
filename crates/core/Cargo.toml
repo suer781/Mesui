@@ -5,6 +5,11 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 description = "去中心化聊天核心：身份 / 熵源 / CBOR 信封 / 自适应策略 / 加密队列 / 传输"
 
+[lib]
+# cdylib：cargo-ndk 产出 libdc_core.so 放入 Android jniLibs；
+# lib：保留 rlib 供本仓测试 / 示例 / 集成测试链接
+crate-type = ["cdylib", "lib"]
+
 # 功能分层：默认全开；--no-default-features 可只验证纯逻辑层
 [features]
 default = ["db", "compress", "signal", "iroh-net"]
@@ -13,6 +18,10 @@ compress = ["dep:zstd"]                  # 中/重载档批量压缩
 signal = ["dep:libsignal-protocol"]      # Signal 官方 monorepo（git 依赖）
 iroh-net = ["dep:iroh"]                  # P2P 管道（QUIC 打洞 + 中继）
 ffi = ["dep:uniffi"]                     # UniFFI Kotlin 绑定（Android 集成时开）
+# 交叉编译 Android 等无系统 OpenSSL 的目标时用：SQLCipher 的 C 编译需要
+# OpenSSL 头文件，改由 openssl-src 从源码 vendor（走 cargo-ndk 注入的 NDK
+# 工具链）。本机 windows-gnu 仍走 OPENSSL_DIR 指向的 MSYS2 libcrypto。
+vendored-openssl = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
 
 [dependencies]
 thiserror = "2"
@@ -24,9 +33,10 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 getrandom = "0.3"
 rusqlite = { version = "0.32", optional = true, features = ["bundled-sqlcipher"] }
 zstd = { version = "0.13", optional = true }
-# signalapp/libsignal 官方 monorepo。vendored 在 mesui-vendor/libsignal
-# （fetch-by-SHA 至 eb7864c4d15435ee33681ce828930d9a4296f155，HEAD 哈希即信任锚）。
-libsignal-protocol = { path = "C:/Users/13682/mesui-vendor/libsignal/rust/protocol", optional = true }
+# signalapp/libsignal 官方 monorepo。vendored 在 third_party/libsignal
+# （fetch-by-SHA 至 eb7864c4d15435ee33681ce828930d9a4296f155，HEAD 哈希即信任锚）；
+# CI 上由 workflow 浅抓取同一 commit 放到同一路径（third_party/ 不入库）。
+libsignal-protocol = { path = "../../third_party/libsignal/rust/protocol", optional = true }
 iroh = { version = "1", optional = true }
 uniffi = { version = "0.29", optional = true, features = ["build"] }
 

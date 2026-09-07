@@ -2,10 +2,15 @@
 resolver = "2"
 members = ["crates/core"]
 
-# vendored 依赖在项目树外（C:/Users/13682/mesui-vendor/），
-# 由 docs/ENVIRONMENT.md 记录的 fetch-by-SHA 流程填充。
-# 不入 GitHub 仓库（100+MB 上游源码，且 Mimosa 扫描会误报上游测试夹具）。
-[patch.crates-io]
-iroh = { path = "C:/Users/13682/mesui-vendor/iroh" }
-iroh-relay = { path = "C:/Users/13682/mesui-vendor/iroh-relay" }
+# third_party/libsignal 是独立工作区（vendored 浅抓取），必须排除，
+# 否则其 workspace.package 继承会被外层工作区错误接管
+exclude = ["third_party"]
 
+# iroh 1.1 官方 crate-type 含 "cdylib"，在 windows-gnu 下触发 PE 导出表
+# 65535 上限（iroh-relay 导出 6.7 万符号）链接失败。本项目只需 rlib，
+# 故 vendored 去掉 cdylib 后经 patch 接入（源码零改动，仅清单）。
+# CI 上 Linux 交叉编译 Android 不受此影响（ELF 格式无此限制），但 patch
+# 对所有目标生效所以保留。
+[patch.crates-io]
+iroh = { path = "third_party/iroh" }
+iroh-relay = { path = "third_party/iroh-relay" }
