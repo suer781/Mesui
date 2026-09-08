@@ -25,7 +25,7 @@ required-features = ["ffi"]
 default = ["db", "compress", "signal", "iroh-net"]
 db = ["dep:rusqlite"]                    # SQLCipher 加密本地库
 compress = ["dep:zstd"]                  # 中/重载档批量压缩
-signal = ["dep:libsignal-protocol", "dep:rand", "dep:futures"]  # Signal 官方 monorepo（vendored）+ 握手所需 RNG/executor
+signal = ["dep:libsignal-protocol", "dep:rand", "dep:futures", "dep:async-trait", "db"]  # Signal 官方 monorepo（vendored）+ 握手所需 RNG/executor；store 落库需 db
 iroh-net = ["dep:iroh"]                  # P2P 管道（QUIC 打洞 + 中继）
 ffi = ["dep:uniffi"]                     # UniFFI Kotlin 绑定（Android 集成时开）
 # 交叉编译 Android 等无系统 OpenSSL 的目标时用：SQLCipher 的 C 编译需要
@@ -51,6 +51,7 @@ libsignal-protocol = { path = "../../third_party/libsignal/rust/protocol", optio
 # futures 提供 block_on 驱动 libsignal 的 ?Send async trait。
 rand = { version = "0.9", optional = true }
 futures = { version = "0.3", optional = true }
+async-trait = { version = "0.1", optional = true } # 实现 libsignal 的 ?Send async store trait（版本随 lock 统一到 0.1.92）
 iroh = { version = "1", optional = true }
 uniffi = { version = "0.29", optional = true, features = ["build", "cli"] }
 

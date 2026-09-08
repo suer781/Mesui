@@ -868,6 +868,7 @@ dependencies = [
 name = "dc-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "ciborium",
  "ed25519-dalek 2.2.0",
