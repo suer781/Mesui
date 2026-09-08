@@ -10,7 +10,9 @@ use rusqlite::{params, Connection};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 联系人（字段对齐 wiki 阶段 3 任务 4：身份公钥、备注、SAS 校验状态、桶地址）。
+/// 联系人（字段对齐 wiki 阶段 3 任务 4：身份公钥、备注、SAS 校验状态、桶地址；
+/// link_secret=S_i 好友间配对时交换的共享秘密，驱动布隆过滤器回连的派生 ID 与
+/// HMAC 挑战应答，见 ble 层设计）。
 #[derive(Debug, Clone)]
 pub struct ContactInfo {
     pub name: String,
@@ -19,6 +21,7 @@ pub struct ContactInfo {
     pub verified: bool,
     pub note: String,
     pub added_ms: i64,
+    pub link_secret: Vec<u8>,
 }
 
 /// 一条聊天记录（显示用；传输重试是 queue.rs 的职责，不在此混用）。
@@ -37,7 +40,8 @@ CREATE TABLE IF NOT EXISTS contacts (
     bucket BLOB NOT NULL,
     verified INTEGER NOT NULL DEFAULT 0,
     note TEXT NOT NULL DEFAULT '',
-    added_ms INTEGER NOT NULL
+    added_ms INTEGER NOT NULL,
+    link_secret BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS chat_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,6 +98,7 @@ impl ContactStore {
         bucket: &[u8],
         verified: bool,
         note: &str,
+        link_secret: &[u8],
     ) -> Result<()> {
         if identity.len() != 32 {
             return Err(CoreError::Config("contact identity must be 32 bytes".into()));
@@ -101,13 +106,16 @@ impl ContactStore {
         if bucket.len() != 32 {
             return Err(CoreError::Config("contact bucket must be 32 bytes".into()));
         }
+        if link_secret.len() != 32 {
+            return Err(CoreError::Config("contact link_secret must be 32 bytes".into()));
+        }
         let conn = self.conn.lock().map_err(|e| CoreError::Db(e.to_string()))?;
         conn.execute(
-            "INSERT INTO contacts (name, identity, bucket, verified, note, added_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO contacts (name, identity, bucket, verified, note, added_ms, link_secret)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(name) DO UPDATE SET
-               identity=?2, bucket=?3, verified=?4, note=?5",
-            params![name, identity, bucket, verified as i64, note, now_ms()],
+               identity=?2, bucket=?3, verified=?4, note=?5, link_secret=?7",
+            params![name, identity, bucket, verified as i64, note, now_ms(), link_secret],
         )
         .map_err(|e| CoreError::Db(e.to_string()))?;
         Ok(())
@@ -116,7 +124,7 @@ impl ContactStore {
     pub fn list(&self) -> Result<Vec<ContactInfo>> {
         let conn = self.conn.lock().map_err(|e| CoreError::Db(e.to_string()))?;
         let mut stmt = conn
-            .prepare("SELECT name, identity, bucket, verified, note, added_ms FROM contacts ORDER BY added_ms")
+            .prepare("SELECT name, identity, bucket, verified, note, added_ms, link_secret FROM contacts ORDER BY added_ms")
             .map_err(|e| CoreError::Db(e.to_string()))?;
         let rows = stmt
             .query_map([], |r| {
@@ -127,6 +135,7 @@ impl ContactStore {
                     verified: r.get::<_, i64>(3)? != 0,
                     note: r.get(4)?,
                     added_ms: r.get(5)?,
+                    link_secret: r.get(6)?,
                 })
             })
             .map_err(|e| CoreError::Db(e.to_string()))?;
@@ -202,15 +211,16 @@ mod tests {
     #[test]
     fn upsert_list_verify_delete() {
         let s = ContactStore::open(std::path::Path::new(":memory:"), None).unwrap();
-        s.upsert("bob", &[1u8; 32], &[2u8; 32], false, "").unwrap();
-        s.upsert("alice", &[3u8; 32], &[4u8; 32], true, "备注").unwrap();
+        s.upsert("bob", &[1u8; 32], &[2u8; 32], false, "", &[9u8; 32]).unwrap();
+        s.upsert("alice", &[3u8; 32], &[4u8; 32], true, "备注", &[9u8; 32]).unwrap();
         let all = s.list().unwrap();
         assert_eq!(all.len(), 2);
         // 重新加好友：同名覆盖不重复
-        s.upsert("bob", &[5u8; 32], &[6u8; 32], true, "").unwrap();
+        s.upsert("bob", &[5u8; 32], &[6u8; 32], true, "", &[8u8; 32]).unwrap();
         assert_eq!(s.list().unwrap().len(), 2);
         let bob = s.list().unwrap().into_iter().find(|c| c.name == "bob").unwrap();
         assert_eq!(bob.identity, vec![5u8; 32]);
+        assert_eq!(bob.link_secret, vec![8u8; 32]);
         assert!(bob.verified);
         s.delete("alice").unwrap();
         assert_eq!(s.list().unwrap().len(), 1);
@@ -219,8 +229,9 @@ mod tests {
     #[test]
     fn rejects_wrong_sizes() {
         let s = ContactStore::open(std::path::Path::new(":memory:"), None).unwrap();
-        assert!(s.upsert("x", &[0u8; 31], &[0u8; 32], false, "").is_err());
-        assert!(s.upsert("x", &[0u8; 32], &[0u8; 33], false, "").is_err());
+        assert!(s.upsert("x", &[0u8; 31], &[0u8; 32], false, "", &[0u8; 32]).is_err());
+        assert!(s.upsert("x", &[0u8; 32], &[0u8; 33], false, "", &[0u8; 32]).is_err());
+        assert!(s.upsert("x", &[0u8; 32], &[0u8; 32], false, "", &[0u8; 31]).is_err());
     }
 
     #[test]
@@ -228,12 +239,13 @@ mod tests {
         let path = temp_db("reopen");
         {
             let s = ContactStore::open(&path, Some("kk")).unwrap();
-            s.upsert("bob", &[7u8; 32], &[8u8; 32], true, "").unwrap();
+            s.upsert("bob", &[7u8; 32], &[8u8; 32], true, "", &[1u8; 32]).unwrap();
             s.append_message("bob", true, "hi").unwrap();
             s.append_message("bob", false, "yo").unwrap();
         }
         let s = ContactStore::open(&path, Some("kk")).unwrap();
         assert_eq!(s.list().unwrap().len(), 1);
+        assert_eq!(s.list().unwrap()[0].link_secret, vec![1u8; 32]);
         let msgs = s.messages("bob", 10).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].text, "hi"); // 时间升序
@@ -255,7 +267,7 @@ mod tests {
         let path = temp_db("wrongkey");
         {
             let s = ContactStore::open(&path, Some("right")).unwrap();
-            s.upsert("bob", &[1u8; 32], &[2u8; 32], false, "").unwrap();
+            s.upsert("bob", &[1u8; 32], &[2u8; 32], false, "", &[3u8; 32]).unwrap();
         }
         assert!(ContactStore::open(&path, Some("wrong")).is_err());
         let _ = std::fs::remove_file(&path);

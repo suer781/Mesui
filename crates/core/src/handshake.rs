@@ -524,12 +524,12 @@ mod tests {
         alice.pin_identity(&bob_addr, &bob.identity_key().unwrap()).unwrap();
 
         // 同名地址、新长期身份钥的 bundle：process 应被 TOFU 拒绝且错误成类
-        let bob2 = Device::generate("b").unwrap();
+        let mut bob2 = Device::generate("b").unwrap();
         let err = alice
             .process_bundle(&bob_addr, &bob2.prekey_bundle().unwrap())
             .expect_err("换钥后必须拒绝");
         assert!(
-            matches!(err, CoreError::IdentityChanged(name) if name == "b"),
+            matches!(&err, CoreError::IdentityChanged(name) if name == "b"),
             "错误须分类为 IdentityChanged，实际: {err:?}"
         );
     }

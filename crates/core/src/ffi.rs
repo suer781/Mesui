@@ -284,6 +284,7 @@ mod signal_ffi {
         pub verified: bool,
         pub note: String,
         pub added_ms: i64,
+        pub link_secret: Vec<u8>,
     }
 
     /// 一条聊天记录。
@@ -324,8 +325,11 @@ mod signal_ffi {
             bucket: Vec<u8>,
             verified: bool,
             note: String,
+            link_secret: Vec<u8>,
         ) -> Result<(), DcError> {
-            self.inner.upsert(&name, &identity, &bucket, verified, &note).map_err(map_err)
+            self.inner
+                .upsert(&name, &identity, &bucket, verified, &note, &link_secret)
+                .map_err(map_err)
         }
 
         pub fn list_contacts(&self) -> Result<Vec<Contact>, DcError> {
@@ -339,6 +343,7 @@ mod signal_ffi {
                     verified: c.verified,
                     note: c.note,
                     added_ms: c.added_ms,
+                    link_secret: c.link_secret,
                 })
                 .collect())
         }
