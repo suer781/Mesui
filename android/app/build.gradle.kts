@@ -41,6 +41,14 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
+    // UniFFI 生成物：CI 在 assembleDebug 前由 uniffi-bindgen 生成到
+    // src/main/uniffi（不入库），Kotlin 编译把它与 java 目录一并纳入。
+    // 本地无该目录时 gradle 不报错，只是缺绑定源。
+    sourceSets {
+        getByName("main") {
+            java.srcDir("src/main/uniffi")
+        }
+    }
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
     }
@@ -73,8 +81,11 @@ dependencies {
     implementation("com.google.zxing:core:3.5.3")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 
-    // TODO: Rust 核心经 UniFFI 生成的 AAR/JNI 桥（阶段 1 集成）
-    // implementation(files("libs/dc-core.aar")) 或使用 cargo-ndk + jniLibs
+    // Rust 核心经 UniFFI 的 Kotlin 绑定：libdc_core.so（三 ABI）由 CI 的
+    // cargo-ndk 步骤放入 jniLibs；生成代码用 JNA 做 native 桥，
+    // @aar 强制取 Maven Central 上与 jar 并行发布的 aar 打包（pom 的
+    // packaging 是 jar，不带后缀会解析错）。
+    implementation("net.java.dev.jna:jna:5.13.0@aar")
 
     testImplementation(composeBom)
     testImplementation("junit:junit:4.13.2")

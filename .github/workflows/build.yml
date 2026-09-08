@@ -95,6 +95,27 @@ jobs:
           CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
           cargo test --lib -p dc-core --features vendored-openssl
 
+      # ================= UniFFI Kotlin 绑定 =================
+      # uniffi-bindgen 的 --library 模式靠 dlopen 读取 cdylib 里嵌入的元数据，
+      # 必须是 host 架构（x86_64-linux）的 .so，不能用上面 cargo-ndk 产出的
+      # Android ARM .so。生成物写入 android/app/src/main/uniffi，由
+      # build.gradle.kts 的 sourceSets 纳入 Kotlin 编译（本目录不入库，
+      # 每次构建重新生成，保证与 ffi.rs 接口同步）。
+      - name: 构建 host cdylib + 生成 UniFFI Kotlin 绑定
+        env:
+          OPENSSL_DIR: /tmp/openssl-dummy
+        run: |
+          mkdir -p /tmp/openssl-dummy/include /tmp/openssl-dummy/lib
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+          cargo build --release --lib -p dc-core --features vendored-openssl,ffi
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+          cargo run --release -p dc-core --features vendored-openssl,ffi \
+            --bin uniffi-bindgen -- generate \
+            --library target/release/libdc_core.so \
+            --config crates/core/uniffi.toml \
+            --language kotlin \
+            --out-dir android/app/src/main/uniffi
+
       # ================= Kotlin / APK =================
 
       - name: 设置 JDK 17

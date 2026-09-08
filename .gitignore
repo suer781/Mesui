@@ -14,3 +14,5 @@ app/build/
 **/.mimosa/
 .zcode/
 third_party/
+# UniFFI 生成的 Kotlin 绑定（CI 每次构建重新生成，不入库）
+android/app/src/main/uniffi/

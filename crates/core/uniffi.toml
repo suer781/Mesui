@@ -1,0 +1,5 @@
+# UniFFI 绑定生成配置：Kotlin 生成物包名（默认 uniffi.dc_core），
+# 与 Android 壳 chat.dc.app 命名空间同级。CI 用
+# `uniffi-bindgen generate --config crates/core/uniffi.toml …` 传入。
+[bindings.kotlin]
+package_name = "chat.dc.core"
