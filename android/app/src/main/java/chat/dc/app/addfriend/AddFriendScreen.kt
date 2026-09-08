@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import chat.dc.app.R
+import chat.dc.app.core.SignalCore
 import chat.dc.app.nearby.NearbyDiscovery
 import com.google.zxing.ResultPoint
 import com.journeyapps.barcodescanner.BarcodeCallback
@@ -160,12 +161,25 @@ private fun RoleCard(
 /**
  * 「别人扫我」：只显示我的动态码。数据帧与当场新随机的噪声帧交错播放（280ms/帧），
  * 每两帧画面都不同，单帧/单张截图不含完整信息。
+ * 载荷为真实密钥材料（SignalCore 会话身份 + PreKeyBundle，阶段 0）。
  */
 @Composable
 fun ShowMyCodeScreen() {
     RequestNearbyPermissionOnEntry()
+    val context = LocalContext.current
     val security = remember { SecureRandom() }
-    val myPayload = remember { AddFriendPayload.generate() }
+    val session = remember { SignalCore.session(context) }
+    val myPayload = remember {
+        fun random(n: Int) = ByteArray(n).also(security::nextBytes)
+        AddFriendPayload(
+            name = SignalCore.deviceName(context),
+            identity = session.identity_key(),
+            bundle = session.prekey_bundle_wire(),
+            bucket = random(32),
+            token = random(48),
+            ble = random(8),
+        )
+    }
     val sid = remember {
         ByteArray(4).also(security::nextBytes).joinToString("") { "%02x".format(it) }
     }
@@ -219,7 +233,9 @@ fun ShowMyCodeScreen() {
 
 /**
  * 「我扫别人」：只开相机采集对方动态码，集齐全部数据帧且 ≥3 秒才完成。
- * 完成后的核对/蓝牙连接在后续阶段接入。
+ * 完成后：解析出的真实 bundle 立即跑 PQXDH 建会话（内存 store），
+ * 并计算真 SAS（绑定双方长期身份公钥）供用户带外比对；
+ * token-MAC 首条消息与 BLE 传输在阶段 3 接入。
  */
 @Composable
 fun ScanToAddScreen() {
@@ -235,9 +251,25 @@ fun ScanToAddScreen() {
         ActivityResultContracts.RequestPermission(),
     ) { cameraGranted = it }
 
+    val session = remember { SignalCore.session(context) }
     val collector = remember { FrameCollector() }
     var collectorState by remember { mutableStateOf<FrameCollector.State?>(null) }
     val peerPayload = collectorState?.takeIf { it.complete }?.payload
+
+    // 采集完成 → 用对方 bundle 跑 PQXDH 建会话（FrameCollector 完成后缓存
+    // 载荷实例，此 effect 对同一 peer 只跑一次）
+    var established by remember { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(peerPayload) {
+        established = peerPayload?.let {
+            runCatching { session.process_bundle(it.name, it.bundle) }.isSuccess
+        }
+    }
+    // 真 SAS：绑定双方长期身份公钥 + 双方地址名，两端各算一端、结果一致
+    val sas = remember(peerPayload) {
+        peerPayload?.let {
+            runCatching { session.sas_with(SignalCore.deviceName(context), it.name, it.identity) }.getOrNull()
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -261,10 +293,23 @@ fun ScanToAddScreen() {
                 Column(modifier = Modifier.padding(12.dp)) {
                     Text(stringResource(R.string.add_friend_verify), style = MaterialTheme.typography.titleSmall)
                     Text(
-                        stringResource(R.string.add_friend_safety_code, peerPayload.fingerprintGroups()),
+                        stringResource(R.string.add_friend_safety_code, sas?.six ?: "……"),
                         style = MaterialTheme.typography.bodyMedium,
                         modifier = Modifier.padding(vertical = 8.dp),
                     )
+                    Text(
+                        stringResource(R.string.add_friend_safety_code_full, sas?.full ?: ""),
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(bottom = 8.dp),
+                    )
+                    if (established != null) {
+                        Text(
+                            stringResource(
+                                if (established == true) R.string.add_friend_established else R.string.add_friend_establish_failed,
+                            ),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
                     Text(stringResource(R.string.add_friend_ble_pending), style = MaterialTheme.typography.bodySmall)
                 }
             }

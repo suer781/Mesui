@@ -9,37 +9,42 @@ import java.security.SecureRandom
 /**
  * 加好友二维码载荷（二维码取代 NFC 成为带外引导通道）。
  *
- * 载荷 = dc://add URI：身份公钥 + 当前节点密钥 + 随机信箱桶 + 单次 bootstrap token。
- * token 是带外秘密：后续蓝牙/网络首条消息必须携带它的派生确认（防中间人顶替），
- * 且单次有效。身份↔节点密钥的绑定只在双方 Signal 会话内生效。
+ * 载荷 = dc://add?v=2 URI（阶段 0 起为真实密钥材料）：
+ * - [name] 出示方地址名（ProtocolAddress + SAS 本地标识，对端原样回传）
+ * - [identity] 出示方长期身份公钥（SAS/TOFU 锚点）
+ * - [bundle] PreKeyBundle 上线格式（CBOR，含 Kyber-1024 公钥，约 1.8KB）
+ * - [bucket] 随机信箱桶地址
+ * - [token] 单次 bootstrap token：带外秘密，首条消息须携带其 keyed-BLAKE3 MAC
+ * - [ble] BLE 匹配 id：与 BLE 广播携带同一 id，扫码方据此定位设备（阶段 3）
+ *
+ * 身份↔节点密钥的绑定只在双方 Signal 会话内生效；token 单次有效。
  */
 data class AddFriendPayload(
+    val name: String,
     val identity: ByteArray,
-    val nodeKey: ByteArray,
+    val bundle: ByteArray,
     val bucket: ByteArray,
     val token: ByteArray,
+    val ble: ByteArray,
 ) {
-    fun encode(): String {
-        val b64 = { bytes: ByteArray -> java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes) }
-        return "dc://add?v=1&id=${b64(identity)}&node=${b64(nodeKey)}&bucket=${b64(bucket)}&token=${b64(token)}"
+    init {
+        // 编码进 URI 前先断言，防止非法名破坏 dc://add 解析
+        require(chat.dc.app.core.SignalCore.NAME_RE.matches(name)) { "bad name" }
+        require(identity.size == 32) { "identity must be 32 bytes" }
+        require(bucket.size == 32) { "bucket must be 32 bytes" }
+        require(token.size == 48) { "token must be 48 bytes" }
+        require(ble.size == 8) { "ble must be 8 bytes" }
+        require(bundle.size in 256..6144) { "bundle size out of range: ${bundle.size}" }
     }
 
-    fun fingerprintGroups(): String {
-        // 占位指纹：真实 1024 位指纹来自 Rust 核心（UniFFI 接入）
-        val all = identity + nodeKey + token
-        return all.take(16).joinToString("") { "%02x".format(it) }
-            .chunked(8)
-            .joinToString(" ")
+    fun encode(): String {
+        val b64 = { bytes: ByteArray -> java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes) }
+        return "dc://add?v=2&name=$name&id=${b64(identity)}&bundle=${b64(bundle)}" +
+            "&bucket=${b64(bucket)}&token=${b64(token)}&ble=${b64(ble)}"
     }
 
     companion object {
-        const val SCHEME_PREFIX = "dc://add?v=1&"
-
-        fun generate(security: SecureRandom = SecureRandom()): AddFriendPayload {
-            fun random(n: Int) = ByteArray(n).also(security::nextBytes)
-            // identity/nodeKey 为占位长度；token 384 bit 为规格要求
-            return AddFriendPayload(random(32), random(32), random(32), random(48))
-        }
+        const val SCHEME_PREFIX = "dc://add?v=2&"
 
         fun parse(text: String): AddFriendPayload? {
             if (!text.startsWith(SCHEME_PREFIX)) return null
@@ -49,14 +54,16 @@ data class AddFriendPayload(
                     if (i <= 0) null else it.substring(0, i) to it.substring(i + 1)
                 }
                 .toMap()
+            val name = params["name"]?.takeIf { chat.dc.app.core.SignalCore.NAME_RE.matches(it) } ?: return null
             val b64 = { s: String? ->
                 s?.let { runCatching { java.util.Base64.getUrlDecoder().decode(it) }.getOrNull() }
             }
             val id = b64(params["id"]) ?: return null
-            val node = b64(params["node"]) ?: return null
+            val bundle = b64(params["bundle"]) ?: return null
             val bucket = b64(params["bucket"]) ?: return null
-            val token = b64(params["token"])?.takeIf { it.size == 48 } ?: return null
-            return AddFriendPayload(id, node, bucket, token)
+            val token = b64(params["token"]) ?: return null
+            val ble = b64(params["ble"]) ?: return null
+            return runCatching { AddFriendPayload(name, id, bundle, bucket, token, ble) }.getOrNull()
         }
     }
 }
@@ -90,7 +97,11 @@ object QrCodec {
 object FrameCodec {
     const val MIN_COLLECT_MS: Long = 3_000
     const val FRAME_PREFIX = "dc://addframe?v=1&"
-    const val CHUNK_SIZE = 48
+
+    // 真实载荷（含 ~1.8KB 的 PreKeyBundle）约 2.6KB；48 字符/帧会切出
+    // 50+ 帧（30 秒以上才能集齐），故提到 256：约 11 帧，配合 3 秒
+    // 时长门槛在 10 秒内可读全。单帧 QR 约 390 字符（版本 13），可扫。
+    const val CHUNK_SIZE = 256
 
     fun split(payload: AddFriendPayload, sid: String): List<String> {
         val text = payload.encode()
@@ -149,6 +160,12 @@ class FrameCollector(private val minCollectMs: Long = FrameCodec.MIN_COLLECT_MS)
         private set
     private var firstSeenMs = -1L
 
+    // 完成后只解析一次并缓存实例：快照被 UI 高频轮询（200ms），
+    // 反复解析既费电，也会让上游以载荷实例为 key 的
+    // remember / LaunchedEffect 每次失效（ByteArray equals 是引用相等）
+    private var parsed = false
+    private var payload: AddFriendPayload? = null
+
     fun onFrame(text: String, nowMs: Long): State {
         if (FrameCodec.isNoise(text)) return snapshot(nowMs)
         val frameSid = FrameCodec.parse(text) ?: return snapshot(nowMs)
@@ -167,19 +184,21 @@ class FrameCollector(private val minCollectMs: Long = FrameCodec.MIN_COLLECT_MS)
         chunks.clear()
         sid = null
         total = -1
-        firstSeenMs = -1
+        firstSeenMs = -1L
+        parsed = false
+        payload = null
     }
 
     private fun state(nowMs: Long): State {
         val elapsed = if (firstSeenMs < 0) 0 else (nowMs - firstSeenMs)
         val allCollected = total > 0 && chunks.keys.size >= total
         val enoughTime = elapsed >= minCollectMs
-        val payload = if (allCollected && enoughTime) {
-            val text = (0 until total).mapNotNull { chunks[it] }
+        if (allCollected && enoughTime && !parsed) {
+            parsed = true
+            payload = (0 until total).mapNotNull { chunks[it] }
                 .joinToString("")
-                .let { String(java.util.Base64.getUrlDecoder().decode(it), Charsets.UTF_8) }
-            runCatching { AddFriendPayload.parse(text) }.getOrNull()
-        } else null
+                .let { runCatching { AddFriendPayload.parse(String(java.util.Base64.getUrlDecoder().decode(it), Charsets.UTF_8)) }.getOrNull() }
+        }
         return State(chunks.keys.size, if (total < 0) 0 else total, elapsed, payload != null, payload)
     }
 
