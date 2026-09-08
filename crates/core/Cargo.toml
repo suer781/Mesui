@@ -10,6 +10,16 @@ description = "去中心化聊天核心：身份 / 熵源 / CBOR 信封 / 自适
 # lib：保留 rlib 供本仓测试 / 示例 / 集成测试链接
 crate-type = ["cdylib", "lib"]
 
+# 绑定生成器薄壳入口：`cargo run --release -p dc-core --features ffi
+# --bin uniffi-bindgen -- generate --library <cdylib> …`。
+# cargo 无法直接运行依赖自带的 bin，须在本包声明入口转发到
+# uniffi::uniffi_bindgen_main()（cli feature）。required-features 保证
+# 未开 ffi 的构建/测试不参与编译。
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["ffi"]
+
 # 功能分层：默认全开；--no-default-features 可只验证纯逻辑层
 [features]
 default = ["db", "compress", "signal", "iroh-net"]
@@ -42,7 +52,7 @@ libsignal-protocol = { path = "../../third_party/libsignal/rust/protocol", optio
 rand = { version = "0.9", optional = true }
 futures = { version = "0.3", optional = true }
 iroh = { version = "1", optional = true }
-uniffi = { version = "0.29", optional = true, features = ["build"] }
+uniffi = { version = "0.29", optional = true, features = ["build", "cli"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time"] }
