@@ -18,7 +18,7 @@ use libsignal_protocol::{
     CiphertextMessageType, DeviceId, Direction, Fingerprint, GenericSignedPreKey, IdentityChange,
     IdentityKey, IdentityKeyPair, IdentityKeyStore, KeyPair, KyberPreKeyId, KyberPreKeyRecord,
     KyberPreKeyStore, PreKeyBundle, PreKeyId, PreKeyRecord, PreKeySignalMessage, PreKeyStore,
-    ProtocolAddress, PublicKey, SessionStore, SignalMessage, SignedPreKeyId, SignedPreKeyRecord,
+    ProtocolAddress, PublicKey, SignalMessage, SignedPreKeyId, SignedPreKeyRecord,
     SignedPreKeyStore, Timestamp,
 };
 use serde::{Deserialize, Serialize};
