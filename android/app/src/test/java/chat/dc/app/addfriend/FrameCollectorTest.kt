@@ -15,8 +15,11 @@ class FrameCollectorTest {
 
     private val security = SecureRandom()
 
+    /** 真实载荷同构的字段尺寸：bundle 含 Kyber-1024 公钥约 1.8KB。 */
+    private fun random(n: Int) = ByteArray(n).also(security::nextBytes)
+
     private fun payloadAndFrames(): Pair<AddFriendPayload, List<String>> {
-        val p = AddFriendPayload.generate(security)
+        val p = AddFriendPayload("aabbccddeeff0011", random(32), random(1792), random(32), random(48), random(8))
         val sid = "aabbccdd"
         return p to FrameCodec.split(p, sid)
     }
@@ -59,7 +62,7 @@ class FrameCollectorTest {
     @Test
     fun frames_from_other_session_do_not_pollute() {
         val (_, frames) = payloadAndFrames()
-        val other = AddFriendPayload.generate(security)
+        val other = AddFriendPayload("ffff0000ffff0000", random(32), random(1792), random(32), random(48), random(8))
         val otherFrames = FrameCodec.split(other, "ffff0000")
         val collector = FrameCollector()
         // 先喂本会话帧（锁定），再喂异会话帧：不得污染本会话进度
@@ -74,7 +77,7 @@ class FrameCollectorTest {
     @Test
     fun reset_clears_lock_so_new_session_can_be_collected() {
         val (_, frames) = payloadAndFrames()
-        val other = AddFriendPayload.generate(security)
+        val other = AddFriendPayload("ffff0000ffff0000", random(32), random(1792), random(32), random(48), random(8))
         val otherFrames = FrameCodec.split(other, "ffff0000")
         val collector = FrameCollector()
         frames.forEach { collector.onFrame(it, 1000L) }
@@ -96,8 +99,8 @@ class FrameCollectorTest {
     @Test
     fun chunk_count_matches_payload_size() {
         val (_, frames) = payloadAndFrames()
-        // 载荷 ~180 字符，48 字符/帧 → 4 帧；防 CHUNK_SIZE 改动导致帧数失控
-        assertTrue("帧数应在 2..8: ${frames.size}", frames.size in 2..8)
+        // 真实载荷约 2.6KB，256 字符/帧 → 约 11 帧；防 CHUNK_SIZE 改动导致帧数失控
+        assertTrue("帧数应在 4..24: ${frames.size}", frames.size in 4..24)
         assertTrue(frames.all { it.startsWith(FrameCodec.FRAME_PREFIX) })
     }
 }

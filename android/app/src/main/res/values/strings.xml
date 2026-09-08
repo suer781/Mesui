@@ -35,6 +35,9 @@
     <string name="add_friend_ble_pending">采集完成；蓝牙协商将在核心接入后自动发起</string>
     <string name="add_friend_verify">核对安全码（双方必须一致）</string>
     <string name="add_friend_safety_code">安全码：%1$s</string>
+    <string name="add_friend_safety_code_full">完整校验串：%1$s</string>
+    <string name="add_friend_established">已建立加密会话（密钥协商完成）</string>
+    <string name="add_friend_establish_failed">密钥协商失败，请重新扫描</string>
     <string name="add_friend_pending_core">真实身份与加密会话将在核心接入后建立</string>
     <string name="search_desc">搜索</string>
     <string name="new_chat_desc">发起新会话</string>

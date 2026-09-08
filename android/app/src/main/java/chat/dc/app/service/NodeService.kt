@@ -7,6 +7,7 @@ import android.app.Service
 import android.content.Intent
 import android.os.IBinder
 import chat.dc.app.R
+import chat.dc.app.core.SignalCore
 
 /**
  * 前台服务：Rust 节点（iroh endpoint + 信箱桶 + 联系人间中继）与蓝牙
@@ -27,6 +28,9 @@ class NodeService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // 启动即生成 Signal 会话（应用级单例；runCatching 防止个别机型
+        // native 加载失败导致前台服务崩溃循环，页面首次访问时仍会重试）
+        runCatching { SignalCore.session(this) }
         ensureChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
     }
