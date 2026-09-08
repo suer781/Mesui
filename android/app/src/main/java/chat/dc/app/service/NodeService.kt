@@ -7,12 +7,13 @@ import android.app.Service
 import android.content.Intent
 import android.os.IBinder
 import chat.dc.app.R
+import chat.dc.app.ble.BleMesh
 import chat.dc.app.core.SignalCore
 
 /**
  * 前台服务：Rust 节点（iroh endpoint + 信箱桶 + 联系人间中继）与蓝牙
  * 链路的常驻宿主。保活策略：常驻通知，用户可关（默认开）。
- * 接入 UniFFI 核心句柄后实现真正逻辑；当前为占位。
+ * iroh/信箱部分尚未接入；BLE mesh（广播/扫描/回连/配对）已由此常驻驱动。
  */
 class NodeService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
@@ -31,8 +32,15 @@ class NodeService : Service() {
         // 启动即生成 Signal 会话（应用级单例；runCatching 防止个别机型
         // native 加载失败导致前台服务崩溃循环，页面首次访问时仍会重试）
         runCatching { SignalCore.session(this) }
+        runCatching { BleMesh.init(this) }
         ensureChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // START_STICKY 重建时 mesh 随新实例 init；进程真退出则无线程可留
+        runCatching { BleMesh.shutdown() }
     }
 
     /** 常驻通知渠道（minSdk 26 = O，无需版本判断；无渠道 startForeground 会丢通知）。 */

@@ -4,6 +4,7 @@ import android.content.Context
 import android.provider.Settings
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import chat.dc.core.ContactStore
 import chat.dc.core.SignalSession
 import java.io.File
 import java.security.KeyStore
@@ -41,6 +42,9 @@ object SignalCore {
 
     @Volatile
     private var session: SignalSession? = null
+
+    @Volatile
+    private var contacts: ContactStore? = null
 
     // 解密失败自动重置的一次性提示位（UI consume 后清除）
     private var resetNoticePending = false
@@ -120,4 +124,12 @@ object SignalCore {
             deviceName(context),
         ).also { session = it }
     }
+
+    /** 联系人 + 聊天记录句柄：与 Signal store 同库同 key（不同表）。 */
+    @Synchronized
+    fun contactStore(context: Context): ContactStore =
+        contacts ?: ContactStore.open(
+            File(context.filesDir, DB_FILE).absolutePath,
+            dbKeyHex(context),
+        ).also { contacts = it }
 }
