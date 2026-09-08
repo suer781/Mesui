@@ -90,7 +90,7 @@ pub fn smoke_test_all_modules() -> String {
 #[cfg(feature = "signal")]
 mod signal_ffi {
     use crate::handshake::{self, Device};
-    use libsignal_protocol::{DeviceId, IdentityKey, ProtocolAddress};
+    use libsignal_protocol::{DeviceId, IdentityKey, PreKeySignalMessage, ProtocolAddress};
     use std::sync::Mutex;
 
     /// 跨 FFI 的错误：Core 为一般失败；RemoteIdentityChanged 单独成类——
@@ -264,6 +264,15 @@ mod signal_ffi {
             .try_into()
             .map_err(|_| DcError::Core { msg: "mac must be 32 bytes".into() })?;
         Ok(handshake::verify_first_message_mac(&token, &b, &ciphertext, &m).is_ok())
+    }
+
+    /// 从首条 PreKeySignalMessage 取发送方长期身份公钥（出示侧收到
+    /// 扫码方首条消息后计算 SAS 需要；libsignal 消息自带身份键并已随
+    /// bundle 签名链验证，不再另行信任来源）。
+    #[uniffi::export]
+    pub fn prekey_sender_identity(ciphertext: Vec<u8>) -> Result<Vec<u8>, DcError> {
+        let msg = PreKeySignalMessage::try_from(ciphertext.as_slice()).map_err(map_sig)?;
+        Ok(msg.identity_key().serialize().to_vec())
     }
 
     /// 联系人（Kotlin 侧 Record；字段含义见 contacts::ContactInfo）。
