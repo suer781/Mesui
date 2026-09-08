@@ -35,11 +35,29 @@ fn crypto_err<E: std::fmt::Display>(e: E) -> CoreError {
     CoreError::Crypto(e.to_string())
 }
 
+/// libsignal 错误 → CoreError：不可信身份单独成类（TOFU 拒绝是安全
+/// 信号，UI 必须能区别于普通失败）。
+fn map_signal_err(e: libsignal_protocol::SignalProtocolError) -> CoreError {
+    match e {
+        libsignal_protocol::SignalProtocolError::UntrustedIdentity(addr) => {
+            CoreError::IdentityChanged(addr.name().to_string())
+        }
+        other => crypto_err(other),
+    }
+}
+
 /// 驱动 libsignal 的 async trait：其 future 为 `?Send`，用当前线程 `block_on` 即可。
 fn block<T>(
     fut: impl std::future::Future<Output = std::result::Result<T, libsignal_protocol::SignalProtocolError>>,
 ) -> Result<T> {
     block_on(fut).map_err(crypto_err)
+}
+
+/// 同 block，但按 map_signal_err 分类（TOFU 拒绝单独成类）。
+fn block_tofu<T>(
+    fut: impl std::future::Future<Output = std::result::Result<T, libsignal_protocol::SignalProtocolError>>,
+) -> Result<T> {
+    block_on(fut).map_err(map_signal_err)
 }
 
 fn now_ts() -> Timestamp {
@@ -152,7 +170,7 @@ impl Device {
         // 两个 &mut dyn 不能同时借自一个对象 → 传共享连接的克隆（见 signal_store.rs）
         let mut session = self.store.clone();
         let mut identity = self.store.clone();
-        block(process_prekey_bundle(
+        block_tofu(process_prekey_bundle(
             remote,
             &self.address,
             &mut session,
@@ -208,7 +226,7 @@ impl Device {
         let mut prekey = self.store.clone();
         let signed = self.store.clone();
         let mut kyber = self.store.clone();
-        block(message_decrypt(
+        block_tofu(message_decrypt(
             &cm,
             remote,
             &self.address,
@@ -491,6 +509,29 @@ mod tests {
         let bob2 = Device::generate("b").unwrap();
         let bik2 = bob2.identity_key().unwrap();
         assert!(!alice.is_trusted(&bob_addr, &bik2).unwrap());
+    }
+
+    /// TOFU 拒绝必须是可分类的错误（IdentityChanged），UI 才能把
+    /// 「对方换钥匙的安全信号」与普通协商失败区分开。
+    #[test]
+    fn process_bundle_rejects_changed_identity_as_classified_error() {
+        let mut alice = Device::generate("a").unwrap();
+        let mut bob = Device::generate("b").unwrap();
+        let bob_addr = bob.address().clone();
+        alice
+            .process_bundle(&bob_addr, &bob.prekey_bundle().unwrap())
+            .unwrap();
+        alice.pin_identity(&bob_addr, &bob.identity_key().unwrap()).unwrap();
+
+        // 同名地址、新长期身份钥的 bundle：process 应被 TOFU 拒绝且错误成类
+        let mut bob2 = Device::generate("b").unwrap();
+        let err = alice
+            .process_bundle(&bob_addr, &bob2.prekey_bundle().unwrap())
+            .expect_err("换钥后必须拒绝");
+        assert!(
+            matches!(&err, CoreError::IdentityChanged(name) if name == "b"),
+            "错误须分类为 IdentityChanged，实际: {err:?}"
+        );
     }
 
     /// 首条消息 token-MAC：正确 token 通过；错 token / 改密文均拒。

@@ -90,18 +90,24 @@ pub fn smoke_test_all_modules() -> String {
 #[cfg(feature = "signal")]
 mod signal_ffi {
     use crate::handshake::{self, Device};
-    use libsignal_protocol::{DeviceId, IdentityKey, ProtocolAddress};
+    use libsignal_protocol::{DeviceId, IdentityKey, PreKeySignalMessage, ProtocolAddress};
     use std::sync::Mutex;
 
-    /// 跨 FFI 的统一错误（扁平化为一条消息）。
+    /// 跨 FFI 的错误：Core 为一般失败；RemoteIdentityChanged 单独成类——
+    /// TOFU 拒绝是「对方换长期钥匙」的安全信号，UI 须区别处理。
     #[derive(Debug, thiserror::Error, uniffi::Error)]
     pub enum DcError {
         #[error("{msg}")]
         Core { msg: String },
+        #[error("对方身份已变更（{name} 已绑定不同的长期身份钥），需重新带外验证")]
+        RemoteIdentityChanged { name: String },
     }
 
     fn map_err(e: crate::CoreError) -> DcError {
-        DcError::Core { msg: e.to_string() }
+        match e {
+            crate::CoreError::IdentityChanged(name) => DcError::RemoteIdentityChanged { name },
+            other => DcError::Core { msg: other.to_string() },
+        }
     }
 
     fn map_sig<E: std::fmt::Display>(e: E) -> DcError {
@@ -258,5 +264,114 @@ mod signal_ffi {
             .try_into()
             .map_err(|_| DcError::Core { msg: "mac must be 32 bytes".into() })?;
         Ok(handshake::verify_first_message_mac(&token, &b, &ciphertext, &m).is_ok())
+    }
+
+    /// 从首条 PreKeySignalMessage 取发送方长期身份公钥（出示侧收到
+    /// 扫码方首条消息后计算 SAS 需要；libsignal 消息自带身份键并已随
+    /// bundle 签名链验证，不再另行信任来源）。
+    #[uniffi::export]
+    pub fn prekey_sender_identity(ciphertext: Vec<u8>) -> Result<Vec<u8>, DcError> {
+        let msg = PreKeySignalMessage::try_from(ciphertext.as_slice()).map_err(map_sig)?;
+        Ok(msg.identity_key().serialize().to_vec())
+    }
+
+    /// 联系人（Kotlin 侧 Record；字段含义见 contacts::ContactInfo）。
+    #[derive(uniffi::Record)]
+    pub struct Contact {
+        pub name: String,
+        pub identity: Vec<u8>,
+        pub bucket: Vec<u8>,
+        pub verified: bool,
+        pub note: String,
+        pub added_ms: i64,
+        pub link_secret: Vec<u8>,
+    }
+
+    /// 一条聊天记录。
+    #[derive(uniffi::Record)]
+    pub struct ChatMessage {
+        pub peer: String,
+        pub outgoing: bool,
+        pub text: String,
+        pub ts_ms: i64,
+    }
+
+    /// 联系人 + 聊天记录的 Kotlin 句柄（SQLCipher 落盘）。
+    #[derive(uniffi::Object)]
+    pub struct ContactStore {
+        inner: crate::contacts::ContactStore,
+    }
+
+    // ContactStore 内部 Mutex 仅守护 &self 方法；uniffi::Object 按 &self 分发
+    #[uniffi::export]
+    impl ContactStore {
+        /// 打开（或创建）联系人库。path/key 与 SignalSession.open 同库同 key
+        /// （不同表；双连接靠 busy_timeout 串行化）。
+        #[uniffi::constructor]
+        pub fn open(path: String, key: String) -> Result<Self, DcError> {
+            Ok(Self {
+                inner: crate::contacts::ContactStore::open(
+                    std::path::Path::new(&path),
+                    Some(key.as_str()),
+                )
+                .map_err(map_err)?,
+            })
+        }
+
+        pub fn upsert_contact(
+            &self,
+            name: String,
+            identity: Vec<u8>,
+            bucket: Vec<u8>,
+            verified: bool,
+            note: String,
+            link_secret: Vec<u8>,
+        ) -> Result<(), DcError> {
+            self.inner
+                .upsert(&name, &identity, &bucket, verified, &note, &link_secret)
+                .map_err(map_err)
+        }
+
+        pub fn list_contacts(&self) -> Result<Vec<Contact>, DcError> {
+            let list = self.inner.list().map_err(map_err)?;
+            Ok(list
+                .into_iter()
+                .map(|c| Contact {
+                    name: c.name,
+                    identity: c.identity,
+                    bucket: c.bucket,
+                    verified: c.verified,
+                    note: c.note,
+                    added_ms: c.added_ms,
+                    link_secret: c.link_secret,
+                })
+                .collect())
+        }
+
+        pub fn set_verified(&self, name: String, verified: bool) -> Result<(), DcError> {
+            self.inner.set_verified(&name, verified).map_err(map_err)
+        }
+
+        pub fn delete_contact(&self, name: String) -> Result<(), DcError> {
+            self.inner.delete(&name).map_err(map_err)
+        }
+
+        pub fn append_message(&self, peer: String, outgoing: bool, text: String) -> Result<(), DcError> {
+            self.inner.append_message(&peer, outgoing, &text).map_err(map_err)
+        }
+
+        /// 最近 limit 条，时间升序。
+        pub fn messages(&self, peer: String, limit: i32) -> Result<Vec<ChatMessage>, DcError> {
+            let list = self.inner.messages(&peer, limit).map_err(map_err)?;
+            Ok(list
+                .into_iter()
+                .map(|m| ChatMessage {
+                    peer: m.peer,
+                    outgoing: m.outgoing,
+                    text: m.text,
+                    ts_ms: m.ts_ms,
+                })
+                .collect())
+        }
     }
 }
