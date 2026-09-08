@@ -173,8 +173,8 @@ fun ShowMyCodeScreen() {
         fun random(n: Int) = ByteArray(n).also(security::nextBytes)
         AddFriendPayload(
             name = SignalCore.deviceName(context),
-            identity = session.identity_key(),
-            bundle = session.prekey_bundle_wire(),
+            identity = session.identityKey(),
+            bundle = session.prekeyBundleWire(),
             bucket = random(32),
             token = random(48),
             ble = random(8),
@@ -261,13 +261,13 @@ fun ScanToAddScreen() {
     var established by remember { mutableStateOf<Boolean?>(null) }
     LaunchedEffect(peerPayload) {
         established = peerPayload?.let {
-            runCatching { session.process_bundle(it.name, it.bundle) }.isSuccess
+            runCatching { session.processBundle(it.name, it.bundle) }.isSuccess
         }
     }
     // 真 SAS：绑定双方长期身份公钥 + 双方地址名，两端各算一端、结果一致
     val sas = remember(peerPayload) {
         peerPayload?.let {
-            runCatching { session.sas_with(SignalCore.deviceName(context), it.name, it.identity) }.getOrNull()
+            runCatching { session.sasWith(SignalCore.deviceName(context), it.name, it.identity) }.getOrNull()
         }
     }
 
