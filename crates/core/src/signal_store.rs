@@ -14,7 +14,7 @@
 use crate::{CoreError, Result};
 use async_trait::async_trait;
 use libsignal_protocol::{
-    Direction, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore,
+    Direction, GenericSignedPreKey, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore,
     KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyId, PreKeyRecord, PreKeyStore,
     ProtocolAddress, SessionRecord, SessionStore, SignedPreKeyId, SignedPreKeyRecord,
     SignedPreKeyStore,
@@ -148,7 +148,7 @@ impl SqlSignalStore {
 
 #[async_trait(?Send)]
 impl IdentityKeyStore for SqlSignalStore {
-    async fn get_identity_key_pair(&self) -> libsignal_protocol::Result<IdentityKeyPair> {
+    async fn get_identity_key_pair(&self) -> libsignal_protocol::error::Result<IdentityKeyPair> {
         let row = self.with_conn("get_identity_key_pair", |c| {
             c.query_row(
                 "SELECT identity_pair FROM local_identity WHERE id = 0",
@@ -159,7 +159,7 @@ impl IdentityKeyStore for SqlSignalStore {
         IdentityKeyPair::try_from(row.as_slice())
     }
 
-    async fn get_local_registration_id(&self) -> libsignal_protocol::Result<u32> {
+    async fn get_local_registration_id(&self) -> libsignal_protocol::error::Result<u32> {
         self.with_conn("get_local_registration_id", |c| {
             c.query_row(
                 "SELECT registration_id FROM local_identity WHERE id = 0",
@@ -174,7 +174,7 @@ impl IdentityKeyStore for SqlSignalStore {
         &mut self,
         address: &ProtocolAddress,
         identity: &IdentityKey,
-    ) -> libsignal_protocol::Result<IdentityChange> {
+    ) -> libsignal_protocol::error::Result<IdentityChange> {
         let existing: Option<Vec<u8>> = self.with_conn("save_identity", |c| {
             c.query_row(
                 "SELECT identity FROM trusted_identities WHERE name = ?1 AND device = ?2",
@@ -201,7 +201,7 @@ impl IdentityKeyStore for SqlSignalStore {
         address: &ProtocolAddress,
         identity: &IdentityKey,
         _direction: Direction,
-    ) -> libsignal_protocol::Result<bool> {
+    ) -> libsignal_protocol::error::Result<bool> {
         let existing: Option<Vec<u8>> = self.with_conn("is_trusted_identity", |c| {
             c.query_row(
                 "SELECT identity FROM trusted_identities WHERE name = ?1 AND device = ?2",
@@ -219,7 +219,7 @@ impl IdentityKeyStore for SqlSignalStore {
     async fn get_identity(
         &self,
         address: &ProtocolAddress,
-    ) -> libsignal_protocol::Result<Option<IdentityKey>> {
+    ) -> libsignal_protocol::error::Result<Option<IdentityKey>> {
         let existing: Option<Vec<u8>> = self.with_conn("get_identity", |c| {
             c.query_row(
                 "SELECT identity FROM trusted_identities WHERE name = ?1 AND device = ?2",
@@ -240,7 +240,7 @@ impl SessionStore for SqlSignalStore {
     async fn load_session(
         &self,
         address: &ProtocolAddress,
-    ) -> libsignal_protocol::Result<Option<SessionRecord>> {
+    ) -> libsignal_protocol::error::Result<Option<SessionRecord>> {
         let row: Option<Vec<u8>> = self.with_conn("load_session", |c| {
             c.query_row(
                 "SELECT record FROM sessions WHERE name = ?1 AND device = ?2",
@@ -259,7 +259,7 @@ impl SessionStore for SqlSignalStore {
         &mut self,
         address: &ProtocolAddress,
         record: &SessionRecord,
-    ) -> libsignal_protocol::Result<()> {
+    ) -> libsignal_protocol::error::Result<()> {
         let bytes = record.serialize()?;
         self.with_conn("store_session", |c| {
             c.execute(
@@ -273,7 +273,7 @@ impl SessionStore for SqlSignalStore {
 
 #[async_trait(?Send)]
 impl PreKeyStore for SqlSignalStore {
-    async fn get_pre_key(&self, prekey_id: PreKeyId) -> libsignal_protocol::Result<PreKeyRecord> {
+    async fn get_pre_key(&self, prekey_id: PreKeyId) -> libsignal_protocol::error::Result<PreKeyRecord> {
         let bytes: Vec<u8> = self.with_conn("get_pre_key", |c| {
             c.query_row(
                 "SELECT record FROM pre_keys WHERE id = ?1",
@@ -288,7 +288,7 @@ impl PreKeyStore for SqlSignalStore {
         &mut self,
         prekey_id: PreKeyId,
         record: &PreKeyRecord,
-    ) -> libsignal_protocol::Result<()> {
+    ) -> libsignal_protocol::error::Result<()> {
         let bytes = record.serialize()?;
         self.with_conn("save_pre_key", |c| {
             c.execute(
@@ -299,7 +299,7 @@ impl PreKeyStore for SqlSignalStore {
         Ok(())
     }
 
-    async fn remove_pre_key(&mut self, prekey_id: PreKeyId) -> libsignal_protocol::Result<()> {
+    async fn remove_pre_key(&mut self, prekey_id: PreKeyId) -> libsignal_protocol::error::Result<()> {
         self.with_conn("remove_pre_key", |c| {
             c.execute(
                 "DELETE FROM pre_keys WHERE id = ?1",
@@ -315,7 +315,7 @@ impl SignedPreKeyStore for SqlSignalStore {
     async fn get_signed_pre_key(
         &self,
         signed_prekey_id: SignedPreKeyId,
-    ) -> libsignal_protocol::Result<SignedPreKeyRecord> {
+    ) -> libsignal_protocol::error::Result<SignedPreKeyRecord> {
         let bytes: Vec<u8> = self.with_conn("get_signed_pre_key", |c| {
             c.query_row(
                 "SELECT record FROM signed_pre_keys WHERE id = ?1",
@@ -330,7 +330,7 @@ impl SignedPreKeyStore for SqlSignalStore {
         &mut self,
         signed_prekey_id: SignedPreKeyId,
         record: &SignedPreKeyRecord,
-    ) -> libsignal_protocol::Result<()> {
+    ) -> libsignal_protocol::error::Result<()> {
         let bytes = record.serialize()?;
         self.with_conn("save_signed_pre_key", |c| {
             c.execute(
@@ -347,7 +347,7 @@ impl KyberPreKeyStore for SqlSignalStore {
     async fn get_kyber_pre_key(
         &self,
         kyber_prekey_id: KyberPreKeyId,
-    ) -> libsignal_protocol::Result<KyberPreKeyRecord> {
+    ) -> libsignal_protocol::error::Result<KyberPreKeyRecord> {
         let bytes: Vec<u8> = self.with_conn("get_kyber_pre_key", |c| {
             c.query_row(
                 "SELECT record FROM kyber_pre_keys WHERE id = ?1",
@@ -362,7 +362,7 @@ impl KyberPreKeyStore for SqlSignalStore {
         &mut self,
         kyber_prekey_id: KyberPreKeyId,
         record: &KyberPreKeyRecord,
-    ) -> libsignal_protocol::Result<()> {
+    ) -> libsignal_protocol::error::Result<()> {
         let bytes = record.serialize()?;
         self.with_conn("save_kyber_pre_key", |c| {
             c.execute(
@@ -379,7 +379,7 @@ impl KyberPreKeyStore for SqlSignalStore {
         kyber_prekey_id: KyberPreKeyId,
         _ec_prekey_id: SignedPreKeyId,
         _base_key: &libsignal_protocol::PublicKey,
-    ) -> libsignal_protocol::Result<()> {
+    ) -> libsignal_protocol::error::Result<()> {
         self.with_conn("mark_kyber_pre_key_used", |c| {
             c.execute(
                 "DELETE FROM kyber_pre_keys WHERE id = ?1",
