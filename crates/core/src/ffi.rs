@@ -139,10 +139,27 @@ mod signal_ffi {
 
     #[uniffi::export]
     impl SignalSession {
-        /// 生成新设备会话（预生成长期身份密钥，TOFU 信任根）。name 为本设备地址标识。
+        /// 生成新设备会话（内存 store，进程退出即丢）。name 为本设备地址标识。
         #[uniffi::constructor]
         pub fn generate(name: String) -> Result<Self, DcError> {
             Ok(Self { inner: Mutex::new(Device::generate(&name).map_err(map_err)?) })
+        }
+
+        /// 持久化会话：SQLCipher 加密库，身份/会话/TOFU pin 重启不丢。
+        /// path 为库文件路径，key 为 SQLCipher 密钥（无引号字符，hex）。
+        /// 首次打开生成长期身份并落盘，之后重开沿用。
+        #[uniffi::constructor]
+        pub fn open(path: String, key: String, name: String) -> Result<Self, DcError> {
+            Ok(Self {
+                inner: Mutex::new(
+                    Device::open(
+                        std::path::Path::new(&path),
+                        Some(key.as_str()),
+                        &name,
+                    )
+                    .map_err(map_err)?,
+                ),
+            })
         }
 
         /// 本设备长期身份公钥（序列化字节，供对端 SAS/TOFU）。
