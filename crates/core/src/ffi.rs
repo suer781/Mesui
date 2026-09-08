@@ -84,35 +84,36 @@ pub fn smoke_test_all_modules() -> String {
     format!("smoke_test_all_modules: [{}]", results.join(", "))
 }
 
+/// 跨 FFI 的统一错误：Core 为一般失败；RemoteIdentityChanged 单独成类——
+/// TOFU 拒绝是「对方换长期钥匙」的安全信号，UI 须区别处理。
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum DcError {
+    #[error("{msg}")]
+    Core { msg: String },
+    #[error("对方身份已变更（{name} 已绑定不同的长期身份钥），需重新带外验证")]
+    RemoteIdentityChanged { name: String },
+}
+
+fn map_err(e: crate::CoreError) -> DcError {
+    match e {
+        crate::CoreError::IdentityChanged(name) => DcError::RemoteIdentityChanged { name },
+        other => DcError::Core { msg: other.to_string() },
+    }
+}
+
+fn map_sig<E: std::fmt::Display>(e: E) -> DcError {
+    DcError::Core { msg: e.to_string() }
+}
+
 /// Signal 握手的 UniFFI 导出层：让 Kotlin 侧能调到手势核心（handshake.rs）。
 /// FFI 面只暴露可跨边界的类型（String / Vec<u8> / bool / Record），
 /// libsignal 类型一律转成字节，Device 用 Mutex 内部可变以满足 UniFFI Object 的 &self 契约。
 #[cfg(feature = "signal")]
 mod signal_ffi {
+    use super::{DcError, map_err, map_sig};
     use crate::handshake::{self, Device};
     use libsignal_protocol::{DeviceId, IdentityKey, PreKeySignalMessage, ProtocolAddress};
     use std::sync::Mutex;
-
-    /// 跨 FFI 的错误：Core 为一般失败；RemoteIdentityChanged 单独成类——
-    /// TOFU 拒绝是「对方换长期钥匙」的安全信号，UI 须区别处理。
-    #[derive(Debug, thiserror::Error, uniffi::Error)]
-    pub enum DcError {
-        #[error("{msg}")]
-        Core { msg: String },
-        #[error("对方身份已变更（{name} 已绑定不同的长期身份钥），需重新带外验证")]
-        RemoteIdentityChanged { name: String },
-    }
-
-    fn map_err(e: crate::CoreError) -> DcError {
-        match e {
-            crate::CoreError::IdentityChanged(name) => DcError::RemoteIdentityChanged { name },
-            other => DcError::Core { msg: other.to_string() },
-        }
-    }
-
-    fn map_sig<E: std::fmt::Display>(e: E) -> DcError {
-        DcError::Core { msg: e.to_string() }
-    }
 
     fn addr(name: &str) -> Result<ProtocolAddress, DcError> {
         let device = DeviceId::new(1).map_err(|e| DcError::Core { msg: format!("{e:?}") })?;
@@ -285,6 +286,8 @@ mod signal_ffi {
         pub note: String,
         pub added_ms: i64,
         pub link_secret: Vec<u8>,
+        pub node_id: String,
+        pub node_naddr: String,
     }
 
     /// 一条聊天记录。
@@ -326,9 +329,11 @@ mod signal_ffi {
             verified: bool,
             note: String,
             link_secret: Vec<u8>,
+            node_id: String,
+            node_naddr: String,
         ) -> Result<(), DcError> {
             self.inner
-                .upsert(&name, &identity, &bucket, verified, &note, &link_secret)
+                .upsert(&name, &identity, &bucket, verified, &note, &link_secret, &node_id, &node_naddr)
                 .map_err(map_err)
         }
 
@@ -344,6 +349,8 @@ mod signal_ffi {
                     note: c.note,
                     added_ms: c.added_ms,
                     link_secret: c.link_secret,
+                    node_id: c.node_id,
+                    node_naddr: c.node_naddr,
                 })
                 .collect())
         }
@@ -360,6 +367,20 @@ mod signal_ffi {
             self.inner.append_message(&peer, outgoing, &text).map_err(map_err)
         }
 
+        /// 每个 peer 最新一条（会话列表用），时间降序。
+        pub fn last_messages(&self) -> Result<Vec<ChatMessage>, DcError> {
+            let list = self.inner.last_messages().map_err(map_err)?;
+            Ok(list
+                .into_iter()
+                .map(|m| ChatMessage {
+                    peer: m.peer,
+                    outgoing: m.outgoing,
+                    text: m.text,
+                    ts_ms: m.ts_ms,
+                })
+                .collect())
+        }
+
         /// 最近 limit 条，时间升序。
         pub fn messages(&self, peer: String, limit: i32) -> Result<Vec<ChatMessage>, DcError> {
             let list = self.inner.messages(&peer, limit).map_err(map_err)?;
@@ -373,5 +394,83 @@ mod signal_ffi {
                 })
                 .collect())
         }
+    }
+}
+
+/// iroh 远程节点 FFI（阶段 5）：常驻 QUIC 端点，联系人间跨网络收发。
+/// v9 红线：无 n0 依赖，地址来自 QR 携带的 dc://node 快照。
+/// 根级模块：不依赖 signal feature；回调 trait 需先于引用它的 Object 注册。
+#[cfg(feature = "iroh-net")]
+mod node_ffi {
+    use super::{DcError, map_err};
+    use std::sync::Arc;
+
+    /// Kotlin 实现的节点回调（UniFFI callback interface，Rust 任意线程回调）。
+    #[uniffi::export(callback_interface)]
+    pub trait NodeCallback: Send + Sync {
+        /// 收到一条消息（from 为对端节点 id hex；payload = msg_type+密文）。
+        fn on_message(&self, from_node_id_hex: String, payload: Vec<u8>);
+        /// 端点就绪：本端节点 id + 地址快照（编 QR 用）。
+        fn on_ready(&self, node_id_hex: String, naddr: String);
+    }
+
+    struct SinkAdapter(Box<dyn NodeCallback>);
+
+    impl crate::node::NodeSink for SinkAdapter {
+        fn on_message(&self, from_node_id_hex: String, payload: Vec<u8>) {
+            self.0.on_message(from_node_id_hex, payload);
+        }
+        fn on_ready(&self, node_id_hex: String, naddr: String) {
+            self.0.on_ready(node_id_hex, naddr);
+        }
+    }
+
+    /// 常驻节点句柄。seed32 由 Kotlin 首次随机生成并加密落盘，重启沿用
+    /// （节点 id 稳定 → 联系人侧快照长期有效）。
+    #[derive(uniffi::Object)]
+    pub struct IrohNode {
+        inner: crate::node::Node,
+    }
+
+    #[uniffi::export]
+    impl IrohNode {
+        #[uniffi::constructor]
+        pub fn start(
+            relay_url: String,
+            seed32: Vec<u8>,
+            callback: Box<dyn NodeCallback>,
+        ) -> Result<Self, DcError> {
+            let seed: [u8; 32] = seed32
+                .as_slice()
+                .try_into()
+                .map_err(|_| DcError::Core { msg: "seed must be 32 bytes".into() })?;
+            Ok(Self {
+                inner: crate::node::Node::start(&relay_url, &seed, Arc::new(SinkAdapter(callback)))
+                    .map_err(map_err)?,
+            })
+        }
+
+        pub fn node_id_hex(&self) -> String {
+            self.inner.node_id_hex()
+        }
+
+        pub fn export_naddr(&self) -> String {
+            self.inner.export_naddr()
+        }
+
+        /// 按快照发送（阻塞至对端应用层确认；调用方放 IO 线程）。
+        pub fn send(&self, naddr: String, payload: Vec<u8>, timeout_ms: u32) -> Result<(), DcError> {
+            self.inner.send(&naddr, &payload, timeout_ms as u64).map_err(map_err)
+        }
+
+        pub fn stop(&self) {
+            self.inner.stop();
+        }
+    }
+
+    /// 快照 → 节点 id hex（配对落库时从对方快照提取）。
+    #[uniffi::export]
+    pub fn node_id_from_naddr(naddr: String) -> Result<String, DcError> {
+        crate::node::node_id_of_naddr(&naddr).map_err(map_err)
     }
 }

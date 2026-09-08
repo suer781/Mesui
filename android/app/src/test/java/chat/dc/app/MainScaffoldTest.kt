@@ -6,6 +6,8 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import chat.dc.app.testing.FakeAndroidKeyStore
+import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -19,6 +21,13 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
 class MainScaffoldTest {
+
+    companion object {
+        init {
+            // 类加载期注册（早于 Compose Rule 启动 Activity / NodeService → SignalCore）
+            FakeAndroidKeyStore.install()
+        }
+    }
 
     @get:Rule
     val compose = createAndroidComposeRule<MainActivity>()
@@ -55,10 +64,12 @@ class MainScaffoldTest {
         // 入口是选角色页：出示与扫码绝不同屏
         compose.onNodeWithTag("role_show").assertExists()
         compose.onNodeWithTag("role_scan").assertExists()
-        // 选「出示我的码」→ 只有动态码，没有取景器
+        // 选「出示我的码」→ 只有动态码，没有取景器（Robolectric 无 AndroidKeyStore
+        // 也无 native：页面走「身份不可用」降级态，同样不出现取景器）
         compose.onNodeWithTag("role_show").performClick()
         compose.waitForIdle()
-        compose.onNodeWithTag("qr_image").assertExists()
+        compose.onNodeWithTag("identity_unavailable").assertExists()
+        compose.onNodeWithTag("qr_image").assertDoesNotExist()
         compose.onNodeWithTag("scan_view").assertDoesNotExist()
     }
 

@@ -180,8 +180,9 @@ fun MainScaffold() {
             composable(
                 route = "chat/{contactId}",
                 arguments = listOf(navArgument("contactId") { type = NavType.StringType }),
-            ) {
+            ) { entry ->
                 ChatScreen(
+                    contactId = entry.arguments?.getString("contactId").orEmpty(),
                     onBack = { navController.popBackStack() },
                     onAddFriend = { navController.navigate("add_friend") },
                 )

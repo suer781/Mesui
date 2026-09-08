@@ -28,7 +28,10 @@ object Wire {
     const val AUTH_B_RSP = 9    // 反向认证②：[type][hmac:16]（responder 证明持有 S_i）
 
     const val HEADER_LEN = 3    // [type:1][bodyLen:2 BE]
-    const val MAX_BODY = 65535
+    // 单帧 body 上限：真实最大帧 = HS（name+MAC+PreKeyBundle ≈2.6KB），留余量取 4KB。
+    // 必须远小于 len 域的 65535：FrameSink 靠「声明长度超限」识别恶意/坏头并立即
+    // 丢弃缓冲，否则对端可用 0xFFFF 假头让重组缓冲无限挂起。
+    const val MAX_BODY = 4096
 }
 
 /** GATT 服务与特征 UUID（client/server 共用）。 */
@@ -60,11 +63,16 @@ class FrameSink {
         while (buf.size >= Wire.HEADER_LEN) {
             val len = ((buf[1].toInt() and 0xFF) shl 8) or (buf[2].toInt() and 0xFF)
             val total = Wire.HEADER_LEN + len
+            if (total > Wire.HEADER_LEN + Wire.MAX_BODY) {
+                // 声明超大 body 的坏头：立即丢弃缓冲（否则真帧被假头吞掉）
+                buf = ByteArray(0)
+                break
+            }
             if (buf.size < total) break
             out += buf.copyOf(total)
             buf = buf.copyOfRange(total, buf.size)
         }
-        if (buf.size > Wire.HEADER_LEN + Wire.MAX_BODY) buf = ByteArray(0) // 越界保护：丢弃缓冲
+        if (buf.size > Wire.HEADER_LEN + Wire.MAX_BODY) buf = ByteArray(0) // 无头垃圾兜底
         return out
     }
 
@@ -101,11 +109,12 @@ interface LinkEvents {
     fun onClosed()
 }
 
-/** minSdk26 兼容写特征（API33 起新签名）。 */
+/** minSdk26 兼容写特征（API33 起新签名返回 status int，0=SUCCESS）。 */
 @Suppress("DEPRECATION")
 private fun writeCharacteristicCompat(g: BluetoothGatt, char: BluetoothGattCharacteristic, value: ByteArray): Boolean =
     if (Build.VERSION.SDK_INT >= 33) {
-        g.writeCharacteristic(char, value, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+        g.writeCharacteristic(char, value, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) ==
+            android.bluetooth.BluetoothStatusCodes.SUCCESS
     } else {
         char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         char.value = value
@@ -262,7 +271,8 @@ class BleServer(private val context: Context) : BluetoothGattServerCallback() {
                 if (Build.VERSION.SDK_INT >= 33) {
                     s.notifyCharacteristicChanged(device, txChar, false, chunk)
                 } else {
-                    s.notifyCharacteristicChanged(device, chunk, false)
+                    txChar.value = chunk
+                    s.notifyCharacteristicChanged(device, txChar, false)
                 }
             }.onFailure { pump.clear() }
         }

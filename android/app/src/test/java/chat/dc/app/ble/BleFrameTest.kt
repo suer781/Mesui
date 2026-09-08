@@ -34,9 +34,11 @@ class BleFrameTest {
     @Test
     fun sink_oversize_buffer_guard() {
         val sink = FrameSink()
-        // 声明超大 bodyLen 的坏头：缓冲被丢弃不无限增长
+        // 声明超大 bodyLen 的坏头：缓冲被立即丢弃，不无限增长也不吞后续帧
         sink.feed(byteArrayOf(Wire.MSG.toByte(), -1, -1))
-        sink.feed(ByteArray(4000))
+        // 长度取 3 的整数倍（2 帧 × 3B 头、len=0）：全零「空体帧流」被整除消费后
+        // 缓冲归零，好帧不被残余错位污染（len=0 的空体帧是 SAS_OK 的合法形态）
+        sink.feed(ByteArray(4002))
         val again = sink.feed(wireFrame(Wire.SAS_OK, ByteArray(1)))
         assertEquals(1, again.size)
     }
@@ -47,6 +49,7 @@ class BleFrameTest {
         val chunks = splitForChunk(frame, 100)
         assertEquals(frame.size, chunks.sumOf { it.size })
         assertTrue(chunks.all { it.size <= 100 })
-        assertEquals(frame.toList(), chunks.flatten())
+        // ByteArray 非 Iterable，flatten 需逐元素展开
+        assertEquals(frame.toList(), chunks.flatMap { it.toList() })
     }
 }

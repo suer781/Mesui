@@ -13,6 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// 联系人（字段对齐 wiki 阶段 3 任务 4：身份公钥、备注、SAS 校验状态、桶地址；
 /// link_secret=S_i 好友间配对时交换的共享秘密，驱动布隆过滤器回连的派生 ID 与
 /// HMAC 挑战应答，见 ble 层设计）。
+/// node_id/node_naddr：对方 iroh 节点 id（hex）与地址快照（dc://node?v=1&…，
+/// 来自 QR 载荷或配对握手），跨网络发消息按快照建连；空 = 对端未提供（仅 BLE）。
 #[derive(Debug, Clone)]
 pub struct ContactInfo {
     pub name: String,
@@ -22,6 +24,8 @@ pub struct ContactInfo {
     pub note: String,
     pub added_ms: i64,
     pub link_secret: Vec<u8>,
+    pub node_id: String,
+    pub node_naddr: String,
 }
 
 /// 一条聊天记录（显示用；传输重试是 queue.rs 的职责，不在此混用）。
@@ -41,7 +45,9 @@ CREATE TABLE IF NOT EXISTS contacts (
     verified INTEGER NOT NULL DEFAULT 0,
     note TEXT NOT NULL DEFAULT '',
     added_ms INTEGER NOT NULL,
-    link_secret BLOB NOT NULL
+    link_secret BLOB NOT NULL,
+    node_id TEXT NOT NULL DEFAULT '',
+    node_naddr TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS chat_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,6 +93,12 @@ impl ContactStore {
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| CoreError::Db(e.to_string()))?;
         conn.execute_batch(SCHEMA).map_err(|e| CoreError::Db(e.to_string()))?;
+        // 旧库迁移（节点地址列）：已存在则报 duplicate column，吞掉即可
+        for col in ["node_id", "node_naddr"] {
+            let _ = conn.execute_batch(&format!(
+                "ALTER TABLE contacts ADD COLUMN {col} TEXT NOT NULL DEFAULT '';"
+            ));
+        }
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -99,6 +111,8 @@ impl ContactStore {
         verified: bool,
         note: &str,
         link_secret: &[u8],
+        node_id: &str,
+        node_naddr: &str,
     ) -> Result<()> {
         if identity.len() != 32 {
             return Err(CoreError::Config("contact identity must be 32 bytes".into()));
@@ -111,11 +125,11 @@ impl ContactStore {
         }
         let conn = self.conn.lock().map_err(|e| CoreError::Db(e.to_string()))?;
         conn.execute(
-            "INSERT INTO contacts (name, identity, bucket, verified, note, added_ms, link_secret)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO contacts (name, identity, bucket, verified, note, added_ms, link_secret, node_id, node_naddr)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(name) DO UPDATE SET
-               identity=?2, bucket=?3, verified=?4, note=?5, link_secret=?7",
-            params![name, identity, bucket, verified as i64, note, now_ms(), link_secret],
+               identity=?2, bucket=?3, verified=?4, note=?5, link_secret=?7, node_id=?8, node_naddr=?9",
+            params![name, identity, bucket, verified as i64, note, now_ms(), link_secret, node_id, node_naddr],
         )
         .map_err(|e| CoreError::Db(e.to_string()))?;
         Ok(())
@@ -124,7 +138,7 @@ impl ContactStore {
     pub fn list(&self) -> Result<Vec<ContactInfo>> {
         let conn = self.conn.lock().map_err(|e| CoreError::Db(e.to_string()))?;
         let mut stmt = conn
-            .prepare("SELECT name, identity, bucket, verified, note, added_ms, link_secret FROM contacts ORDER BY added_ms")
+            .prepare("SELECT name, identity, bucket, verified, note, added_ms, link_secret, node_id, node_naddr FROM contacts ORDER BY added_ms")
             .map_err(|e| CoreError::Db(e.to_string()))?;
         let rows = stmt
             .query_map([], |r| {
@@ -136,6 +150,8 @@ impl ContactStore {
                     note: r.get(4)?,
                     added_ms: r.get(5)?,
                     link_secret: r.get(6)?,
+                    node_id: r.get(7)?,
+                    node_naddr: r.get(8)?,
                 })
             })
             .map_err(|e| CoreError::Db(e.to_string()))?;
@@ -169,6 +185,30 @@ impl ContactStore {
         )
         .map_err(|e| CoreError::Db(e.to_string()))?;
         Ok(())
+    }
+
+    /// 每个 peer 的最新一条记录（会话列表用），按时间降序。
+    pub fn last_messages(&self) -> Result<Vec<ChatMsg>> {
+        let conn = self.conn.lock().map_err(|e| CoreError::Db(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.peer, c.outgoing, c.text, c.ts_ms FROM chat_log c
+                 JOIN (SELECT peer, MAX(id) AS mid FROM chat_log GROUP BY peer) t ON c.id = t.mid
+                 ORDER BY c.ts_ms DESC",
+            )
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ChatMsg {
+                    peer: r.get(0)?,
+                    outgoing: r.get::<_, i64>(1)? != 0,
+                    text: r.get(2)?,
+                    ts_ms: r.get(3)?,
+                })
+            })
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| CoreError::Db(e.to_string()))
     }
 
     /// 最近 limit 条，按时间升序返回（UI 直接渲染）。
@@ -211,17 +251,20 @@ mod tests {
     #[test]
     fn upsert_list_verify_delete() {
         let s = ContactStore::open(std::path::Path::new(":memory:"), None).unwrap();
-        s.upsert("bob", &[1u8; 32], &[2u8; 32], false, "", &[9u8; 32]).unwrap();
-        s.upsert("alice", &[3u8; 32], &[4u8; 32], true, "备注", &[9u8; 32]).unwrap();
+        s.upsert("bob", &[1u8; 32], &[2u8; 32], false, "", &[9u8; 32], "", "").unwrap();
+        s.upsert("alice", &[3u8; 32], &[4u8; 32], true, "备注", &[9u8; 32], "aa", "dc://node?v=1&id=aa").unwrap();
         let all = s.list().unwrap();
         assert_eq!(all.len(), 2);
         // 重新加好友：同名覆盖不重复
-        s.upsert("bob", &[5u8; 32], &[6u8; 32], true, "", &[8u8; 32]).unwrap();
+        s.upsert("bob", &[5u8; 32], &[6u8; 32], true, "", &[8u8; 32], "bb", "").unwrap();
         assert_eq!(s.list().unwrap().len(), 2);
         let bob = s.list().unwrap().into_iter().find(|c| c.name == "bob").unwrap();
         assert_eq!(bob.identity, vec![5u8; 32]);
         assert_eq!(bob.link_secret, vec![8u8; 32]);
+        assert_eq!(bob.node_id, "bb");
         assert!(bob.verified);
+        let alice = s.list().unwrap().into_iter().find(|c| c.name == "alice").unwrap();
+        assert_eq!(alice.node_naddr, "dc://node?v=1&id=aa");
         s.delete("alice").unwrap();
         assert_eq!(s.list().unwrap().len(), 1);
     }
@@ -229,9 +272,9 @@ mod tests {
     #[test]
     fn rejects_wrong_sizes() {
         let s = ContactStore::open(std::path::Path::new(":memory:"), None).unwrap();
-        assert!(s.upsert("x", &[0u8; 31], &[0u8; 32], false, "", &[0u8; 32]).is_err());
-        assert!(s.upsert("x", &[0u8; 32], &[0u8; 33], false, "", &[0u8; 32]).is_err());
-        assert!(s.upsert("x", &[0u8; 32], &[0u8; 32], false, "", &[0u8; 31]).is_err());
+        assert!(s.upsert("x", &[0u8; 31], &[0u8; 32], false, "", &[0u8; 32], "", "").is_err());
+        assert!(s.upsert("x", &[0u8; 32], &[0u8; 33], false, "", &[0u8; 32], "", "").is_err());
+        assert!(s.upsert("x", &[0u8; 32], &[0u8; 32], false, "", &[0u8; 31], "", "").is_err());
     }
 
     #[test]
@@ -239,19 +282,42 @@ mod tests {
         let path = temp_db("reopen");
         {
             let s = ContactStore::open(&path, Some("kk")).unwrap();
-            s.upsert("bob", &[7u8; 32], &[8u8; 32], true, "", &[1u8; 32]).unwrap();
+            s.upsert("bob", &[7u8; 32], &[8u8; 32], true, "", &[1u8; 32], "aa", "dc://node?v=1&id=aa").unwrap();
             s.append_message("bob", true, "hi").unwrap();
             s.append_message("bob", false, "yo").unwrap();
         }
         let s = ContactStore::open(&path, Some("kk")).unwrap();
         assert_eq!(s.list().unwrap().len(), 1);
         assert_eq!(s.list().unwrap()[0].link_secret, vec![1u8; 32]);
+        // 旧库迁移列在重开后依然读写
+        assert_eq!(s.list().unwrap()[0].node_naddr, "dc://node?v=1&id=aa");
         let msgs = s.messages("bob", 10).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].text, "hi"); // 时间升序
         assert_eq!(msgs[1].text, "yo");
         assert!(msgs[0].outgoing && !msgs[1].outgoing);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn last_messages_latest_per_peer_desc() {
+        use std::time::Duration;
+        let s = ContactStore::open(std::path::Path::new(":memory:"), None).unwrap();
+        // 拉开时间戳（ms 粒度），保证跨 peer 排序断言确定性
+        s.append_message("bob", true, "b1").unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        s.append_message("alice", true, "a1").unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        s.append_message("bob", false, "b2").unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        s.append_message("alice", true, "a2").unwrap();
+        let last = s.last_messages().unwrap();
+        assert_eq!(last.len(), 2);
+        assert_eq!(last[0].peer, "alice"); // 最新在前
+        assert_eq!(last[0].text, "a2");
+        assert_eq!(last[1].peer, "bob");
+        assert_eq!(last[1].text, "b2");
+        assert!(!last[1].outgoing);
     }
 
     #[test]
@@ -267,7 +333,7 @@ mod tests {
         let path = temp_db("wrongkey");
         {
             let s = ContactStore::open(&path, Some("right")).unwrap();
-            s.upsert("bob", &[1u8; 32], &[2u8; 32], false, "", &[3u8; 32]).unwrap();
+            s.upsert("bob", &[1u8; 32], &[2u8; 32], false, "", &[3u8; 32], "", "").unwrap();
         }
         assert!(ContactStore::open(&path, Some("wrong")).is_err());
         let _ = std::fs::remove_file(&path);

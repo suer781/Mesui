@@ -10,27 +10,57 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Radar
+import androidx.compose.material.icons.filled.Verified
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import chat.dc.app.R
+import chat.dc.app.ble.BleMesh
+import chat.dc.app.core.SignalCore
 import chat.dc.app.ui.components.EmptyState
+import chat.dc.app.ui.components.InitialsAvatar
+import chat.dc.core.Contact
 
-/** 联系人主 tab：功能入口卡片（图标+底色）+ 联系人列表空态（核心数据接入前不放演示联系人）。 */
+/**
+ * 联系人主 tab（阶段 5 接真数据）：功能入口卡片 + 真实联系人列表。
+ * 数据 = contactStore.listContacts；在线点 = BleMesh.peers（蓝牙链路在位）；
+ * 点击进聊天。长按删除先不做（误触代价高，删除入口放在后续设置）。
+ */
 @Composable
 fun ContactsScreen(onOpenNearby: () -> Unit, onOpenAddFriend: () -> Unit, onOpenChat: (String) -> Unit) {
+    val context = LocalContext.current
+    var contacts by remember { mutableStateOf<List<Contact>>(emptyList()) }
+    val peers by BleMesh.peers.collectAsState()
+    val pairing by BleMesh.pairing.collectAsState()
+
+    LaunchedEffect(Unit) {
+        contacts = runCatching { SignalCore.contactStore(context).listContacts() }.getOrDefault(emptyList())
+    }
+    // 配对完成（有新联系人）后刷新列表
+    LaunchedEffect(pairing) {
+        contacts = runCatching { SignalCore.contactStore(context).listContacts() }.getOrDefault(emptyList())
+    }
+
     Column(modifier = Modifier.fillMaxSize()) {
         Text(
             stringResource(R.string.tab_contacts),
@@ -59,15 +89,66 @@ fun ContactsScreen(onOpenNearby: () -> Unit, onOpenAddFriend: () -> Unit, onOpen
                     onClick = onOpenNearby,
                 )
             }
-            // 核心数据接入前没有联系人可列出：展示引导空态，而不是演示数据
-            item {
-                EmptyState(
-                    icon = Icons.Filled.People,
-                    title = stringResource(R.string.empty_contacts_title),
-                    hint = stringResource(R.string.empty_contacts_hint),
-                    actionText = stringResource(R.string.empty_action_add_friend),
-                    onAction = onOpenAddFriend,
-                )
+            if (contacts.isEmpty()) {
+                item {
+                    EmptyState(
+                        icon = Icons.Filled.People,
+                        title = stringResource(R.string.empty_contacts_title),
+                        hint = stringResource(R.string.empty_contacts_hint),
+                        actionText = stringResource(R.string.empty_action_add_friend),
+                        onAction = onOpenAddFriend,
+                    )
+                }
+            } else {
+                items(contacts.size) { i ->
+                    val c = contacts[i]
+                    val identityHex = remember(c.identity) {
+                        c.identity.joinToString("") { "%02x".format(it) }
+                    }
+                    val online = peers[identityHex] == chat.dc.app.ble.PeerState.ONLINE
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onOpenChat(c.name) }
+                            .padding(horizontal = 20.dp, vertical = 12.dp)
+                            .testTag("contact_row_${c.name}"),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        InitialsAvatar(c.name.take(1), size = 44, corner = 14)
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(horizontal = 12.dp),
+                        ) {
+                            Text(c.name, style = MaterialTheme.typography.bodyLarge)
+                            if (c.note.isNotBlank()) {
+                                Text(
+                                    c.note,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        if (c.verified) {
+                            Icon(
+                                Icons.Filled.Verified,
+                                contentDescription = stringResource(R.string.contacts_verified_desc),
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                        // 在线指示：蓝牙链路在位（iroh 为按需建连，不在此断言）
+                        Box(
+                            modifier = Modifier
+                                .padding(start = 8.dp)
+                                .size(10.dp)
+                                .background(
+                                    if (online) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
+                                    CircleShape,
+                                ),
+                        )
+                    }
+                }
             }
         }
     }
@@ -119,4 +200,3 @@ private fun EntryRow(
         }
     }
 }
-

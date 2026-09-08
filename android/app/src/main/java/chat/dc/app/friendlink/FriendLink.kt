@@ -90,9 +90,18 @@ object FriendLink {
         secrets.forEach { add(slotId(it, slot)) }
         val target = HASHES * CAP_FRIENDS
         var off = 0
-        while (bits.count { it } < target && off + ID_LEN <= padRnd.size) {
-            add(padRnd.copyOfRange(off, off + ID_LEN))
-            off += ID_LEN
+        var round = 0
+        while (bits.count { it } < target) {
+            // padRnd 耗尽后用确定性扩展（SHA-256(padRnd||counter)）继续填充：
+            // 目标 set-bit 数必须与好友数无关（不泄露好友数的设计承诺）
+            val id = if (off + ID_LEN <= padRnd.size) {
+                val id = padRnd.copyOfRange(off, off + ID_LEN)
+                off += ID_LEN
+                id
+            } else {
+                sha256(padRnd + le8(round.toLong())).copyOf(ID_LEN).also { round++ }
+            }
+            add(id)
         }
         val out = ByteArray(BLOOM_BYTES)
         for (i in 0 until BLOOM_BITS) {

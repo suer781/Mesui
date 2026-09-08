@@ -56,6 +56,7 @@ data class PairingSnap(
     val localConfirmed: Boolean,
     val peerConfirmed: Boolean,
     val waitingLink: Boolean,
+    val finished: Boolean,
 )
 
 /** 统一链路句柄。 */
@@ -92,6 +93,7 @@ private class PairingInternal(val asHost: Boolean) {
     @Volatile var token: ByteArray? = null
     @Volatile var bucket: ByteArray? = null
     @Volatile var bleId: ByteArray? = null
+    @Volatile var naddr: String = ""
     @Volatile var sas: SasCode? = null
     @Volatile var localConfirmed = false
     @Volatile var peerConfirmed = false
@@ -105,6 +107,7 @@ private class PairingInternal(val asHost: Boolean) {
         localConfirmed = localConfirmed,
         peerConfirmed = peerConfirmed,
         waitingLink = link == null,
+        finished = finished,
     )
 }
 
@@ -209,7 +212,9 @@ object BleMesh {
         val params = AdvertisingSetParameters.Builder()
             .setLegacyMode(false)
             .setInterval(AdvertisingSetParameters.INTERVAL_LOW)
-            .setTxPowerLevel(AdvertisingSetParameters.TRANSMIT_POWER_LOW)
+            // AdvertisingSetParameters.TRANSMIT_POWER_LOW（-60 dBm）——部分 SDK 面
+            // 未暴露该常量，直接用数值，语义等同
+            .setTxPowerLevel(-60)
             .build()
         advCallback?.let { runCatching { adv.stopAdvertisingSet(it) } }
         delay(250) // stop→start 栈内序列化留量
@@ -420,7 +425,11 @@ object BleMesh {
         val context = ctx()
         val session = SignalCore.session(context)
         val plain = runCatching { session.decrypt(name, WireMessage(sigType.toUByte(), ct)) }.getOrNull() ?: return
-        if (!plain.contentEquals("dc-hs".toByteArray())) return
+        // 明文 = "dc-hs"（旧版，无节点快照）或 "dc-hs" + 0x00 + dc://node 快照（跨网直连入口）
+        if (!(plain.size == 5 && String(plain, Charsets.US_ASCII) == "dc-hs") &&
+            !(plain.size > 6 && plain[5] == 0.toByte() && String(plain.copyOfRange(6, plain.size), Charsets.US_ASCII).startsWith("dc://node"))
+        ) return
+        p.naddr = if (plain.size > 6) String(plain.copyOfRange(6, plain.size), Charsets.US_ASCII) else ""
         val theirId = runCatching { prekeySenderIdentity(ct) }.getOrNull() ?: return
         p.peerName = name
         p.peerIdentity = theirId
@@ -455,7 +464,14 @@ object BleMesh {
             val session = runCatching { SignalCore.session(context) }.getOrNull() ?: return@whenReady
             val token = p.token ?: return@whenReady
             val bucket = p.bucket ?: return@whenReady
-            val wm = runCatching { session.encrypt(name, "dc-hs".toByteArray()) }.getOrNull() ?: return@whenReady
+            // 明文 = "dc-hs" + 0x00 + 本端节点快照（无节点时退化为旧版 5 字节）
+            val myNaddr = chat.dc.app.core.IrohNodeManager.state.value.naddr
+            val plainPayload = if (myNaddr.isEmpty()) {
+                "dc-hs".toByteArray()
+            } else {
+                "dc-hs".toByteArray(Charsets.US_ASCII) + byteArrayOf(0) + myNaddr.toByteArray(Charsets.US_ASCII)
+            }
+            val wm = runCatching { session.encrypt(name, plainPayload) }.getOrNull() ?: return@whenReady
             val mac = runCatching { firstMessageMac(token, bucket, wm.ciphertext) }.getOrNull() ?: return@whenReady
             val nameBytes = name.toByteArray()
             val body = byteArrayOf(nameBytes.size.toByte()) + nameBytes + mac + byteArrayOf(wm.msgType.toByte()) + wm.ciphertext
@@ -484,7 +500,8 @@ object BleMesh {
         val context = ctx()
         val name = p.peerName ?: return
         val theirId = p.peerIdentity ?: return
-        runCatching { SignalCore.contactStore(context).upsertContact(name, theirId, p.bucket ?: ByteArray(32), true, "", secret) }
+        val peerNodeId = runCatching { chat.dc.core.nodeIdFromNaddr(p.naddr) }.getOrDefault("")
+        runCatching { SignalCore.contactStore(context).upsertContact(name, theirId, p.bucket ?: ByteArray(32), true, "", secret, peerNodeId, p.naddr) }
         p.finished = true
         p.link?.send(wireFrame(Wire.SAS_OK, ByteArray(0)))
         publishPairing()
@@ -510,10 +527,11 @@ object BleMesh {
     }
 
     /** 扫码页采集完成（UI 已 processBundle）。 */
-    fun startPairingAsJoiner(peerName: String, peerIdentity: ByteArray, token: ByteArray, bucket: ByteArray, bleId: ByteArray) {
+    fun startPairingAsJoiner(peerName: String, peerIdentity: ByteArray, token: ByteArray, bucket: ByteArray, bleId: ByteArray, naddr: String) {
         pairingObj = PairingInternal(asHost = false).apply {
             this.peerName = peerName; this.peerIdentity = peerIdentity
             this.token = token; this.bucket = bucket; this.bleId = bleId
+            this.naddr = naddr
         }
         publishPairing()
     }
@@ -532,15 +550,17 @@ object BleMesh {
         val session = runCatching { SignalCore.session(context) }.getOrNull() ?: return
         val name = p.peerName ?: return
         val theirId = p.peerIdentity ?: return
+        // 节点地址落库：host 取自配对握手携带的快照，joiner 取自 QR 载荷
+        val peerNodeId = runCatching { chat.dc.core.nodeIdFromNaddr(p.naddr) }.getOrDefault("")
         runCatching { session.pinIdentity(name, theirId) }
         if (p.asHost) {
             val secret = ByteArray(32).also(security::nextBytes)
-            runCatching { SignalCore.contactStore(context).upsertContact(name, theirId, p.bucket ?: ByteArray(32), true, "", secret) }
+            runCatching { SignalCore.contactStore(context).upsertContact(name, theirId, p.bucket ?: ByteArray(32), true, "", secret, peerNodeId, p.naddr) }
             val wm = runCatching { session.encrypt(name, "DCS1".toByteArray(Charsets.US_ASCII) + secret) }.getOrNull()
             wm?.let { p.link?.send(wireFrame(Wire.MSG, byteArrayOf(it.msgType.toByte()) + it.ciphertext)) }
             p.finished = true
         } else {
-            runCatching { SignalCore.contactStore(context).upsertContact(name, theirId, p.bucket ?: ByteArray(32), true, "", ByteArray(32)) }
+            runCatching { SignalCore.contactStore(context).upsertContact(name, theirId, p.bucket ?: ByteArray(32), true, "", ByteArray(32), peerNodeId, p.naddr) }
         }
         p.localConfirmed = true
         p.link?.send(wireFrame(Wire.SAS_OK, ByteArray(0)))
@@ -549,33 +569,49 @@ object BleMesh {
 
     // ---------------- 业务帧 ----------------
 
-    private fun dispatchIncoming(handle: LinkHandle, frame: ByteArray, peerNameHint: String?) {
-        val body = frame.copyOfRange(Wire.HEADER_LEN, frame.size)
+    /** 统一解密落库入口：BLE 帧 / iroh 远程载荷（均为 msgType+密文体）共用。 */
+    private fun decryptAndStore(peerName: String, body: ByteArray) {
         if (body.isEmpty()) return
-        val context = ctx()
+        val context = appContext ?: return
         val session = runCatching { SignalCore.session(context) }.getOrNull() ?: return
-        val name = peerNameHint ?: return
         val plain = runCatching {
-            session.decrypt(name, WireMessage(body[0].toUByte(), body.copyOfRange(1, body.size)))
+            session.decrypt(peerName, WireMessage(body[0].toUByte(), body.copyOfRange(1, body.size)))
         }.getOrNull() ?: return
         if (plain.size == 4 + 32 && String(plain.copyOfRange(0, 4), Charsets.US_ASCII) == "DCS1") return // 聊天链路拒收下发格式
         val text = String(plain, Charsets.UTF_8)
-        runCatching { SignalCore.contactStore(context).appendMessage(name, false, text) }
-        _incoming.tryEmit(Incoming(name, text))
+        runCatching { SignalCore.contactStore(context).appendMessage(peerName, false, text) }
+        _incoming.tryEmit(Incoming(peerName, text))
     }
 
-    /** 无在线链路返回 false（UI 显示「对方已离线」）。 */
+    private fun dispatchIncoming(handle: LinkHandle, frame: ByteArray, peerNameHint: String?) {
+        val body = frame.copyOfRange(Wire.HEADER_LEN, frame.size)
+        val name = peerNameHint ?: return
+        decryptAndStore(name, body)
+    }
+
+    /** iroh 远程链路投递（IrohNodeManager 回调）：与 BLE 收发同一条落库+入站流路径。 */
+    fun deliverRemote(peerName: String, body: ByteArray) = decryptAndStore(peerName, body)
+
+    /**
+     * 发送文本：BLE 在线链路优先（近场免费直发）；无链路且有对方节点快照
+     * 则走 iroh 跨网络（阻塞等对端应用层确认，调用方须在 IO 线程）。
+     * 两条路都不通返回 false（UI 显示「对方不在线」），不落库（队列补投为后续阶段）。
+     */
     fun sendText(peerName: String, text: String): Boolean {
         val context = runCatching { ctx() }.getOrNull() ?: return false
         val contact = runCatching {
             SignalCore.contactStore(context).listContacts().firstOrNull { it.name == peerName }
         }.getOrNull() ?: return false
-        val handle = synchronized(links) { links[hex(contact.identity)] } ?: return false
         val session = runCatching { SignalCore.session(context) }.getOrNull() ?: return false
         val wm = runCatching { session.encrypt(peerName, text.toByteArray()) }.getOrNull() ?: return false
-        runCatching { SignalCore.contactStore(context).appendMessage(peerName, true, text) }
-        handle.send(wireFrame(Wire.MSG, byteArrayOf(wm.msgType.toByte()) + wm.ciphertext))
-        return true
+        val payload = byteArrayOf(wm.msgType.toByte()) + wm.ciphertext
+        val sent = synchronized(links) { links[hex(contact.identity)] }?.let {
+            it.send(wireFrame(Wire.MSG, payload))
+            true
+        } ?: (contact.nodeNaddr.isNotEmpty() && chat.dc.app.core.IrohNodeManager.isRunning() &&
+            chat.dc.app.core.IrohNodeManager.send(contact.nodeNaddr, payload))
+        if (sent) runCatching { SignalCore.contactStore(context).appendMessage(peerName, true, text) }
+        return sent
     }
 
     fun isOnline(peerName: String): Boolean {

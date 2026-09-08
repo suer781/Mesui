@@ -35,6 +35,9 @@ pub mod handshake;
 #[cfg(feature = "signal")]
 pub mod signal_store;
 
+#[cfg(feature = "iroh-net")]
+pub mod node;
+
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
