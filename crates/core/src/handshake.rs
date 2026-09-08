@@ -7,18 +7,19 @@
 //! - 带外认证：SAS 由 `Fingerprint` 计算，绑定双方长期身份公钥；两端算出同一串，中间人必不匹配。
 //! - 首条消息：QR 里的一次性 token 派生 keyed-BLAKE3 MAC，未扫到码者无法为第一条握手消息造出合法 MAC。
 //!
-//! 阶段 1 用 libsignal 的内存 store 证明链路正确；SQLCipher 持久化(TOFU pin)与 UniFFI 导出在后续阶段接入，
-//! store trait 边界已就位。
+//! 阶段 3 起后端为 SQLCipher 持久化 store（signal_store.rs）：generate 用内存库，
+//! open 用文件库；身份/预密钥/会话/TOFU pin 全落盘，重启不丢。
 
+use crate::signal_store::SqlSignalStore;
 use crate::{CoreError, Result};
 use futures::executor::block_on;
 use libsignal_protocol::{
     kem, message_decrypt, message_encrypt, process_prekey_bundle, CiphertextMessage,
     CiphertextMessageType, DeviceId, Direction, Fingerprint, GenericSignedPreKey, IdentityChange,
-    IdentityKey, IdentityKeyPair, IdentityKeyStore, InMemSignalProtocolStore, KeyPair,
-    KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle, PreKeyId, PreKeyRecord,
-    PreKeySignalMessage, PreKeyStore, ProtocolAddress, PublicKey, SignalMessage, SignedPreKeyId,
-    SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
+    IdentityKey, IdentityKeyPair, IdentityKeyStore, KeyPair, KyberPreKeyId, KyberPreKeyRecord,
+    KyberPreKeyStore, PreKeyBundle, PreKeyId, PreKeyRecord, PreKeySignalMessage, PreKeyStore,
+    ProtocolAddress, PublicKey, SignalMessage, SignedPreKeyId, SignedPreKeyRecord,
+    SignedPreKeyStore, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,21 +52,35 @@ fn now_ts() -> Timestamp {
 
 /// 一个设备的 Signal 端点：长期身份密钥 + 预密钥/会话存储。
 ///
-/// 阶段 1 后端是 libsignal 内存 store；后续以 SQLCipher 实现同一组 trait 即可无缝替换。
+/// 后端统一为 SQLCipher store（signal_store.rs）：`generate` 用内存库
+/// （每次全新身份，测试与临时会话），`open` 用文件库（身份/会话/TOFU pin 落盘，
+/// 重启不丢）。libsignal 的 InMem 实现已被替换。
 pub struct Device {
     pub address: ProtocolAddress,
-    store: InMemSignalProtocolStore,
+    store: SqlSignalStore,
 }
 
 impl Device {
-    /// 生成新设备：预生成长期身份密钥对（TOFU 的信任根），随机 registration_id。
+    /// 内存后端：每次调用生成全新身份（测试 / 无持久化诉求的临时会话）。
     pub fn generate(name: &str) -> Result<Self> {
-        let mut rng = rand::rng();
-        let identity = IdentityKeyPair::generate(&mut rng);
-        let mut reg = [0u8; 4];
-        getrandom::fill(&mut reg).map_err(|e| CoreError::Entropy(e.to_string()))?;
-        let store =
-            InMemSignalProtocolStore::new(identity, u32::from_be_bytes(reg)).map_err(crypto_err)?;
+        Self::bootstrap(SqlSignalStore::open(std::path::Path::new(":memory:"), None)?, name)
+    }
+
+    /// SQLCipher 持久化后端：首次打开生成长期身份并落盘；之后重开沿用，
+    /// 会话与 TOFU pin 均持久（strict 模式：文件库必须给 key）。
+    pub fn open(path: &std::path::Path, key: Option<&str>, name: &str) -> Result<Self> {
+        Self::bootstrap(SqlSignalStore::open(path, key)?, name)
+    }
+
+    /// 打开 store 后的身份引导：无本地身份则生成（长期钥 + 随机 registration_id）。
+    fn bootstrap(store: SqlSignalStore, name: &str) -> Result<Self> {
+        if store.local_identity()?.is_none() {
+            let mut rng = rand::rng();
+            let identity = IdentityKeyPair::generate(&mut rng);
+            let mut reg = [0u8; 4];
+            getrandom::fill(&mut reg).map_err(|e| CoreError::Entropy(e.to_string()))?;
+            store.save_local_identity(&identity.serialize(), u32::from_be_bytes(reg))?;
+        }
         let address = ProtocolAddress::new(name.to_owned(), DeviceId::new(DEVICE_ID).map_err(crypto_err)?);
         Ok(Self { address, store })
     }
@@ -90,9 +105,10 @@ impl Device {
         let signed_pre_key = KeyPair::generate(&mut rng);
         let kyber_key = kem::KeyPair::generate(kem::KeyType::Kyber1024, &mut rng);
 
-        let pk_id = PreKeyId::from(1u32);
-        let spk_id = SignedPreKeyId::from(1u32);
-        let kpk_id = KyberPreKeyId::from(1u32);
+        // 单调 id：每次出示 QR 生成新组，固定 id 会覆盖上一组悬而未决的预密钥
+        let pk_id = PreKeyId::from(self.store.next_prekey_id("pre_keys")?);
+        let spk_id = SignedPreKeyId::from(self.store.next_prekey_id("signed_pre_keys")?);
+        let kpk_id = KyberPreKeyId::from(self.store.next_prekey_id("kyber_pre_keys")?);
 
         let spk_sig = identity_pair
             .private_key()
@@ -133,11 +149,14 @@ impl Device {
     /// 内部会验签名预密钥/Kyber 预密钥的身份签名，并按 TOFU 校验对方身份。
     pub fn process_bundle(&mut self, remote: &ProtocolAddress, bundle: &PreKeyBundle) -> Result<()> {
         let mut rng = rand::rng();
+        // 两个 &mut dyn 不能同时借自一个对象 → 传共享连接的克隆（见 signal_store.rs）
+        let mut session = self.store.clone();
+        let mut identity = self.store.clone();
         block(process_prekey_bundle(
             remote,
             &self.address,
-            &mut self.store.session_store,
-            &mut self.store.identity_store,
+            &mut session,
+            &mut identity,
             bundle,
             SystemTime::now(),
             &mut rng,
@@ -147,12 +166,14 @@ impl Device {
     /// 发一条消息（Double Ratchet 自动换钥）。返回 (线格式类型字节, 密文)。
     pub fn encrypt(&mut self, remote: &ProtocolAddress, plaintext: &[u8]) -> Result<(u8, Vec<u8>)> {
         let mut rng = rand::rng();
+        let mut session = self.store.clone();
+        let mut identity = self.store.clone();
         let msg = block(message_encrypt(
             plaintext,
             remote,
             &self.address,
-            &mut self.store.session_store,
-            &mut self.store.identity_store,
+            &mut session,
+            &mut identity,
             SystemTime::now(),
             &mut rng,
         ))?;
@@ -180,15 +201,22 @@ impl Device {
                 )))
             }
         };
+        // 五个 store 参数（一个 &dyn + 四个 &mut dyn）各传一份共享连接的克隆
+        // （单一对象无法同时借出多个 &mut，见 signal_store.rs 模块注释）
+        let mut session = self.store.clone();
+        let mut identity = self.store.clone();
+        let mut prekey = self.store.clone();
+        let signed = self.store.clone();
+        let mut kyber = self.store.clone();
         block(message_decrypt(
             &cm,
             remote,
             &self.address,
-            &mut self.store.session_store,
-            &mut self.store.identity_store,
-            &mut self.store.pre_key_store,
-            &self.store.signed_pre_key_store,
-            &mut self.store.kyber_pre_key_store,
+            &mut session,
+            &mut identity,
+            &mut prekey,
+            &signed,
+            &mut kyber,
             &mut rng,
         ))
     }
