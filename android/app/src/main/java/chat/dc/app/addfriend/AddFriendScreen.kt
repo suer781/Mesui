@@ -74,6 +74,23 @@ private fun RequestNearbyPermissionOnEntry() {
     }
 }
 
+/** 本地加密库解密失败被自动重置后的一次性提示（session 访问时触发检测）。 */
+@Composable
+private fun IdentityResetNotice() {
+    val shown = remember { SignalCore.consumeIdentityResetNotice() }
+    if (shown) {
+        Text(
+            stringResource(R.string.identity_reset_notice),
+            color = MaterialTheme.colorScheme.error,
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 8.dp)
+                .testTag("identity_reset_notice"),
+        )
+    }
+}
+
 /**
  * 加好友入口：先选角色。安全约束——「出示我的码」与「扫码添加」绝不同屏，
  * 要么别人扫你、要么你扫别人，二选一进入各自的独立页。
@@ -209,6 +226,7 @@ fun ShowMyCodeScreen() {
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
+        IdentityResetNotice()
         Text(
             stringResource(R.string.add_friend_role_show),
             style = MaterialTheme.typography.titleLarge,
@@ -278,6 +296,7 @@ fun ScanToAddScreen() {
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
+        IdentityResetNotice()
         Text(
             stringResource(R.string.add_friend_role_scan),
             style = MaterialTheme.typography.titleLarge,
