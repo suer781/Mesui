@@ -83,8 +83,7 @@ gradle assembleDebug      # 或 ./gradlew assembleDebug（wrapper 已指向国�
 
 ## 当前能力边界（实测）
 
-- Rust 核心（`crates/core`）已有身份 / 熵源 / 信封 / 自适应 / 队列 / 中继 / Signal 会话（PQXDH + Double Ratchet + SAS + TOFU）等模块，并配套单测。
-- Android 侧聊天收发目前是纯内存占位：`ui/chat/ChatScreen.kt` 的发送只追加本地列表，不经过任何加密或传输。
-- 联系人与消息未落库（无本地持久化）。
-- `NodeService` 是代码中明确标注的占位实现。
-- Rust 传输层（iroh）尚未通过 FFI 暴露给 Kotlin。
+- Rust 核心（`crates/core`）已有身份 / 熵源 / 信封 / 自适应 / 队列 / 中继 / Signal 会话（PQXDH + Double Ratchet + SAS + TOFU）、联系人落库（`contacts.rs`）与 iroh 传输层（`node.rs`），并配套单测。
+- Android 侧聊天 / 联系人 / 消息 / 我的四页已接真实数据层（`ContactStore` 持久化），`NodeService` 宿主 `IrohNodeManager`，BLE 帧通道与好友回连在位（`BleMesh` / `FriendLink`）。
+- 带外比对已闭环：扫码侧 `sasWith` + 出示侧经 `prekeySenderIdentity` 从首条 PreKey 消息取对方身份算 SAS。
+- 以上均以代码调用点核对为准；**运行时端到端行为（真机互扫、跨 WiFi 收发）尚无自动化验证**，回归测试需在 CI 与真机实测补齐。
