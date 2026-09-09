@@ -16,3 +16,6 @@ app/build/
 third_party/
 # UniFFI 生成的 Kotlin 绑定（CI 每次构建重新生成，不入库）
 android/app/src/main/uniffi/
+
+# Kotlin 编译器会话错误日志（IDE/构建噪声，误入库）
+.kotlin/
