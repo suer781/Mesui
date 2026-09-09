@@ -15,15 +15,21 @@ import javax.crypto.spec.GCMParameterSpec
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+
+/** iroh 节点启动状态机（自愈重试用）。 */
+enum class IrohStatus { IDLE, STARTING, RETRYING, RUNNING, FAILED }
 
 /** iroh 节点运行快照（Me 页节点面板与发送降级判定用）。 */
 data class IrohSnap(
     val running: Boolean = false,
     val nodeIdHex: String = "",
     val naddr: String = "",
+    // 启动/自愈重试状态：消费方（Me 页等）未消费该字段时行为与旧版一致
+    val status: IrohStatus = IrohStatus.IDLE,
 )
 
 /**
@@ -44,6 +50,10 @@ object IrohNodeManager {
     private const val GCM_IV_LEN = 12
     private const val GCM_TAG_BITS = 128
 
+    // 启动自愈重试：失败后 5s/15s/45s 指数退避，最多重试 3 次（首发失败之后）
+    private const val RETRY_MAX = 3
+    private val RETRY_DELAYS_MS = longArrayOf(5_000L, 15_000L, 45_000L)
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val _state = MutableStateFlow(IrohSnap())
@@ -52,6 +62,8 @@ object IrohNodeManager {
     @Volatile private var node: IrohNode? = null
     @Volatile private var appContext: Context? = null
     @Volatile private var starting = false
+    // 启动代次：stop() 自增使在途的启动/重试协程失效，防止 stop 后被旧协程重新拉起
+    @Volatile private var startGen = 0L
 
     /** 自建中继 URL（空 = 禁用）。 */
     fun relayUrl(context: Context): String =
@@ -65,15 +77,14 @@ object IrohNodeManager {
         start(context)
     }
 
-    /** 启动（幂等）：已在跑或正在启动则忽略。 */
+    /** 启动（幂等）：已在跑或正在启动则忽略；失败按 5s/15s/45s 退避自愈重试，最多 3 次。 */
     fun start(context: Context) {
         if (node != null || starting) return
         starting = true
         appContext = context.applicationContext
+        val gen = startGen
         scope.launch {
             try {
-                val seed = nodeSeed(context)
-                val relay = relayUrl(context)
                 val callback = object : NodeCallback {
                     override fun onMessage(fromNodeIdHex: String, payload: ByteArray) {
                         val ctx = appContext ?: return
@@ -84,21 +95,51 @@ object IrohNodeManager {
                     }
 
                     override fun onReady(nodeIdHex: String, naddr: String) {
-                        _state.value = IrohSnap(running = true, nodeIdHex = nodeIdHex, naddr = naddr)
+                        _state.value = IrohSnap(running = true, nodeIdHex = nodeIdHex, naddr = naddr, status = IrohStatus.RUNNING)
                     }
                 }
-                node = IrohNode.start(relay, seed, callback)
-            } catch (_: Exception) {
-                // 无网/端口异常等：保持未运行态，下次 start 或服务重建再试
-                _state.value = IrohSnap()
+                // 首发 + 指数退避自愈：NodeService 仅在 onCreate 调一次 start，
+                // 此前失败被 runCatching 静默吞掉后无任何路径再拉起，节点直到进程
+                // 重启都是死的；无网/端口占用等多为瞬时故障，退避重试即可自愈。
+                for (attempt in 0..RETRY_MAX) {
+                    if (gen != startGen) break  // stop() 已打断本轮启动
+                    // 首发标「启动中」，退避重试标「重试中」；旧消费方只看 running，不受影响
+                    _state.value =
+                        if (attempt == 0) IrohSnap(status = IrohStatus.STARTING)
+                        else IrohSnap(status = IrohStatus.RETRYING)
+                    if (attempt > 0) delay(RETRY_DELAYS_MS[attempt - 1])
+                    if (gen != startGen) break  // 退避期间发生 stop()
+                    try {
+                        val ctx = appContext ?: break
+                        val seed = nodeSeed(ctx)
+                        val relay = relayUrl(ctx)
+                        val created = IrohNode.start(relay, seed, callback)
+                        // 原生 start 阻塞期间若发生 stop()：立即回收，避免遗留无人管的节点
+                        if (gen != startGen) {
+                            runCatching { created.stop() }
+                            break
+                        }
+                        node = created
+                        break  // 启动成功（RUNNING 态由 onReady 回调写入）
+                    } catch (_: Exception) {
+                        // 本轮失败：退避后重试；重试耗尽则标「失败」，等
+                        // setRelayUrlAndRestart 或服务重建（START_STICKY）再拉起
+                        if (attempt == RETRY_MAX) _state.value = IrohSnap(status = IrohStatus.FAILED)
+                    }
+                }
             } finally {
-                starting = false
+                // 仅当代次未变时清 flag：stop→start 换代后，新启动协程持有该 flag
+                if (gen == startGen) starting = false
             }
         }
     }
 
     /** 停止并清理快照（NodeService.onDestroy / 中继变更重启时调用）。 */
     fun stop() {
+        // 换代 + 释放 starting：让在途启动/重试协程失效，setRelayUrlAndRestart
+        // 紧随其后的 start() 不再被旧协程的 starting flag 挡掉
+        startGen++
+        starting = false
         val n = node
         node = null
         _state.value = IrohSnap()
