@@ -6,7 +6,7 @@
 
 | 组件 | 用途 | 许可证 | 来源 |
 |---|---|---|---|
-| libsignal-protocol / libsignal-core | Signal 协议（X3DH、Double Ratchet） | AGPL-3.0-only | signalapp/libsignal @ eb7864c（vendored 浅抓取） |
+| libsignal-protocol / libsignal-core | Signal 协议（PQXDH、Double Ratchet） | AGPL-3.0-only | signalapp/libsignal @ eb7864c（vendored 浅抓取） |
 | SparsePostQuantumRatchet (spqr) | 后量子棘轮（libsignal 依赖） | 见其仓库 | signalapp/SparsePostQuantumRatchet v1.5.3 |
 | iroh | P2P QUIC 连接/打洞/中继 | MIT OR Apache-2.0 | n0-computer/iroh 1.1 |
 | iroh-relay / iroh-base 等 | iroh 生态 | MIT OR Apache-2.0 | 同上 |

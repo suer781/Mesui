@@ -11,7 +11,9 @@ import java.security.SecureRandom
  *
  * 载荷 = dc://add?v=2 URI（阶段 0 起为真实密钥材料）：
  * - [name] 出示方地址名（ProtocolAddress + SAS 本地标识，对端原样回传）
- * - [identity] 出示方长期身份公钥（SAS/TOFU 锚点）
+ * - [identity] 出示方长期身份公钥（SAS/TOFU 锚点）：33 字节，即 libsignal
+ *   `IdentityKey::serialize()`（1 字节曲线类型前缀 + 32 字节裸公钥），与
+ *   `SignalSession.identityKey()` 返回值、Rust 侧 `IdentityKey::decode()` 入参为同一契约
  * - [bundle] PreKeyBundle 上线格式（CBOR，含 Kyber-1024 公钥，约 1.8KB）
  * - [bucket] 随机信箱桶地址
  * - [token] 单次 bootstrap token：带外秘密，首条消息须携带其 keyed-BLAKE3 MAC
@@ -30,7 +32,8 @@ data class AddFriendPayload(
     init {
         // 编码进 URI 前先断言，防止非法名破坏 dc://add 解析
         require(chat.dc.app.core.SignalCore.NAME_RE.matches(name)) { "bad name" }
-        require(identity.size == 32) { "identity must be 32 bytes" }
+        // 33 = libsignal IdentityKey::serialize()（1 字节类型前缀 + 32 字节公钥），见类注释
+        require(identity.size == 33) { "identity must be 33 bytes" }
         require(bucket.size == 32) { "bucket must be 32 bytes" }
         require(token.size == 48) { "token must be 48 bytes" }
         require(ble.size == 8) { "ble must be 8 bytes" }

@@ -1,8 +1,9 @@
 //! Signal 会话层：PQXDH(Kyber-1024 + X25519) 初始协商 → Double Ratchet 逐条换钥 → SAS 带外比对。
 //!
 //! 密码学原语全部来自 vendored libsignal-protocol，本模块只做编排：
-//! - 初始密钥：`process_prekey_bundle` 跑 X3DH，内部 HKDF 从共享点派生根密钥（不直接用共享点当钥匙）。
-//!   该 libsignal 版本的 PreKeyBundle 恒含 Kyber 预密钥，故初始握手即 PQXDH（抗量子）。
+//! - 初始密钥：`process_prekey_bundle` 跑 PQXDH，内部 HKDF 从共享点派生根密钥（不直接用共享点当钥匙）。
+//!   之所以是 PQXDH 而非 X3DH：本 libsignal 版本的 PreKeyBundle 恒含 Kyber 预密钥，
+//!   X3DH 的 X25519 共享点之外还叠加了 Kyber-1024 的 KEM 共享秘密，故初始握手即抗量子。
 //! - 逐条消息：`message_encrypt` / `message_decrypt` 驱动 Double Ratchet，前向保密 + 后向自愈。
 //! - 带外认证：SAS 由 `Fingerprint` 计算，绑定双方长期身份公钥；两端算出同一串，中间人必不匹配。
 //! - 首条消息：QR 里的一次性 token 派生 keyed-BLAKE3 MAC，未扫到码者无法为第一条握手消息造出合法 MAC。
@@ -570,5 +571,32 @@ mod tests {
         );
         let (t3, ct3) = alice.encrypt(&bob_addr, b"msg after connect").unwrap();
         assert_eq!(bob.decrypt(&alice_addr, t3, &ct3).unwrap(), b"msg after connect");
+    }
+
+    /// 跨 FFI 字节契约回归：Kotlin 侧 `AddFriendPayload.identity` 必须是 **33 字节**。
+    ///
+    /// Kotlin 的 `SignalSession.identityKey()` 拿到的就是本测试里
+    /// `identity_key().serialize()` 的同一份字节（含 libsignal 的 1 字节曲线类型前缀）。
+    /// `AddFriendPayload` 的长度断言、以及 Rust 侧 `IdentityKey::decode()`
+    /// （`sas_with` / `pin_identity` 的入参解析）依赖同一个「33 字节」契约；
+    /// 历史上 Kotlin 侧误写成 32，导致出示码页面启动即崩、安全码恒为空。
+    /// 此处把该跨语言契约钉死，防止再次回归。
+    #[test]
+    fn identity_key_wire_bytes_are_33_and_roundtrip_through_decode() {
+        let device = Device::generate("x").unwrap();
+        let bytes = device.identity_key().unwrap().serialize().to_vec();
+
+        // 1 字节曲线类型前缀 + 32 字节公钥
+        assert_eq!(bytes.len(), 33, "跨 FFI 契约：identity 必须是 33 字节");
+
+        // 模拟 Kotlin 把 identityKey() 的字节原样回传给 sas_with / pin_identity
+        let decoded = IdentityKey::decode(&bytes).expect("33 字节必须能 decode 成 IdentityKey");
+        assert_eq!(decoded.serialize().to_vec(), bytes);
+
+        // 截断成裸 32 字节公钥必须失败——这正是曾经写错的契约
+        assert!(
+            IdentityKey::decode(&bytes[..32]).is_err(),
+            "32 字节截断必须 decode 失败"
+        );
     }
 }
