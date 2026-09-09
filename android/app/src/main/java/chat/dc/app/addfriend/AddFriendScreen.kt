@@ -32,7 +32,6 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -216,25 +215,27 @@ fun ShowMyCodeScreen() {
         ByteArray(4).also(security::nextBytes).joinToString("") { "%02x".format(it) }
     }
     val dataFrames = remember(myPayload, sid) { myPayload?.let { FrameCodec.split(it, sid) } }
-    var frameIdx by remember { mutableIntStateOf(0) }
     var frameBmp by remember(myPayload) {
         mutableStateOf(dataFrames?.firstOrNull()?.let { QrCodec.encode(it, 480) })
     }
     LaunchedEffect(dataFrames) {
         val frames = dataFrames ?: return@LaunchedEffect
+        var dataSeq = 0
         while (true) {
-            frameIdx += 1
-            // 奇数帧放数据帧（顺序循环），偶数帧放一张当场新随机的噪声帧：
-            // 每两帧画面都不同；采集端靠 f=0 忽略噪声帧
-            val f = if (frameIdx % 2 == 1) {
-                frames[(frameIdx / 2) % frames.size]
-            } else {
+            // 每 4 个数据帧才插 1 个噪声帧：噪声只为防单帧截屏，1:1 会把
+            // 有效帧率砍半——高密度帧解码本来就慢，跳一帧就「总差最后一帧」
+            val showNoise = dataSeq > 0 && dataSeq % 4 == 0
+            val f = if (showNoise) {
                 FrameCodec.noiseFrame(sid, security)
+            } else {
+                frames[dataSeq % frames.size].also { dataSeq += 1 }
             }
             frameBmp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
                 QrCodec.encode(f, 480)
             }
-            delay(280)
+            // 150ms/帧：全部数据帧 ~2.2s 一轮，配合扫描端 3 秒时长门槛，
+            // 正常情况 3-4 秒内必能集齐
+            delay(150)
         }
     }
     val pairSnap by BleMesh.pairing.collectAsState()
@@ -496,13 +497,19 @@ fun ScanToAddScreen() {
                             .testTag("collect_progress"),
                     )
                     Text(
-                        stringResource(
-                            R.string.add_friend_progress,
-                            st.collected,
-                            st.total,
-                            // 时间门槛满足后秒数封顶在阈值，不再无限上涨
-                            st.elapsedMs.coerceAtMost(FrameCodec.MIN_COLLECT_MS) / 1000.0,
-                        ),
+                        if (st.collected >= st.total) {
+                            // 全部帧已到手、只剩 3 秒防截屏时长门槛：明确告知
+                            // 用户不是「总差一帧」，避免误解为识别失败
+                            stringResource(R.string.add_friend_collected_waiting)
+                        } else {
+                            stringResource(
+                                R.string.add_friend_progress,
+                                st.collected,
+                                st.total,
+                                // 时间门槛满足后秒数封顶在阈值，不再无限上涨
+                                st.elapsedMs.coerceAtMost(FrameCodec.MIN_COLLECT_MS) / 1000.0,
+                            )
+                        },
                         style = MaterialTheme.typography.bodySmall,
                     )
                 } else {

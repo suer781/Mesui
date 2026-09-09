@@ -78,14 +78,19 @@ data class AddFriendPayload(
 }
 
 object QrCodec {
-    /** 生成方形二维码位图（纠错 M，容损 15%）。 */
+    /** 生成方形二维码位图。纠错 L（7%）：本场景单帧截屏无意义（须集齐全部
+     *  数据帧），用更低的纠错换取更快更稳的解码——「总差最后一帧」的帮凶
+     *  之一就是高密度帧 + M 级纠错解码耗时超过展示时长导致跳帧。 */
     fun encode(content: String, size: Int): Bitmap {
         val matrix = QRCodeWriter().encode(
             content,
             BarcodeFormat.QR_CODE,
             size,
             size,
-            mapOf(EncodeHintType.MARGIN to 1),
+            mapOf(
+                EncodeHintType.MARGIN to 1,
+                EncodeHintType.ERROR_CORRECTION to com.google.zxing.qrcode.decoder.ErrorCorrectionLevel.L,
+            ),
         )
         val bmp = Bitmap.createBitmap(matrix.width, matrix.height, Bitmap.Config.ARGB_8888)
         for (x in 0 until matrix.width) {
@@ -108,8 +113,10 @@ object FrameCodec {
     const val FRAME_PREFIX = "dc://addframe?v=1&"
 
     // 真实载荷（含 ~1.8KB 的 PreKeyBundle）约 2.6KB；48 字符/帧会切出
-    // 50+ 帧（30 秒以上才能集齐），故提到 256：约 11 帧，配合 3 秒
-    // 时长门槛在 10 秒内可读全。单帧 QR 约 390 字符（版本 13），可扫。
+    // 50+ 帧（30 秒以上才能集齐），故提到 256：约 11 帧。展示端 150ms/帧、
+    // 数据:噪声 = 3:1（见 ShowMyCodeScreen），全部数据帧 ~2.2s 一轮，
+    // 配合 3 秒时长门槛，正常 3-4 秒集齐。单帧 QR 约 390 字符（版本 13），
+    // 纠错 L 换取更快解码，可扫。
     const val CHUNK_SIZE = 256
 
     fun split(payload: AddFriendPayload, sid: String): List<String> {
