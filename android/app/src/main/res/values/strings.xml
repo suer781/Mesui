@@ -15,9 +15,12 @@
     <string name="nearby_stop">停止扫描</string>
     <string name="nearby_scan_failed">扫描启动失败，请重试</string>
     <string name="nearby_only_ours">只看本应用节点</string>
-    <string name="nearby_advertise">允许被发现</string>
+    <string name="nearby_advertise">近场广播</string>
+    <string name="nearby_advertise_hint">打开后附近节点扫描时才能看到你；仅用于近场加好友，不广播设备名等任何身份信息，蓝牙中转不依赖此开关</string>
     <string name="nearby_found">发现 %1$d 台设备</string>
-    <string name="nearby_unnamed">未命名设备</string>
+    <string name="nearby_alias">节点 %1$s</string>
+    <string name="nearby_dc_node">本应用节点</string>
+    <string name="nearby_other_device">其他蓝牙设备（调试可见）</string>
     <string name="nearby_bonded">已配对</string>
     <string name="nearby_rssi">信号 %1$d dBm</string>
     <string name="add_friend_title">添加好友</string>
