@@ -114,8 +114,14 @@ impl ContactStore {
         node_id: &str,
         node_naddr: &str,
     ) -> Result<()> {
-        if identity.len() != 32 {
-            return Err(CoreError::Config("contact identity must be 32 bytes".into()));
+        // 身份公钥契约 = 33 字节（libsignal IdentityKey::serialize()：1 字节类型前缀 + 32），
+        // 32 字节保留兼容，其余长度拒绝。原样存取、不剥离前缀：BleMesh 以 hex(identity)
+        // 为链路 key、AUTH 挑战按 33 字节比对，sas_with/pin_identity 的 IdentityKey::decode
+        // 也要求 33（此前硬性断言 32 是错误契约，FFI 调用方传 33 全被拒 → P0-2）。
+        if identity.len() != 32 && identity.len() != 33 {
+            return Err(CoreError::Config(
+                "contact identity must be 32 or 33 bytes (libsignal serialize = 33)".into(),
+            ));
         }
         if bucket.len() != 32 {
             return Err(CoreError::Config("contact bucket must be 32 bytes".into()));
@@ -251,15 +257,16 @@ mod tests {
     #[test]
     fn upsert_list_verify_delete() {
         let s = ContactStore::open(std::path::Path::new(":memory:"), None).unwrap();
-        s.upsert("bob", &[1u8; 32], &[2u8; 32], false, "", &[9u8; 32], "", "").unwrap();
-        s.upsert("alice", &[3u8; 32], &[4u8; 32], true, "备注", &[9u8; 32], "aa", "dc://node?v=1&id=aa").unwrap();
+        // 身份公钥用 33 字节（libsignal serialize 标准形态，含类型前缀）
+        s.upsert("bob", &[1u8; 33], &[2u8; 32], false, "", &[9u8; 32], "", "").unwrap();
+        s.upsert("alice", &[3u8; 33], &[4u8; 32], true, "备注", &[9u8; 32], "aa", "dc://node?v=1&id=aa").unwrap();
         let all = s.list().unwrap();
         assert_eq!(all.len(), 2);
         // 重新加好友：同名覆盖不重复
-        s.upsert("bob", &[5u8; 32], &[6u8; 32], true, "", &[8u8; 32], "bb", "").unwrap();
+        s.upsert("bob", &[5u8; 33], &[6u8; 32], true, "", &[8u8; 32], "bb", "").unwrap();
         assert_eq!(s.list().unwrap().len(), 2);
         let bob = s.list().unwrap().into_iter().find(|c| c.name == "bob").unwrap();
-        assert_eq!(bob.identity, vec![5u8; 32]);
+        assert_eq!(bob.identity, vec![5u8; 33]);
         assert_eq!(bob.link_secret, vec![8u8; 32]);
         assert_eq!(bob.node_id, "bb");
         assert!(bob.verified);
@@ -269,10 +276,29 @@ mod tests {
         assert_eq!(s.list().unwrap().len(), 1);
     }
 
+    /// 33 字节（libsignal serialize 标准形态）原样往返：存什么读什么，不剥离前缀。
+    #[test]
+    fn identity_33_roundtrip() {
+        let s = ContactStore::open(std::path::Path::new(":memory:"), None).unwrap();
+        // 0x05 = libsignal Ed25519 公钥类型前缀，后 32 字节为钥体，共 33
+        let mut id = vec![0x05u8];
+        id.extend_from_slice(&[7u8; 32]);
+        assert_eq!(id.len(), 33);
+        s.upsert("bob", &id, &[2u8; 32], true, "", &[9u8; 32], "bb", "dc://node?v=1&id=bb").unwrap();
+        let bob = s.list().unwrap().into_iter().find(|c| c.name == "bob").unwrap();
+        assert_eq!(bob.identity, id, "identity 必须原样往返（33 字节含前缀）");
+        assert_eq!(bob.node_naddr, "dc://node?v=1&id=bb");
+    }
+
     #[test]
     fn rejects_wrong_sizes() {
         let s = ContactStore::open(std::path::Path::new(":memory:"), None).unwrap();
+        // identity：31/34 拒绝；32 保留兼容、33（标准形态）放行
         assert!(s.upsert("x", &[0u8; 31], &[0u8; 32], false, "", &[0u8; 32], "", "").is_err());
+        assert!(s.upsert("x", &[0u8; 34], &[0u8; 32], false, "", &[0u8; 32], "", "").is_err());
+        assert!(s.upsert("x", &[0u8; 32], &[0u8; 32], false, "", &[0u8; 32], "", "").is_ok());
+        assert!(s.upsert("x", &[0u8; 33], &[0u8; 32], false, "", &[0u8; 32], "", "").is_ok());
+        // bucket / link_secret 断言不动（固定 32）
         assert!(s.upsert("x", &[0u8; 32], &[0u8; 33], false, "", &[0u8; 32], "", "").is_err());
         assert!(s.upsert("x", &[0u8; 32], &[0u8; 32], false, "", &[0u8; 31], "", "").is_err());
     }
@@ -282,7 +308,7 @@ mod tests {
         let path = temp_db("reopen");
         {
             let s = ContactStore::open(&path, Some("kk")).unwrap();
-            s.upsert("bob", &[7u8; 32], &[8u8; 32], true, "", &[1u8; 32], "aa", "dc://node?v=1&id=aa").unwrap();
+            s.upsert("bob", &[7u8; 33], &[8u8; 32], true, "", &[1u8; 32], "aa", "dc://node?v=1&id=aa").unwrap();
             s.append_message("bob", true, "hi").unwrap();
             s.append_message("bob", false, "yo").unwrap();
         }
@@ -333,7 +359,7 @@ mod tests {
         let path = temp_db("wrongkey");
         {
             let s = ContactStore::open(&path, Some("right")).unwrap();
-            s.upsert("bob", &[1u8; 32], &[2u8; 32], false, "", &[3u8; 32], "", "").unwrap();
+            s.upsert("bob", &[1u8; 33], &[2u8; 32], false, "", &[3u8; 32], "", "").unwrap();
         }
         assert!(ContactStore::open(&path, Some("wrong")).is_err());
         let _ = std::fs::remove_file(&path);
