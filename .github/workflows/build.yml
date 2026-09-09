@@ -37,7 +37,14 @@ jobs:
         run: cargo install cargo-ndk
 
       - name: 安装 protoc（libsignal 后量子棘轮的 protobuf 代码生成需要）
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        run: |
+          # runner 镜像自带的 google-chrome apt 源上游偶尔 Hash Sum mismatch，
+          # 会让 apt-get update 以 100 退出、拖垮整条流水线（2026-09-10 实证）。
+          # 本步只需要 Ubuntu 官方仓库的 protobuf-compiler：先摘掉 chrome 源，
+          # update 失败再重试一次。
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list
+          sudo apt-get update || { sleep 20 && sudo apt-get update; }
+          sudo apt-get install -y protobuf-compiler
 
       - name: 定位预装 Android NDK
         run: |
