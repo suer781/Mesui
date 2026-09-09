@@ -46,6 +46,12 @@ jobs:
             if [ -z "$NDK_ROOT" ]; then
               NDK_ROOT="$(ls -d "${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"/ndk/* 2>/dev/null | head -1)"
             fi
+            # fail-fast：runner 镜像换了/NDK 目录为空时立即报错，
+            # 不许静默带空路径往下走（此前会在 cargo-ndk 交叉编译步才炸，报错误导排查）
+            if [ -z "$NDK_ROOT" ] || [ ! -d "$NDK_ROOT" ]; then
+              echo "::error::未找到预装 NDK（查过 ANDROID_NDK_HOME/ANDROID_NDK_ROOT 与 ${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}/ndk/*）。请在 runner 上安装固定版本 NDK 或显式设置 ANDROID_NDK_ROOT"
+              exit 1
+            fi
             echo "ANDROID_NDK_HOME=$NDK_ROOT" >> "$GITHUB_ENV"
             echo "使用 NDK: $NDK_ROOT"
           else
