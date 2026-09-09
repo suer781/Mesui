@@ -49,3 +49,19 @@
 - **第一遍（读基线）误判盲区"干净"；第二遍（独立盲扫）发现 5 处真缺陷**，印证"不读锚定文档"的价值。
 - 第 3 块（构建配置）确为 force-push 瞬态失败、已在树修复，无需改代码。
 - 5 张单已转修复工程师，待其回报 diff 后由主理人统一提交。
+
+## 六、修复收尾状态（2026-09-10，主理人统一提交）
+
+工程师已现场验证并最小修复 A/B/C，D/E 经核实为设计边界按纪律停手未改。提交 `c58d466`（分支 `workbuddy`）。
+
+| 单 | 结果 | 改动文件 | 关键修复 |
+|---|---|---|---|
+| A | ✅ 已修 | `ui/chat/ChatScreen.kt` | 跟随滚动改为仅「首次加载」或「用户贴底」时滚到底（`remember(contactId)` 重置）；上翻历史不被打断 |
+| B | ✅ 已修 | `core/IrohNodeManager.kt` | `onMessage` 体从 iroh tokio worker 线程投递到 IO 协程（`scope.launch`），绝不在 iroh 线程做阻塞 SQLite+解密；`gen` 双世代守卫保留 |
+| C | ✅ 已修 | `core/IrohNodeManager.kt` | 新增 `nodeIdIndex: ConcurrentHashMap<String,String>` 缓存 nodeId→联系人名，`resolveNameByNodeId` 命中 O(1)，未命中按 `listContacts` 自愈重建一次，消除每条消息全表反查 |
+| D | ⏸ 停手未改（设计边界） | — | 核实时间窗口确实存在（配对早于 `onReady` → naddr 为空 → 跨网快照永久空）。修需改握手时序+失败兜底语义，涉及双通道既有设计，待主理人/产品裁定是否进专门设计修订 |
+| E | ⏸ 停手未改（设计边界） | — | 核实 QR 图标 → `add_friend` 角色选择页（含「出示本人码」卡），非清晰误绑；直达本人码需新增独立 route/页面，属新功能，待主理人/产品裁定 |
+
+工程师验证佐证（B 跨线程）：Rust 侧 `ContactStore{ conn: Mutex<Connection> }`（contacts.rs:63）、`SqlSignalStore{ conn: Arc<Mutex<Connection>> }`（signal_store.rs:72）的 SQLite 连接**已由 Mutex 包裹**，故 Rust 无需改动；Kotlin 侧把 onMessage 体移出 iroh worker 线程即可消除 reactor 阻塞。
+
+**待主理人/产品裁定**：D、E 是否纳入专门的修复/设计修订流程（D 可能需与已知台账 P1-4「配对链路收不了 MSG」一并处理）。
