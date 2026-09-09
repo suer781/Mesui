@@ -95,6 +95,17 @@ jobs:
           CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
           cargo test --lib -p dc-core --features vendored-openssl
 
+      # 此前 CI 只跑 --lib，tests/ 下的集成测试（redteam 20 例 /
+      # security_bruteforce 1 例 / iroh_pair 1 例）从未被执行过。三份测试
+      # 均为进程内确定性测试（iroh_pair 已禁 relay 走 loopback），不依赖外网。
+      - name: Rust 集成测试（tests/ 全量）
+        env:
+          OPENSSL_DIR: /tmp/openssl-dummy
+        run: |
+          mkdir -p /tmp/openssl-dummy/include /tmp/openssl-dummy/lib
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+          cargo test --tests -p dc-core --features vendored-openssl
+
       # ================= UniFFI Kotlin 绑定 =================
       # uniffi-bindgen 的 --library 模式靠 dlopen 读取 cdylib 里嵌入的元数据，
       # 必须是 host 架构（x86_64-linux）的 .so，不能用上面 cargo-ndk 产出的
@@ -126,6 +137,12 @@ jobs:
 
       - name: 构建 APK
         run: cd android && chmod +x gradlew && ./gradlew assembleDebug --no-daemon
+
+      # 此前 CI 只 assembleDebug，Kotlin 单测（FrameCollector / BleFrame /
+      # FriendLink / NearbyDiscovery / MainScaffold 等）只被编译从未被执行。
+      # Robolectric 镜像已在 build.gradle.kts 指到国内源，CI 上走 aliyun 亦可。
+      - name: Kotlin 单元测试
+        run: cd android && ./gradlew testDebugUnitTest --no-daemon
 
       - name: 上传 APK
         uses: actions/upload-artifact@v4
