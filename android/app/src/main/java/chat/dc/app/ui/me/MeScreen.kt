@@ -27,6 +27,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -44,6 +45,9 @@ import chat.dc.app.core.IrohNodeManager
 import chat.dc.app.core.SignalCore
 import chat.dc.app.ui.components.InitialsAvatar
 import chat.dc.core.CoreInfo
+import chat.dc.core.SignalSession
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
@@ -57,13 +61,22 @@ import java.io.File
 @Composable
 fun MeScreen(onOpenAddFriend: () -> Unit) {
     val context = LocalContext.current
-    val session = remember { runCatching { SignalCore.session(context) }.getOrNull() }
-    val deviceName = remember { SignalCore.deviceName(context) }
-    val fingerprint = remember {
-        session?.identityKey()?.joinToString("") { "%02x".format(it) }.orEmpty()
+    // 会话初始化（SignalCore.session 打开 SQLCipher 库，含 KDF 运算）较重，
+    // 不能在组合期主线程同步执行（掉帧/ANR 风险）——挪进 LaunchedEffect + IO 线程，
+    // 结果用 state 承载，加载完成前指纹显示中性占位（空态优先，不放演示数据）。
+    // SignalCore.session 自带 @Synchronized 幂等，重复调用安全。
+    var session by remember { mutableStateOf<SignalSession?>(null) }
+    var fingerprint by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            val s = runCatching { SignalCore.session(context) }.getOrNull()
+            session = s
+            fingerprint = s?.identityKey()?.joinToString("") { "%02x".format(it) }.orEmpty()
+        }
     }
     val irohSnap by IrohNodeManager.state.collectAsState()
 
+    val deviceName = remember { SignalCore.deviceName(context) }
     var showNode by remember { mutableStateOf(false) }
     var showStorage by remember { mutableStateOf(false) }
     var showAbout by remember { mutableStateOf(false) }
@@ -99,7 +112,8 @@ fun MeScreen(onOpenAddFriend: () -> Unit) {
             ) {
                 Text(deviceName, style = MaterialTheme.typography.titleLarge)
                 Text(
-                    stringResource(R.string.me_identity_fp, fingerprint.take(16)),
+                    // 会话未加载完成时（session==null → fingerprint 为空）显示中性占位，不放演示数据
+                    stringResource(R.string.me_identity_fp, fingerprint.take(16).ifEmpty { "…" }),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
