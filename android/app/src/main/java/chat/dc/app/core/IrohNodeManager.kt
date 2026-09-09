@@ -12,6 +12,7 @@ import java.security.SecureRandom
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.spec.GCMParameterSpec
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -87,6 +88,8 @@ object IrohNodeManager {
             try {
                 val callback = object : NodeCallback {
                     override fun onMessage(fromNodeIdHex: String, payload: ByteArray) {
+                        // 世代守卫：本回调属于某一代启动，stop() 换代后到达的消息不再投递
+                        if (gen != startGen) return
                         val ctx = appContext ?: return
                         val contact = runCatching {
                             SignalCore.contactStore(ctx).listContacts().firstOrNull { it.nodeId == fromNodeIdHex }
@@ -95,6 +98,9 @@ object IrohNodeManager {
                     }
 
                     override fun onReady(nodeIdHex: String, naddr: String) {
+                        // 世代守卫：原生 start 可能仍在跑时发生 stop()，其 onReady 迟到会
+                        // 把已清空的快照写回 running=true（Me 页显示「运行中」但 node 已为 null）
+                        if (gen != startGen) return
                         _state.value = IrohSnap(running = true, nodeIdHex = nodeIdHex, naddr = naddr, status = IrohStatus.RUNNING)
                     }
                 }
@@ -121,6 +127,9 @@ object IrohNodeManager {
                         }
                         node = created
                         break  // 启动成功（RUNNING 态由 onReady 回调写入）
+                    } catch (e: CancellationException) {
+                        // 协程取消（如退出/重建）不是启动失败：不吞，交回结构化并发语义
+                        throw e
                     } catch (_: Exception) {
                         // 本轮失败：退避后重试；重试耗尽则标「失败」，等
                         // setRelayUrlAndRestart 或服务重建（START_STICKY）再拉起
