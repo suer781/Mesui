@@ -6,6 +6,7 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import chat.dc.app.testing.FakeAndroidKeyStore
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Before
 import org.junit.Rule
@@ -22,6 +23,12 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
 class MainScaffoldCameraTest {
+
+    companion object {
+        init {
+            FakeAndroidKeyStore.install() // 类加载期注册，早于 Activity 启动
+        }
+    }
 
     @get:Rule
     val compose = createAndroidComposeRule<MainActivity>()
@@ -43,7 +50,7 @@ class MainScaffoldCameraTest {
         compose.waitForIdle()
         compose.onNodeWithTag("scan_view").assertExists()
         compose.onNodeWithText("对准对方滚动的动态码，保持约 3 秒即可读全").assertExists()
-        // 页面尾部的提示文本也必须存在：配合 verticalScroll，小屏不得裁掉内容
-        compose.onNodeWithText("真实身份与加密会话将在核心接入后建立").assertExists()
+        // 页面标题也必须存在：配合 verticalScroll，小屏不得裁掉内容
+        compose.onNodeWithText("扫码添加").assertExists()
     }
 }

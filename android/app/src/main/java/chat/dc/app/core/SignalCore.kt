@@ -4,6 +4,7 @@ import android.content.Context
 import android.provider.Settings
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import chat.dc.core.ContactStore
 import chat.dc.core.SignalSession
 import java.io.File
 import java.security.KeyStore
@@ -42,6 +43,12 @@ object SignalCore {
     @Volatile
     private var session: SignalSession? = null
 
+    @Volatile
+    private var contacts: ContactStore? = null
+
+    // 解密失败自动重置的一次性提示位（UI consume 后清除）
+    private var resetNoticePending = false
+
     fun deviceName(context: Context): String =
         cachedName ?: run {
             val id = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
@@ -75,14 +82,21 @@ object SignalCore {
         val key = keystoreKey()
         if (file.exists()) {
             val blob = file.readBytes()
-            if (blob.size > GCM_IV_LEN) {
+            val plain = runCatching {
+                if (blob.size <= GCM_IV_LEN) error("dbkey truncated")
                 val cipher = Cipher.getInstance("AES/GCM/NoPadding")
                 cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, blob, 0, GCM_IV_LEN))
-                return cipher.doFinal(blob, GCM_IV_LEN, blob.size - GCM_IV_LEN)
-                    .toString(Charsets.US_ASCII) // 存的就是 hex ASCII
-            }
+                cipher.doFinal(blob, GCM_IV_LEN, blob.size - GCM_IV_LEN)
+            }.getOrNull()
+            if (plain != null) return String(plain, Charsets.US_ASCII) // 存的就是 hex ASCII
+            // 解不开 = Keystore key 与密文不匹配（恢复出厂/换机恢复/库损坏）。
+            // 无法找回旧库密钥：重置——删 key 文件与加密库，重新生成身份；
+            // 会话/联系人/聊天记录全部丢失，UI 明示需重新扫码加好友。
+            resetNoticePending = true
+            file.delete()
+            File(context.filesDir, DB_FILE).delete()
         }
-        // 首次：32 字节随机 → hex(64 字符，无引号，SQLCipher PRAGMA key 安全)
+        // 首次（或刚重置）：32 字节随机 → hex(64 字符，无引号，SQLCipher PRAGMA key 安全)
         val hex = ByteArray(32).also(SecureRandom()::nextBytes)
             .joinToString("") { "%02x".format(it) }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -91,12 +105,31 @@ object SignalCore {
         return hex
     }
 
+    /** 取走「身份已自动重置」提示（一次性，true 后复位）。 */
+    @Synchronized
+    fun consumeIdentityResetNotice(): Boolean =
+        resetNoticePending.also { resetNoticePending = false }
+
     /** 持久化 SignalSession：身份/会话/TOFU pin 落盘，重启沿用。 */
     @Synchronized
-    fun session(context: Context): SignalSession =
-        session ?: SignalSession.open(
-            File(context.filesDir, DB_FILE).absolutePath,
+    fun session(context: Context): SignalSession {
+        val dbFile = File(context.filesDir, DB_FILE)
+        // 对称边界：key 在而库被外部删除——重建库等于新身份，同样须提示
+        if (File(context.filesDir, KEY_FILE).exists() && !dbFile.exists()) {
+            resetNoticePending = true
+        }
+        return session ?: SignalSession.open(
+            dbFile.absolutePath,
             dbKeyHex(context),
             deviceName(context),
         ).also { session = it }
+    }
+
+    /** 联系人 + 聊天记录句柄：与 Signal store 同库同 key（不同表）。 */
+    @Synchronized
+    fun contactStore(context: Context): ContactStore =
+        contacts ?: ContactStore.open(
+            File(context.filesDir, DB_FILE).absolutePath,
+            dbKeyHex(context),
+        ).also { contacts = it }
 }

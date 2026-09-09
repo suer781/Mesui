@@ -30,6 +30,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -47,8 +48,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import chat.dc.app.R
+import chat.dc.app.ble.BleMesh
 import chat.dc.app.core.SignalCore
 import chat.dc.app.nearby.NearbyDiscovery
+import chat.dc.core.DcException
 import com.google.zxing.ResultPoint
 import com.journeyapps.barcodescanner.BarcodeCallback
 import com.journeyapps.barcodescanner.BarcodeResult
@@ -71,6 +74,23 @@ private fun RequestNearbyPermissionOnEntry() {
         if (!discovery.hasPermissions()) {
             launcher.launch(discovery.requiredPermissions())
         }
+    }
+}
+
+/** 本地加密库解密失败被自动重置后的一次性提示（session 访问时触发检测）。 */
+@Composable
+private fun IdentityResetNotice() {
+    val shown = remember { SignalCore.consumeIdentityResetNotice() }
+    if (shown) {
+        Text(
+            stringResource(R.string.identity_reset_notice),
+            color = MaterialTheme.colorScheme.error,
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 8.dp)
+                .testTag("identity_reset_notice"),
+        )
     }
 }
 
@@ -161,38 +181,53 @@ private fun RoleCard(
 /**
  * 「别人扫我」：只显示我的动态码。数据帧与当场新随机的噪声帧交错播放（280ms/帧），
  * 每两帧画面都不同，单帧/单张截图不含完整信息。
- * 载荷为真实密钥材料（SignalCore 会话身份 + PreKeyBundle，阶段 0）。
+ * 载荷为真实密钥材料；进入即登记 host 配对（mesh 广播临时配对 id 等对方回连，
+ * 收到 HS 后展示 SAS 供双方肉眼比对确认）。
  */
 @Composable
 fun ShowMyCodeScreen() {
     RequestNearbyPermissionOnEntry()
     val context = LocalContext.current
     val security = remember { SecureRandom() }
-    val session = remember { SignalCore.session(context) }
-    val myPayload = remember {
-        fun random(n: Int) = ByteArray(n).also(security::nextBytes)
-        AddFriendPayload(
-            name = SignalCore.deviceName(context),
-            identity = session.identityKey(),
-            bundle = session.prekeyBundleWire(),
-            bucket = random(32),
-            token = random(48),
-            ble = random(8),
-        )
+    // Keystore/native 失败（厂商机型异常、测试环境）不能崩页面：降级为明确错误态
+    val session = remember { runCatching { SignalCore.session(context) }.getOrNull() }
+    val irohSnap by chat.dc.app.core.IrohNodeManager.state.collectAsState()
+    val myPayload = remember(session, irohSnap.naddr) {
+        session?.let {
+            fun random(n: Int) = ByteArray(n).also(security::nextBytes)
+            AddFriendPayload(
+                name = SignalCore.deviceName(context),
+                identity = it.identityKey(),
+                bundle = it.prekeyBundleWire(),
+                bucket = random(32),
+                token = random(48),
+                ble = random(8),
+                naddr = irohSnap.naddr,
+            )
+        }
+    }
+    LaunchedEffect(myPayload) {
+        myPayload?.let { BleMesh.startPairingAsHost(it.token, it.bucket, it.ble) }
+    }
+    DisposableEffect(myPayload) {
+        onDispose { if (myPayload != null) BleMesh.stopPairingAsHost() }
     }
     val sid = remember {
         ByteArray(4).also(security::nextBytes).joinToString("") { "%02x".format(it) }
     }
-    val dataFrames = remember(myPayload, sid) { FrameCodec.split(myPayload, sid) }
+    val dataFrames = remember(myPayload, sid) { myPayload?.let { FrameCodec.split(it, sid) } }
     var frameIdx by remember { mutableIntStateOf(0) }
-    var frameBmp by remember { mutableStateOf(QrCodec.encode(dataFrames[0], 480)) }
+    var frameBmp by remember(myPayload) {
+        mutableStateOf(dataFrames?.firstOrNull()?.let { QrCodec.encode(it, 480) })
+    }
     LaunchedEffect(dataFrames) {
+        val frames = dataFrames ?: return@LaunchedEffect
         while (true) {
             frameIdx += 1
             // 奇数帧放数据帧（顺序循环），偶数帧放一张当场新随机的噪声帧：
             // 每两帧画面都不同；采集端靠 f=0 忽略噪声帧
             val f = if (frameIdx % 2 == 1) {
-                dataFrames[(frameIdx / 2) % dataFrames.size]
+                frames[(frameIdx / 2) % frames.size]
             } else {
                 FrameCodec.noiseFrame(sid, security)
             }
@@ -202,6 +237,7 @@ fun ShowMyCodeScreen() {
             delay(280)
         }
     }
+    val pairSnap by BleMesh.pairing.collectAsState()
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -209,25 +245,74 @@ fun ShowMyCodeScreen() {
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
+        IdentityResetNotice()
         Text(
             stringResource(R.string.add_friend_role_show),
             style = MaterialTheme.typography.titleLarge,
             modifier = Modifier.padding(bottom = 8.dp),
         )
+        if (myPayload == null) {
+            // 身份不可用（Keystore/native 异常）：明确降级提示，不出码也不登记配对
+            Text(
+                stringResource(R.string.identity_unavailable),
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.padding(vertical = 24.dp).testTag("identity_unavailable"),
+            )
+            return@Column
+        }
         Text(stringResource(R.string.add_friend_show_hint), style = MaterialTheme.typography.bodyMedium)
-        Image(
-            bitmap = frameBmp.asImageBitmap(),
-            contentDescription = stringResource(R.string.add_friend_qr_desc),
-            modifier = Modifier
-                .size(240.dp)
-                .padding(vertical = 8.dp)
-                .testTag("qr_image"),
-        )
-        Text(
-            stringResource(R.string.add_friend_pending_core),
-            style = MaterialTheme.typography.bodySmall,
-            modifier = Modifier.padding(top = 12.dp),
-        )
+        frameBmp?.let { bmp ->
+            Image(
+                bitmap = bmp.asImageBitmap(),
+                contentDescription = stringResource(R.string.add_friend_qr_desc),
+                modifier = Modifier
+                    .size(240.dp)
+                    .padding(vertical = 8.dp)
+                    .testTag("qr_image"),
+            )
+        }
+        // 对方已连接并发来握手：进入 SAS 比对确认
+        val snap = pairSnap
+        if (snap != null && snap.asHost && snap.sas != null) {
+            Card(modifier = Modifier.fillMaxWidth().padding(top = 8.dp).testTag("host_pairing_card")) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(stringResource(R.string.add_friend_verify), style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        stringResource(R.string.add_friend_safety_code, snap.sas!!.six),
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(vertical = 8.dp),
+                    )
+                    Text(
+                        stringResource(R.string.add_friend_safety_code_full, snap.sas!!.full),
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(bottom = 8.dp),
+                    )
+                    if (!snap.localConfirmed) {
+                        Button(
+                            onClick = { BleMesh.confirmSas() },
+                            modifier = Modifier.fillMaxWidth().testTag("host_sas_confirm"),
+                        ) {
+                            Text(stringResource(R.string.add_friend_sas_confirm))
+                        }
+                    } else {
+                        Text(
+                            if (snap.peerConfirmed) stringResource(R.string.add_friend_peer_confirmed)
+                            else stringResource(R.string.add_friend_local_confirmed_wait),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    if (snap.finished) {
+                        Text(
+                            stringResource(R.string.add_friend_done),
+                            color = MaterialTheme.colorScheme.primary,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -251,25 +336,43 @@ fun ScanToAddScreen() {
         ActivityResultContracts.RequestPermission(),
     ) { cameraGranted = it }
 
-    val session = remember { SignalCore.session(context) }
+    // 会话延迟到「采集完成建会话」时才取：无相机权限的引导分支不触碰 Keystore/native
     val collector = remember { FrameCollector() }
     var collectorState by remember { mutableStateOf<FrameCollector.State?>(null) }
     val peerPayload = collectorState?.takeIf { it.complete }?.payload
 
-    // 采集完成 → 用对方 bundle 跑 PQXDH 建会话（FrameCollector 完成后缓存
-    // 载荷实例，此 effect 对同一 peer 只跑一次）
-    var established by remember { mutableStateOf<Boolean?>(null) }
+    // 采集完成 → PQXDH 建会话 + 登记 joiner 配对（mesh 负责扫到配对 id 后
+    // 回连、发 HS、S_i 接收）。established: 0 失败 / 1 成功 / 2 对方身份已变更
+    var established by remember { mutableStateOf<Int?>(null) }
     LaunchedEffect(peerPayload) {
-        established = peerPayload?.let {
-            runCatching { session.processBundle(it.name, it.bundle) }.isSuccess
+        peerPayload?.let { p ->
+            val session = runCatching { SignalCore.session(context) }.getOrNull()
+            established = when {
+                session == null -> 0
+                else -> try {
+                    session.processBundle(p.name, p.bundle)
+                    BleMesh.startPairingAsJoiner(p.name, p.identity, p.token, p.bucket, p.ble, p.naddr)
+                    1
+                } catch (_: DcException.RemoteIdentityChanged) {
+                    2
+                } catch (_: Exception) {
+                    0
+                }
+            }
         }
+    }
+    DisposableEffect(peerPayload) {
+        onDispose { if (peerPayload != null) BleMesh.stopPairingAsJoiner() }
     }
     // 真 SAS：绑定双方长期身份公钥 + 双方地址名，两端各算一端、结果一致
-    val sas = remember(peerPayload) {
-        peerPayload?.let {
-            runCatching { session.sasWith(SignalCore.deviceName(context), it.name, it.identity) }.getOrNull()
+    val sas = remember(peerPayload, established) {
+        peerPayload?.takeIf { established == 1 }?.let { p ->
+            runCatching {
+                SignalCore.session(context).sasWith(SignalCore.deviceName(context), p.name, p.identity)
+            }.getOrNull()
         }
     }
+    val pairSnap by BleMesh.pairing.collectAsState()
 
     Column(
         modifier = Modifier
@@ -278,6 +381,7 @@ fun ScanToAddScreen() {
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
+        IdentityResetNotice()
         Text(
             stringResource(R.string.add_friend_role_scan),
             style = MaterialTheme.typography.titleLarge,
@@ -289,8 +393,22 @@ fun ScanToAddScreen() {
             modifier = Modifier.padding(bottom = 4.dp),
         )
         when {
-            peerPayload != null -> Card(modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) {
+            peerPayload != null -> Card(modifier = Modifier.fillMaxWidth().padding(top = 4.dp).testTag("pairing_card")) {
                 Column(modifier = Modifier.padding(12.dp)) {
+                    when (established) {
+                        2 -> {
+                            Text(
+                                stringResource(R.string.add_friend_identity_changed),
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            return@Card
+                        }
+                        0 -> {
+                            Text(stringResource(R.string.add_friend_establish_failed), style = MaterialTheme.typography.bodySmall)
+                            return@Card
+                        }
+                    }
                     Text(stringResource(R.string.add_friend_verify), style = MaterialTheme.typography.titleSmall)
                     Text(
                         stringResource(R.string.add_friend_safety_code, sas?.six ?: "……"),
@@ -302,15 +420,32 @@ fun ScanToAddScreen() {
                         style = MaterialTheme.typography.bodySmall,
                         modifier = Modifier.padding(bottom = 8.dp),
                     )
-                    if (established != null) {
+                    if (established == 1 && pairSnap?.waitingLink != false) {
+                        Text(stringResource(R.string.add_friend_waiting_link), style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (pairSnap?.localConfirmed != true) {
+                        Button(
+                            onClick = { BleMesh.confirmSas() },
+                            enabled = established == 1 && sas != null,
+                            modifier = Modifier.fillMaxWidth().padding(top = 4.dp).testTag("sas_confirm"),
+                        ) {
+                            Text(stringResource(R.string.add_friend_sas_confirm))
+                        }
+                    } else {
                         Text(
-                            stringResource(
-                                if (established == true) R.string.add_friend_established else R.string.add_friend_establish_failed,
-                            ),
+                            if (pairSnap?.peerConfirmed == true) stringResource(R.string.add_friend_peer_confirmed)
+                            else stringResource(R.string.add_friend_local_confirmed_wait),
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
-                    Text(stringResource(R.string.add_friend_ble_pending), style = MaterialTheme.typography.bodySmall)
+                    if (pairSnap?.finished == true) {
+                        Text(
+                            stringResource(R.string.add_friend_done),
+                            color = MaterialTheme.colorScheme.primary,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
                 }
             }
             !cameraGranted -> Button(
@@ -379,11 +514,5 @@ fun ScanToAddScreen() {
                 }
             }
         }
-
-        Text(
-            stringResource(R.string.add_friend_pending_core),
-            style = MaterialTheme.typography.bodySmall,
-            modifier = Modifier.padding(top = 12.dp),
-        )
     }
 }
