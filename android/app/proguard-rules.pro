@@ -15,3 +15,10 @@
 # 兜底 keep JNA 运行时：项目依赖 jna:5.13.0@aar，其自带 consumer 规则是否完整存疑，
 # 此规则成本为零，防止 JNA 内部反射被 R8 裁剪。
 -keep class com.sun.jna.** { *; }
+
+# JNA 的桌面端 AWT 分支（Native$AWT.getComponentID/getWindowID）引用 java.awt，
+# Android 上没有这些类。运行时不会触达（Android 走的是非 AWT 路径），但 keep 上面
+# 的 com.sun.jna.** 会把 Native$AWT 一并保留，R8 全量缺类检查即报 Missing class
+# java.awt.Component/Window/GraphicsEnvironment/HeadlessException（2026-09-10 CI
+# Release 混淆验证实证），需显式豁免该告警。
+-dontwarn java.awt.**
