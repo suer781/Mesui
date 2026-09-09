@@ -167,16 +167,19 @@ fun MainScaffold() {
             composable("me") {
                 MeScreen(onOpenAddFriend = { navController.navigate("add_friend") })
             }
-            composable("nearby") { NearbyScreen() }
+            composable("nearby") {
+                NearbyScreen(onBack = { navController.popBackStack() })
+            }
             // 加好友入口先选角色，出示码与扫码是两个独立页，绝不同屏（安全）
             composable("add_friend") {
                 AddFriendRoleScreen(
+                    onBack = { navController.popBackStack() },
                     onShow = { navController.navigate("add_friend_show") },
                     onScan = { navController.navigate("add_friend_scan") },
                 )
             }
-            composable("add_friend_show") { ShowMyCodeScreen() }
-            composable("add_friend_scan") { ScanToAddScreen() }
+            composable("add_friend_show") { ShowMyCodeScreen(onBack = { navController.popBackStack() }) }
+            composable("add_friend_scan") { ScanToAddScreen(onBack = { navController.popBackStack() }) }
             composable(
                 route = "chat/{contactId}",
                 arguments = listOf(navArgument("contactId") { type = NavType.StringType }),

@@ -50,6 +50,7 @@ import chat.dc.app.R
 import chat.dc.app.ble.BleMesh
 import chat.dc.app.core.SignalCore
 import chat.dc.app.nearby.NearbyDiscovery
+import chat.dc.app.ui.components.SubPageTopBar
 import chat.dc.core.DcException
 import com.google.zxing.ResultPoint
 import com.journeyapps.barcodescanner.BarcodeCallback
@@ -98,18 +99,14 @@ private fun IdentityResetNotice() {
  * 要么别人扫你、要么你扫别人，二选一进入各自的独立页。
  */
 @Composable
-fun AddFriendRoleScreen(onShow: () -> Unit, onScan: () -> Unit) {
+fun AddFriendRoleScreen(onBack: () -> Unit, onShow: () -> Unit, onScan: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
             .padding(16.dp),
     ) {
-        Text(
-            stringResource(R.string.add_friend_title),
-            style = MaterialTheme.typography.titleLarge,
-            modifier = Modifier.padding(bottom = 4.dp),
-        )
+        SubPageTopBar(title = stringResource(R.string.add_friend_title), onBack = onBack)
         Text(
             stringResource(R.string.add_friend_role_hint),
             style = MaterialTheme.typography.bodyMedium,
@@ -184,7 +181,7 @@ private fun RoleCard(
  * 收到 HS 后展示 SAS 供双方肉眼比对确认）。
  */
 @Composable
-fun ShowMyCodeScreen() {
+fun ShowMyCodeScreen(onBack: () -> Unit) {
     RequestNearbyPermissionOnEntry()
     val context = LocalContext.current
     val security = remember { SecureRandom() }
@@ -246,12 +243,8 @@ fun ShowMyCodeScreen() {
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
+        SubPageTopBar(title = stringResource(R.string.add_friend_role_show), onBack = onBack)
         IdentityResetNotice()
-        Text(
-            stringResource(R.string.add_friend_role_show),
-            style = MaterialTheme.typography.titleLarge,
-            modifier = Modifier.padding(bottom = 8.dp),
-        )
         if (myPayload == null) {
             // 身份不可用（Keystore/native 异常）：明确降级提示，不出码也不登记配对
             Text(
@@ -324,7 +317,7 @@ fun ShowMyCodeScreen() {
  * token-MAC 首条消息与 BLE 传输在阶段 3 接入。
  */
 @Composable
-fun ScanToAddScreen() {
+fun ScanToAddScreen(onBack: () -> Unit) {
     RequestNearbyPermissionOnEntry()
     val context = LocalContext.current
     var cameraGranted by remember {
@@ -383,11 +376,7 @@ fun ScanToAddScreen() {
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         IdentityResetNotice()
-        Text(
-            stringResource(R.string.add_friend_role_scan),
-            style = MaterialTheme.typography.titleLarge,
-            modifier = Modifier.padding(bottom = 8.dp),
-        )
+        SubPageTopBar(title = stringResource(R.string.add_friend_role_scan), onBack = onBack)
         Text(
             stringResource(R.string.add_friend_scan),
             style = MaterialTheme.typography.titleSmall,

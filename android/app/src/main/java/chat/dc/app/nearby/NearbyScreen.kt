@@ -33,6 +33,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import chat.dc.app.R
+import chat.dc.app.ui.components.SubPageTopBar
 
 /**
  * 发现附近设备子页：权限引导 → BLE 扫描（只认本应用服务 UUID）+ 对外广播。
@@ -40,7 +41,7 @@ import chat.dc.app.R
  * 里嵌 LazyColumn（无限高度约束会崩）。
  */
 @Composable
-fun NearbyScreen() {
+fun NearbyScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val discovery = remember { NearbyDiscovery(context) }
     val state by discovery.state.collectAsState()
@@ -65,7 +66,7 @@ fun NearbyScreen() {
 
     LazyColumn(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
         item {
-            Text(stringResource(R.string.nearby_title), style = MaterialTheme.typography.titleLarge)
+            SubPageTopBar(title = stringResource(R.string.nearby_title), onBack = onBack)
         }
         when (state.status) {
             NearbyDiscovery.Status.NO_PERMISSION -> item {
