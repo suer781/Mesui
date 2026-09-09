@@ -144,6 +144,14 @@ jobs:
       - name: Kotlin 单元测试
         run: cd android && ./gradlew testDebugUnitTest --no-daemon
 
+      # release 才启用 R8 混淆（build.gradle.kts 中 isMinifyEnabled/isShrinkResources），
+      # proguard keep 规则只在 assembleRelease 时生效——此前 CI 只跑 assembleDebug，
+      # 混淆路径从未被验证过，keep 缺失会在 release 首调 JNA 核心时才暴露
+      # （UnsatisfiedLinkError / struct 字段错位崩溃）。此步专门验证 R8 通过。
+      # release 无签名配置时产出 unsigned APK，不影响混淆验证。
+      - name: Release 混淆验证
+        run: cd android && ./gradlew assembleRelease --no-daemon
+
       - name: 上传 APK
         uses: actions/upload-artifact@v4
         with:
