@@ -31,7 +31,10 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import java.security.SecureRandom
 import java.util.UUID
 
@@ -474,8 +477,14 @@ object BleMesh {
             val session = runCatching { SignalCore.session(context) }.getOrNull() ?: return@whenReady
             val token = p.token ?: return@whenReady
             val bucket = p.bucket ?: return@whenReady
-            // 明文 = "dc-hs" + 0x00 + 本端节点快照（无节点时退化为旧版 5 字节）
-            val myNaddr = chat.dc.app.core.IrohNodeManager.state.value.naddr
+            // 等 iroh 节点快照就绪（冷启动 onReady 可能滞后于 BLE 配对）。超时则降级
+            // 沿用当前快照（可能为空 → 退化为纯 BLE 握手），绝不因此阻塞 BLE 配对；
+            // 不静默把 naddr 写成空，否则联系人 node_naddr 被永久置空、跨网不可达（缺陷 D）
+            val myNaddr = runBlocking(Dispatchers.IO) {
+                withTimeoutOrNull(4000L) {
+                    chat.dc.app.core.IrohNodeManager.state.first { it.naddr.isNotBlank() }
+                }?.naddr ?: chat.dc.app.core.IrohNodeManager.state.value.naddr
+            }
             val plainPayload = if (myNaddr.isEmpty()) {
                 "dc-hs".toByteArray()
             } else {

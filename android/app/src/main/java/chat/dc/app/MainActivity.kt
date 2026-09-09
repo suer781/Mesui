@@ -165,7 +165,9 @@ fun MainScaffold() {
                 )
             }
             composable("me") {
-                MeScreen(onOpenAddFriend = { navController.navigate("add_friend") })
+                // 资料卡二维码图标应直达「本人可分享二维码」屏（add_friend_show =
+                // ShowMyCodeScreen），而非先进加好友角色选择页（缺陷 E：避免多点一下）
+                MeScreen(onOpenAddFriend = { navController.navigate("add_friend_show") })
             }
             composable("nearby") {
                 NearbyScreen(onBack = { navController.popBackStack() })
