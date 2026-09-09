@@ -8,6 +8,7 @@ import chat.dc.core.IrohNode
 import chat.dc.core.NodeCallback
 import java.io.File
 import java.security.KeyStore
+import java.util.concurrent.ConcurrentHashMap
 import java.security.SecureRandom
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -66,6 +67,10 @@ object IrohNodeManager {
     // 启动代次：stop() 自增使在途的启动/重试协程失效，防止 stop 后被旧协程重新拉起
     @Volatile private var startGen = 0L
 
+    // 缺陷 C：nodeId→联系人名 缓存，避免每条入站消息全表 listContacts() 线性反查。
+    // 命中 O(1)；未命中时按 listContacts 重建一次（联系人增改后下次未命中自动刷新）。
+    private val nodeIdIndex = ConcurrentHashMap<String, String>()
+
     /** 自建中继 URL（空 = 禁用）。 */
     fun relayUrl(context: Context): String =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(PREF_RELAY, "") ?: ""
@@ -90,11 +95,15 @@ object IrohNodeManager {
                     override fun onMessage(fromNodeIdHex: String, payload: ByteArray) {
                         // 世代守卫：本回调属于某一代启动，stop() 换代后到达的消息不再投递
                         if (gen != startGen) return
-                        val ctx = appContext ?: return
-                        val contact = runCatching {
-                            SignalCore.contactStore(ctx).listContacts().firstOrNull { it.nodeId == fromNodeIdHex }
-                        }.getOrNull() ?: return
-                        BleMesh.deliverRemote(contact.name, payload)
+                        // 本回调运行在 iroh 的 tokio worker 线程（node.rs 仅 2 个 worker）：
+                        // 同步做 SQLite 全表反查 + 解密会拖垮端点调度（心跳/建连），
+                        // 故投递到 IO 线程执行，绝不阻塞 iroh 线程（缺陷 B）。
+                        scope.launch {
+                            if (gen != startGen) return@launch
+                            val ctx = appContext ?: return@launch
+                            val name = resolveNameByNodeId(ctx, fromNodeIdHex) ?: return@launch
+                            BleMesh.deliverRemote(name, payload)
+                        }
                     }
 
                     override fun onReady(nodeIdHex: String, naddr: String) {
@@ -166,6 +175,21 @@ object IrohNodeManager {
 
     /** 节点是否在跑（发送降级判定）。 */
     fun isRunning(): Boolean = node != null
+
+    /**
+     * 按 nodeId 反查联系人名：先走 [nodeIdIndex] 缓存（O(1)），未命中再按 listContacts
+     * 重建一次（缺陷 C）。联系人增改后下次未命中自动刷新，避免每条入站消息全表扫描。
+     */
+    private fun resolveNameByNodeId(context: Context, nodeIdHex: String): String? {
+        nodeIdIndex[nodeIdHex]?.let { return it }
+        synchronized(nodeIdIndex) {
+            nodeIdIndex.clear()
+            runCatching { SignalCore.contactStore(context).listContacts() }
+                .getOrDefault(emptyList())
+                .forEach { nodeIdIndex[it.nodeId] = it.name }
+        }
+        return nodeIdIndex[nodeIdHex]
+    }
 
     // ---------------- 节点种子持久化（Keystore AES-GCM 包裹，同 SignalCore 库密钥模式） ----------------
 

@@ -73,14 +73,25 @@ fun ChatScreen(contactId: String, onBack: () -> Unit, onAddFriend: () -> Unit) {
     }
 
     LaunchedEffect(contactId) { reload() }
-    // 入站消息（任意通道）到达 → 刷新列表并滚到底部
+    // 入站消息（任意通道）到达 → 刷新列表
     LaunchedEffect(contactId) {
         BleMesh.incoming.collect {
             if (it.peerName == contactId) reload()
         }
     }
+    // 列表变化后自动跟随到底：仅「首次加载」或「用户已贴近底部」时滚动，
+    // 上翻浏览历史时不打扰（缺陷 A：此前无脑滚到底会打断历史浏览）
+    var initialScrollDone by remember(contactId) { mutableStateOf(false) }
     LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
+        if (messages.isEmpty()) return@LaunchedEffect
+        val layout = listState.layoutInfo
+        val lastIndex = messages.size - 1
+        val lastVisible = layout.visibleItemsInfo.lastOrNull()?.index ?: -1
+        val nearBottom = lastVisible >= lastIndex - 1
+        if (!initialScrollDone || nearBottom) {
+            listState.scrollToItem(lastIndex)
+            initialScrollDone = true
+        }
     }
 
     Scaffold(
