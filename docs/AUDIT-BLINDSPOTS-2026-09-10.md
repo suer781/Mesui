@@ -60,7 +60,7 @@
 | B | ✅ 已修 | `core/IrohNodeManager.kt` | `onMessage` 体从 iroh tokio worker 线程投递到 IO 协程（`scope.launch`），绝不在 iroh 线程做阻塞 SQLite+解密；`gen` 双世代守卫保留 |
 | C | ✅ 已修 | `core/IrohNodeManager.kt` | 新增 `nodeIdIndex: ConcurrentHashMap<String,String>` 缓存 nodeId→联系人名，`resolveNameByNodeId` 命中 O(1)，未命中按 `listContacts` 自愈重建一次，消除每条消息全表反查 |
 | D | ⏸ 停手未改（设计边界） | — | 核实时间窗口确实存在（配对早于 `onReady` → naddr 为空 → 跨网快照永久空）。修需改握手时序+失败兜底语义，涉及双通道既有设计，待主理人/产品裁定是否进专门设计修订 |
-| E | ⏸ 停手未改（设计边界） | — | 核实 QR 图标 → `add_friend` 角色选择页（含「出示本人码」卡），非清晰误绑；直达本人码需新增独立 route/页面，属新功能，待主理人/产品裁定 |
+| E | ✅ 已修（一行路由） | `MainActivity.kt` | 资料卡 QR 图标 `onOpenAddFriend` 由角色选择页 `add_friend` 改指直达本人码屏 `add_friend_show`（ShowMyCodeScreen），点一下即见本人码；其余加好友入口仍走角色选择，不动（提交 d07a458） |
 
 工程师验证佐证（B 跨线程）：Rust 侧 `ContactStore{ conn: Mutex<Connection> }`（contacts.rs:63）、`SqlSignalStore{ conn: Arc<Mutex<Connection>> }`（signal_store.rs:72）的 SQLite 连接**已由 Mutex 包裹**，故 Rust 无需改动；Kotlin 侧把 onMessage 体移出 iroh worker 线程即可消除 reactor 阻塞。
 
