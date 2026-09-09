@@ -118,6 +118,11 @@ private class PairingInternal(val asHost: Boolean) {
  */
 object BleMesh {
 
+    // 身份公钥长度契约 = 33 字节（libsignal IdentityKey::serialize()：1 字节类型前缀 + 32）。
+    // AUTH 全流程统一引用此常量，勿再手写 32——旧码 32/33 混用导致回连握手
+    // 两端都建不起来（P0-1）
+    private const val IDENTITY_LEN = 33
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val security = SecureRandom()
 
@@ -316,9 +321,12 @@ object BleMesh {
         val body = frame.copyOfRange(Wire.HEADER_LEN, frame.size)
         when (frame[0].toInt()) {
             Wire.AUTH_CHA -> {
-                if (body.size != 16 + 32) return
+                // 挑战体 = nonce(16) + 对方身份公钥(33)。旧码断言 16+32 且切片
+                // copyOfRange(16, 48) 只取 32 字节，与 contact.identity(33) 永不匹配
+                // → 回连握手发起端建不起来（P0-1）
+                if (body.size != 16 + IDENTITY_LEN) return
                 val nonce = body.copyOfRange(0, 16)
-                val theirId = body.copyOfRange(16, 48)
+                val theirId = body.copyOfRange(16, 16 + IDENTITY_LEN)
                 // 候选集已在扫描层（布隆命中）过滤，identity 命中本地联系人即定身份
                 val contact = contacts.firstOrNull { it.identity.contentEquals(theirId) } ?: return
                 st.secret = contact.linkSecret
@@ -360,10 +368,12 @@ object BleMesh {
         val body = frame.copyOfRange(Wire.HEADER_LEN, frame.size)
         when (frame[0].toInt()) {
             Wire.AUTH_CAND -> {
-                if (frame.size < Wire.HEADER_LEN + 33) return
-                val theirId = body.copyOfRange(0, 32)
-                val n = body[32].toInt() and 0xFF
-                val ids = (0 until n).map { body.copyOfRange(33 + it * FriendLink.ID_LEN, minOf(33 + (it + 1) * FriendLink.ID_LEN, body.size)) }
+                // 体 = 发起方身份公钥(33) + 候选数(1) + n 个槽位 id。旧码按 32 解析
+                // 身份、count/ids 全部错位 → 回连握手应答端建不起来（P0-1）
+                if (body.size < IDENTITY_LEN + 1) return
+                val theirId = body.copyOfRange(0, IDENTITY_LEN)
+                val n = body[IDENTITY_LEN].toInt() and 0xFF
+                val ids = (0 until n).map { body.copyOfRange(IDENTITY_LEN + 1 + it * FriendLink.ID_LEN, minOf(IDENTITY_LEN + 1 + (it + 1) * FriendLink.ID_LEN, body.size)) }
                 val contacts = runCatching { SignalCore.contactStore(ctx()).listContacts().filter { it.verified } }.getOrDefault(emptyList())
                 val slot = FriendLink.currentSlot()
                 val hit = contacts.firstOrNull { c ->
