@@ -3,7 +3,8 @@
 > 复审范围：v8 方案全部设计文档 + crates/core 全部源码 + Android 工程。
 > 结论：发现两个架构级问题（A1、A2）与三处文档/实现缺口（A3–A5）。
 > **处置决议（2026-09-04 用户确认）：A1 → 可轮换节点密钥方案；A2 → 隐私群/效率群分立。
-> 两者已并入 PLAN.md v9；A3/A4 列入阶段 5 待办。**
+> 两者已并入 PLAN.md v9；A3/A4 列入阶段 5 待办。（2026-09-11 更新：A3 已落地、
+> A5 已随 pkarr 废止消解、A4 部分落地，见各节状态标注。）**
 
 ## A1 🔴 身份公钥 = 节点 ID + 公共发现服务 → 全局「公钥→IP」映射
 
@@ -50,17 +51,41 @@
 语义反复摇摆，故属产品/隐私策略层面的永久禁止（实现不复原任何 pairwise
 群状态）。
 
-## A3 🟡 n0 公共中继「构建时移除」未落地
-文档承诺移除 iroh 默认 n0 中继，代码未实现（spike 测试使用 `presets::N0`）。
-需在 iroh 端点构建处按设置强制 `RelayMode::Disabled/Custom`，且发现组件一并禁用 n0 DNS。
+## A3 🟡 n0 公共中继「构建时移除」未落地 → ✅ 已落地（2026-09，GLM-Zcode）
+~~文档承诺移除 iroh 默认 n0 中继，代码未实现（spike 测试使用 `presets::N0`）。~~
+已修：`node.rs` 端点以 `presets::Minimal` 构建（无 n0 DNS 发现/默认中继）；
+未配置自建中继 URL 时 `RelayMode::Disabled`，配置后 `RelayMode::custom([url])`。
+中继 URL 由用户在「节点服务」面板配置。
 
-## A4 🟡 队列表无限增长
-`inbox_seen` 与 `outbox(sent)` 无保留策略清理；「数据与存储」设置仅有模型未接逻辑。
-需加保留期 + 启动时清理（注意：清理 inbox_seen 会放松去重窗口，需与 TTL 联动）。
+## A4 🟡 队列表无限增长 → 🔶 部分（原语已备，清理调度未接）
+`inbox_seen` 有 `prune_seen()` 裁剪原语（注释强制保留窗口 ≥7 天）；outbox 死信
+清理仍缺。~~「数据与存储」设置仅有模型未接逻辑~~——「我的」页存储面板已显示
+dc-signal.db / dc.dbkey / dc.nodekey 真实大小。剩余：清理策略接线（注意：清理
+inbox_seen 会放松去重窗口，需与 TTL 联动）。
 
-## A5 🟡 发现路径的中心化依赖未在文档标注
-「pkarr/DHT」依赖 n0 服务器（可自建 pkarr relay 替换，但默认配置是中心服务）。
-与 A1 一并修复后在第一原则处如实标注。
+## A5 🟡 发现路径的中心化依赖未在文档标注 → ✅ 已消解
+「pkarr/DHT」方案已整体废止（A1 决议），n0 依赖随之消失；现行发现路径
+（QR/配对握手携带 dc://node 快照、BLE 布隆广播）无任何中心目录，PLAN.md
+第一原则处已如实标注。
+
+---
+
+# 第八轮：台账清账与安全修复落地（2026-09-07 ~ 2026-09-11，GLM-Zcode 分支）
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| P0-1 BLE AUTH 32/33 契约 | ✅ 已修（`befb1d8`） | BleMesh.kt IDENTITY_LEN=33 全流程引用 + Rust 33 契约回归测试 |
+| P0-2 contacts.rs 拒 33 | ✅ 已修（`f06df7b`） | upsert 接受 33（32 兼容），33 原样往返测试 |
+| P1-1 TOFU pin 静默换钥 | ✅ 已修（`7a195a3`） | signal_store save_identity 异钥拒绝 + 旧记录保留测试 |
+| iroh 启动失败无自愈 | ✅ 已修（`b307ee4`） | IrohNodeManager 5s/15s/45s 退避 + 世代守卫（`4e7e365`） |
+| 前台服务 5 秒死线/销毁后复活 | ✅ 已修（`cff51c6`/`2207026`） | NodeService 先占位后初始化 + 步骤边界取消 |
+| MeScreen 主线程开库 | ✅ 已修（`4888fbb`） | LaunchedEffect + IO 线程 |
+| 盲区审计 A/B/C/D/E | ✅ 已修（`c58d466`/`d07a458`） | 滚动跟随、iroh 回调投 IO、nodeIdIndex 缓存、naddr 等待、QR 入口直达 |
+| A3 n0 中继移除 | ✅ 已落地 | node.rs presets::Minimal（见上） |
+| Release R8 混淆验证 | ✅ CI 已加 | assembleRelease 步骤 + proguard keep `chat.dc.core`（`976e311`/`dbd0dde`） |
+
+仍开放：A4 清理调度接线、P1-3/P1-4/P2-1/P2-2/P2-3 等（台账见
+docs/APP-OVERVIEW.md 第五节）。
 
 ## 已接受的剩余风险（复审确认，维持原判）
 - 中继运营者可见「节点 ID 对 + 时序」，不可见内容（威胁模型已声明）

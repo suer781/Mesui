@@ -49,7 +49,8 @@ class MainScaffoldCameraTest {
         compose.onNodeWithTag("role_scan").performClick()
         compose.waitForIdle()
         compose.onNodeWithTag("scan_view").assertExists()
-        compose.onNodeWithText("对准对方滚动的动态码，保持约 3 秒即可读全").assertExists()
+        // UI 简化后只剩取景器 + 提示文案（无帧数进度条）
+        compose.onNodeWithText("对准对方的动态码").assertExists()
         // 页面标题也必须存在：配合 verticalScroll，小屏不得裁掉内容
         compose.onNodeWithText("扫码添加").assertExists()
     }

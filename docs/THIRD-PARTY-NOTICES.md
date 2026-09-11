@@ -22,12 +22,15 @@
 | prost-build（构建期） | protobuf 编译 | Apache-2.0 | tokio-rs/prost |
 | uniffi | Kotlin 绑定生成 | MPL-2.0 | mozilla/uniffi-rs |
 
-## Android 侧（规划）
+## Android 侧（实际使用）
 
 | 组件 | 用途 | 许可证 |
 |---|---|---|
 | Jetpack Compose / Material 3 | UI | Apache-2.0 |
-| zxing-android-embedded | 二维码 | Apache-2.0 |
-| Briar（蓝牙实现参考，不直接复制代码时无需遵守；若复制则 AGPL-3.0 与本项目兼容） | 蓝牙 RFCOMM 参考 | AGPL-3.0 |
+| zxing core（3.5.3）+ zxing-android-embedded（4.3.0, journeyapps） | 二维码生成与扫描 | Apache-2.0 |
+| JNA（net.java.dev.jna:jna 5.13.0 @aar） | UniFFI Kotlin 绑定的原生桥 | Apache-2.0 或 LGPL-2.1（双许可，随 UniFFI 默认后端采用 Apache 路径） |
+| kotlinx-coroutines | 协程 | Apache-2.0 |
+| Robolectric（测试期） | JVM Android 模拟测试 | MIT |
+| Briar（蓝牙实现参考，不直接复制代码时无需遵守；若复制则 AGPL-3.0 与本项目兼容） | 蓝牙保活/前台服务策略参考 | AGPL-3.0 |
 
 > 完整传递依赖清单由 `cargo license` / Gradle 许可报告在发布流程中自动生成后替换本文件。

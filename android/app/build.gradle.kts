@@ -50,6 +50,12 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
+    lint {
+        // 存量 lint 债务（BLE MissingPermission ×6、uniffi 生成代码 NewApi ×3 等
+        // 共 10 项）在 CI 从未跑过 lint，属历史遗留；用 baseline 记录，保证
+        // 「新增代码的新 lint 问题仍然会让 lint 失败」，不掩盖增量问题。
+        baseline = file("lint-baseline.xml")
+    }
     // UniFFI 生成物：CI 在 assembleDebug 前由 uniffi-bindgen 生成到
     // src/main/uniffi（不入库），Kotlin 编译把它与 java 目录一并纳入。
     // 本地无该目录时 gradle 不报错，只是缺绑定源。

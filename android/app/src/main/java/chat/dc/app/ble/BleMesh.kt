@@ -14,9 +14,12 @@ import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.ParcelUuid
+import chat.dc.app.addfriend.AddFriendPayload
+import chat.dc.app.addfriend.FrameCodec
 import chat.dc.app.core.SignalCore
 import chat.dc.app.friendlink.FriendLink
 import chat.dc.core.Contact
+import chat.dc.core.DcException
 import chat.dc.core.SasCode
 import chat.dc.core.WireMessage
 import chat.dc.core.firstMessageMac
@@ -41,6 +44,9 @@ import java.util.UUID
 private val SERVICE_PU = ParcelUuid(LinkUuids.SERVICE_UUID)
 private val PAIR_UUID = ParcelUuid(UUID.fromString("8f9d5a11-4c2b-4e0a-9d1e-5a1b2c3d4e70"))
 
+/** QR 快连③的 Signal 密文标记：扫码端用它向出示端索要完整身份（含 token）。 */
+private const val QR_ID_REQ = "dc-idreq"
+
 /** 链路事件转接（构造期回填）。 */
 private class LinkAdapter : LinkEvents {
     var onFrame: ((ByteArray) -> Unit)? = null
@@ -60,6 +66,8 @@ data class PairingSnap(
     val peerConfirmed: Boolean,
     val waitingLink: Boolean,
     val finished: Boolean,
+    /** QR 快连错误：0 无 / 1 失败（重扫） / 2 对方身份已变更（拒绝）。仅扫码端。 */
+    val dialError: Int = 0,
 )
 
 /** 统一链路句柄。 */
@@ -103,6 +111,19 @@ private class PairingInternal(val asHost: Boolean) {
     @Volatile var link: LinkHandle? = null
     @Volatile var finished = false
 
+    // QR 快连（SP-3 蓝牙搭线）。challenge 非空 = 快连模式：
+    // 出示端持有 qrPayload（答 QR_DIAL/QR_REQ 用）；扫码端 QR_OFFER 收到的
+    // bundle 存 offerBundle，QR_ID 到达时做绑定校验（防换包）。
+    @Volatile var challenge: ByteArray? = null
+    @Volatile var qrPayload: AddFriendPayload? = null
+    @Volatile var offerBundle: ByteArray? = null
+    @Volatile var dialError = 0 // 0 无 / 1 快连失败 / 2 对方身份变更（仅扫码端）
+    // 出示端：配对开始时刻（QR_REQ 时长门槛——偷拍者拍单帧+回连同样要等满
+    // 3 秒才能拿到 token，与拍全数据帧的门槛等价）。扫码端：identityReadyAtMs
+    // = 本端时长门槛到期时刻，到点才发 QR_REQ。
+    @Volatile var startedAtMs = -1L
+    @Volatile var identityReadyAtMs = -1L
+
     fun snap() = PairingSnap(
         asHost = asHost,
         peerName = peerName,
@@ -111,6 +132,7 @@ private class PairingInternal(val asHost: Boolean) {
         peerConfirmed = peerConfirmed,
         waitingLink = link == null,
         finished = finished,
+        dialError = dialError,
     )
 }
 
@@ -410,6 +432,8 @@ object BleMesh {
                 if (!ok) link.drop()
             }
             Wire.HS -> onHostHandshake(handle, body)
+            Wire.QR_DIAL -> onHostQrDial(link, body)
+            Wire.QR_REQ -> onHostQrReq(handle, link, body)
             Wire.SAS_OK -> pairingObj?.takeIf { it.asHost && !it.finished }?.let {
                 it.peerConfirmed = true
                 publishPairing()
@@ -420,6 +444,46 @@ object BleMesh {
     }
 
     // ---------------- 配对 ----------------
+
+    /** QR 快连①：扫码端读到 f=2 蓝牙帧后经常驻扫描回连，原样回传挑战。
+     *  挑战对上 + 本端正在出示配对 + 尚无配对链路，才回 QR_OFFER（把 GATT
+     *  连接与当前出示的动态码绑定）；其余一律不回话，对端超时自断。 */
+    @SuppressLint("MissingPermission")
+    private fun onHostQrDial(link: BleServer.ServerLink, body: ByteArray) {
+        val p = pairingObj?.takeIf { it.asHost && !it.finished && it.link == null } ?: return
+        val challenge = p.challenge ?: return // 非 QR 快连配对：不回话
+        if (body.size != challenge.size || !body.contentEquals(challenge)) return
+        val payload = p.qrPayload ?: return
+        if (payload.bundle.size > Wire.MAX_BODY - 66) return // 异常大 bundle：放弃快连，扫码端走数据帧回退
+        val nameBytes = payload.name.toByteArray(Charsets.UTF_8)
+        link.send(wireFrame(Wire.QR_OFFER, byteArrayOf(nameBytes.size.toByte()) + nameBytes + payload.bundle))
+    }
+
+    /** QR 快连③：扫码端已用 bundle 建会话，经 Signal 加密通道索要完整身份。
+     *  两道门：①本端配对已进行 ≥[FrameCodec.MIN_COLLECT_MS]——偷拍者拍单帧+
+     *  回连拿不到 token，须与拍全数据帧同样在场 3 秒（SP-3 时长门槛双端执行；
+     *  合法扫码端的门槛计时必然包含在出示时长内——码都看不见就无从扫起）；
+     *  ②请求标记在 Signal 密文里（会话由出示端 bundle 建立，密文只有持会话的
+     *  QR 对端能造）。token 只在密文里过空。 */
+    @SuppressLint("MissingPermission")
+    private fun onHostQrReq(handle: ServerLinkHandle, link: BleServer.ServerLink, body: ByteArray) {
+        val p = pairingObj?.takeIf { it.asHost && !it.finished } ?: return
+        if (p.link != null && p.link !== handle) return // 配对链路已被别的连接占用
+        val payload = p.qrPayload ?: return
+        val startedAt = p.startedAtMs
+        if (startedAt < 0 || System.currentTimeMillis() - startedAt < FrameCodec.MIN_COLLECT_MS) return
+        if (body.isEmpty()) return
+        val nameLen = body[0].toInt() and 0xFF
+        if (nameLen == 0 || body.size < 1 + nameLen + 1) return
+        val name = String(body.copyOfRange(1, 1 + nameLen), Charsets.UTF_8)
+        val session = runCatching { SignalCore.session(ctx()) }.getOrNull() ?: return
+        val plain = runCatching {
+            session.decrypt(name, WireMessage(body[1 + nameLen].toUByte(), body.copyOfRange(2 + nameLen, body.size)))
+        }.getOrNull() ?: return
+        if (plain.size != QR_ID_REQ.length || String(plain, Charsets.US_ASCII) != QR_ID_REQ) return
+        val wm = runCatching { session.encrypt(name, payload.encode().toByteArray(Charsets.UTF_8)) }.getOrNull() ?: return
+        link.send(wireFrame(Wire.QR_ID, byteArrayOf(wm.msgType.toByte()) + wm.ciphertext))
+    }
 
     private fun onHostHandshake(handle: ServerLinkHandle, body: ByteArray) {
         val p = pairingObj?.takeIf { it.asHost && !it.finished } ?: return
@@ -466,40 +530,154 @@ object BleMesh {
                 when (frame[0].toInt()) {
                     Wire.SAS_OK -> { p.peerConfirmed = true; publishPairing() }
                     Wire.MSG -> onJoinerBusiness(handle, frame, p)
+                    Wire.QR_OFFER -> onJoinerQrOffer(handle, frame, p)
+                    Wire.QR_ID -> onJoinerQrId(handle, frame, p)
                     else -> Unit
                 }
             }
         }
-        adapter.onClosed = { p.link = null; publishPairing() }
+        adapter.onClosed = {
+            p.link = null
+            // QR 快连中途断链且未完成：标记失败（UI 提示重扫；完整身份仍可
+            // 经数据帧全集回退）。已完成/旧路径（无 challenge）不打扰
+            if (!p.finished && p.challenge != null && p.dialError == 0) p.dialError = 1
+            publishPairing()
+        }
         link.connect()
         link.whenReady { ok ->
             if (!ok || p.finished) { link.close(); return@whenReady }
-            val session = runCatching { SignalCore.session(context) }.getOrNull() ?: return@whenReady
-            val token = p.token ?: return@whenReady
-            val bucket = p.bucket ?: return@whenReady
-            // 等 iroh 节点快照就绪（冷启动 onReady 可能滞后于 BLE 配对）。超时则降级
-            // 沿用当前快照（可能为空 → 退化为纯 BLE 握手），绝不因此阻塞 BLE 配对；
-            // 不静默把 naddr 写成空，否则联系人 node_naddr 被永久置空、跨网不可达（缺陷 D）
-            val myNaddr = runBlocking(Dispatchers.IO) {
-                withTimeoutOrNull(4000L) {
-                    chat.dc.app.core.IrohNodeManager.state.first { it.naddr.isNotBlank() }
-                }?.naddr ?: chat.dc.app.core.IrohNodeManager.state.value.naddr
+            val challenge = p.challenge
+            if (challenge != null) {
+                // QR 快连：身份尚未到手，先原样回传挑战搭线（出示端比对通过
+                // 才回 QR_OFFER）；QR_OFFER/QR_ID 到齐后再走既有 token-MAC 握手
+                p.link = handle
+                publishPairing()
+                link.send(wireFrame(Wire.QR_DIAL, challenge))
+                return@whenReady
             }
-            val plainPayload = if (myNaddr.isEmpty()) {
-                "dc-hs".toByteArray()
-            } else {
-                "dc-hs".toByteArray(Charsets.US_ASCII) + byteArrayOf(0) + myNaddr.toByteArray(Charsets.US_ASCII)
-            }
-            val wm = runCatching { session.encrypt(name, plainPayload) }.getOrNull() ?: return@whenReady
-            val mac = runCatching { firstMessageMac(token, bucket, wm.ciphertext) }.getOrNull() ?: return@whenReady
-            val nameBytes = name.toByteArray()
-            val body = byteArrayOf(nameBytes.size.toByte()) + nameBytes + mac + byteArrayOf(wm.msgType.toByte()) + wm.ciphertext
-            link.send(wireFrame(Wire.HS, body))
-            p.link = handle
-            val idHex = p.peerIdentity?.let { hex(it) }
-            if (idHex != null) synchronized(links) { links[idHex] = handle }
-            publishPairing()
+            sendJoinerHandshake(handle, p)
         }
+    }
+
+    /** 身份就绪（旧路径 startPairingAsJoiner 直接就绪 / QR 快连 QR_ID 到齐）后：
+     *  发 token-MAC 握手（SP-3 第 4 条：首条消息必须携带 token 派生确认），
+     *  随后进入 SAS 比对。 */
+    private fun sendJoinerHandshake(handle: ClientLinkHandle, p: PairingInternal) {
+        val context = ctx()
+        val name = p.peerName ?: return
+        val session = runCatching { SignalCore.session(context) }.getOrNull() ?: return
+        val token = p.token ?: return
+        val bucket = p.bucket ?: return
+        // 等 iroh 节点快照就绪（冷启动 onReady 可能滞后于 BLE 配对）。超时则降级
+        // 沿用当前快照（可能为空 → 退化为纯 BLE 握手），绝不因此阻塞 BLE 配对；
+        // 不静默把 naddr 写成空，否则联系人 node_naddr 被永久置空、跨网不可达（缺陷 D）
+        val myNaddr = runBlocking(Dispatchers.IO) {
+            withTimeoutOrNull(4000L) {
+                chat.dc.app.core.IrohNodeManager.state.first { it.naddr.isNotBlank() }
+            }?.naddr ?: chat.dc.app.core.IrohNodeManager.state.value.naddr
+        }
+        val plainPayload = if (myNaddr.isEmpty()) {
+            "dc-hs".toByteArray()
+        } else {
+            "dc-hs".toByteArray(Charsets.US_ASCII) + byteArrayOf(0) + myNaddr.toByteArray(Charsets.US_ASCII)
+        }
+        val wm = runCatching { session.encrypt(name, plainPayload) }.getOrNull() ?: return
+        val mac = runCatching { firstMessageMac(token, bucket, wm.ciphertext) }.getOrNull() ?: return
+        val nameBytes = name.toByteArray()
+        val body = byteArrayOf(nameBytes.size.toByte()) + nameBytes + mac + byteArrayOf(wm.msgType.toByte()) + wm.ciphertext
+        handle.send(wireFrame(Wire.HS, body))
+        p.link = handle
+        val idHex = p.peerIdentity?.let { hex(it) }
+        if (idHex != null) synchronized(links) { links[idHex] = handle }
+        publishPairing()
+    }
+
+    /** QR 快连②：出示端回 PreKeyBundle（公开材料，明文与旧版二维码数据帧等价）。
+     *  本端 PQXDH 建会话，再经 Signal 加密通道索要完整身份（QR_REQ，到时长门槛
+     *  才发——与出示端门槛共同维持「偷拍需持续在场 3 秒」）。 */
+    private fun onJoinerQrOffer(handle: ClientLinkHandle, frame: ByteArray, p: PairingInternal) {
+        val body = frame.copyOfRange(Wire.HEADER_LEN, frame.size)
+        if (body.size < 2 + 256) return // nameLen:1 + name:≥1 + bundle:≥256（载荷契约）
+        val nameLen = body[0].toInt() and 0xFF
+        if (nameLen == 0 || body.size < 1 + nameLen + 256) return
+        val name = String(body.copyOfRange(1, 1 + nameLen), Charsets.UTF_8)
+        val bundle = body.copyOfRange(1 + nameLen, body.size)
+        val context = ctx()
+        val session = runCatching { SignalCore.session(context) }.getOrNull() ?: run {
+            p.dialError = 1
+            publishPairing()
+            handle.closeLink()
+            return
+        }
+        try {
+            session.processBundle(name, bundle)
+        } catch (_: DcException.RemoteIdentityChanged) {
+            p.dialError = 2
+            publishPairing()
+            handle.closeLink()
+            return
+        } catch (_: Exception) {
+            p.dialError = 1
+            publishPairing()
+            handle.closeLink()
+            return
+        }
+        p.peerName = name
+        p.offerBundle = bundle
+        val wm = runCatching { session.encrypt(name, QR_ID_REQ.toByteArray(Charsets.US_ASCII)) }.getOrNull() ?: run {
+            p.dialError = 1
+            publishPairing()
+            handle.closeLink()
+            return
+        }
+        // 时长门槛到期才索要完整身份（token 只走密文）；到期前先挂在加密会话上等
+        val wait = (p.identityReadyAtMs - System.currentTimeMillis()).coerceAtLeast(0)
+        scope.launch {
+            if (wait > 0) delay(wait)
+            if (p.finished || p.link !== handle || p.challenge == null) return@launch
+            val myName = SignalCore.deviceName(context)
+            val myNameBytes = myName.toByteArray(Charsets.UTF_8)
+            handle.send(
+                wireFrame(
+                    Wire.QR_REQ,
+                    byteArrayOf(myNameBytes.size.toByte()) + myNameBytes +
+                        byteArrayOf(wm.msgType.toByte()) + wm.ciphertext,
+                ),
+            )
+        }
+    }
+
+    /** QR 快连④：出示端经 Signal 加密通道回完整身份（含 bootstrap token——
+     *  token 只走密文，SP-3 第 4 条不变）。与 QR_OFFER 绑定校验（同名同 bundle，
+     *  防换包）后填齐配对状态并走既有 token-MAC 握手 + SAS。 */
+    private fun onJoinerQrId(handle: ClientLinkHandle, frame: ByteArray, p: PairingInternal) {
+        val offerBundle = p.offerBundle ?: return
+        val name = p.peerName ?: return
+        val body = frame.copyOfRange(Wire.HEADER_LEN, frame.size)
+        if (body.isEmpty()) return
+        val context = ctx()
+        val session = runCatching { SignalCore.session(context) }.getOrNull() ?: return
+        val plain = runCatching {
+            session.decrypt(name, WireMessage(body[0].toUByte(), body.copyOfRange(1, body.size)))
+        }.getOrNull() ?: return
+        val payload = runCatching { AddFriendPayload.parse(String(plain, Charsets.UTF_8)) }.getOrNull()
+        if (payload == null || payload.name != name || !payload.bundle.contentEquals(offerBundle)) {
+            p.dialError = 1
+            publishPairing()
+            handle.closeLink()
+            return
+        }
+        p.token = payload.token
+        p.bucket = payload.bucket
+        p.bleId = payload.ble
+        p.peerIdentity = payload.identity
+        p.naddr = payload.naddr
+        p.challenge = null
+        // 快连路径 SAS 由 BleMesh 直接算好（与出示端 onHostHandshake 对称）
+        p.sas = runCatching {
+            session.sasWith(SignalCore.deviceName(context), payload.name, payload.identity)
+        }.getOrNull()
+        sendJoinerHandshake(handle, p)
     }
 
     /** joiner 在配对链路上收到的 MSG：只可能是 DCS1（S_i 下发），其余丢弃等主链路。 */
@@ -526,10 +704,14 @@ object BleMesh {
         publishPairing()
     }
 
-    /** 出示页进入。 */
-    fun startPairingAsHost(token: ByteArray, bucket: ByteArray, bleId: ByteArray) {
+    /** 出示页进入。[payload] = 本场动态码载荷（QR 快连用它应答 QR_DIAL/QR_REQ），
+     *  [challenge] = 蓝牙连接帧（f=2）的当场随机挑战。 */
+    fun startPairingAsHost(payload: AddFriendPayload, challenge: ByteArray) {
         pairingObj = PairingInternal(asHost = true).apply {
-            this.token = token; this.bucket = bucket; this.bleId = bleId
+            token = payload.token; bucket = payload.bucket; bleId = payload.ble
+            qrPayload = payload
+            this.challenge = challenge
+            startedAtMs = System.currentTimeMillis()
         }
         publishPairing()
         republishAdv()
@@ -551,6 +733,23 @@ object BleMesh {
             this.peerName = peerName; this.peerIdentity = peerIdentity
             this.token = token; this.bucket = bucket; this.bleId = bleId
             this.naddr = naddr
+        }
+        publishPairing()
+    }
+
+    /**
+     * 扫码页读到蓝牙连接帧（f=2）立即调：只登记搭线信息（名字/配对 id/挑战），
+     * 常驻 BLE 扫描命中对方配对广播即回连（QR_DIAL→QR_OFFER→QR_REQ→QR_ID→HS），
+     * 完整身份（含 token）经蓝牙上的 Signal 加密通道交换，不走二维码。
+     * [identityReadyAtMs] = 本端 3 秒时长门槛到期时刻（FrameCollector 锚定）——
+     * 到点才发 QR_REQ 索要完整身份，与出示端门槛共同维持防偷拍时长语义。
+     */
+    fun startQrDialAsJoiner(peerName: String, bleId: ByteArray, challenge: ByteArray, identityReadyAtMs: Long) {
+        pairingObj = PairingInternal(asHost = false).apply {
+            this.peerName = peerName
+            this.bleId = bleId
+            this.challenge = challenge
+            this.identityReadyAtMs = identityReadyAtMs
         }
         publishPairing()
     }

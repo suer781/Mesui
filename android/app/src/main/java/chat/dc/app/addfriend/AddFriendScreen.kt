@@ -2,6 +2,7 @@ package chat.dc.app.addfriend
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -24,7 +25,6 @@ import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.Icon
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -174,11 +174,30 @@ private fun RoleCard(
     }
 }
 
+// 两阶段展示阶段号（见 [ShowMyCodeScreen]）：蓝牙搭线 → 身份交换；0 = 降级混合
+private const val SHOW_PHASE_HANDSHAKE = 1
+private const val SHOW_PHASE_EXCHANGE = 2
+private const val SHOW_PHASE_FALLBACK = 0
+
+/** 阶段 1（蓝牙搭线）最长停留：超过仍未建立蓝牙链路（对端不支持快连/一直没扫）
+ *  即降级为旧式 f=1/f=2 交替序列（对方可走数据帧采集路径，安全码比对兜底）。
+ *  须覆盖对端 3 秒防偷拍时长门槛 + BLE 连接/握手耗时，再留余量。 */
+private const val HANDSHAKE_PHASE_MS = 8_000L
+
 /**
- * 「别人扫我」：只显示我的动态码。数据帧与当场新随机的噪声帧交错播放（280ms/帧），
- * 每两帧画面都不同，单帧/单张截图不含完整信息。
- * 载荷为真实密钥材料；进入即登记 host 配对（mesh 广播临时配对 id 等对方回连，
- * 收到 HS 后展示 SAS 供双方肉眼比对确认）。
+ * 「别人扫我」：两阶段出示（蓝牙/身份信息防混暴露）——
+ *  阶段 1（蓝牙搭线）：只滚蓝牙连接帧（f=2，少量重复），对方读到即经常驻
+ *    BLE 扫描回连，本阶段不出示任何数据帧；
+ *  阶段 2（身份交换）：蓝牙链路建立（本端 SAS 在手）后只滚数据帧 f=1 +
+ *    奇偶帧 f=3 + 噪声帧 f=0——完整身份经加密蓝牙通道交换，f=2 与 f=1 绝不
+ *    出现在同一滚动序列，长曝光单照至多捕到一种信息；
+ *  降级：蓝牙迟迟未建立（对方不支持快连/超时）→ 旧式 f=1/f=2 交替序列
+ *    （对方可走数据帧采集路径），安全码比对兜底。
+ *  每轮展示开始重新生成帧内随机盐（nonce）：CRC 随之重算，同一张物理二维码
+ *  每轮在字节层不同（防长曝光拼接）；sid 与数据内容不变。奇偶帧让扫描端丢
+ *  1 帧可即时恢复。自适应帧率：间隔 = max(实测编码耗时, 150ms 最小视觉间隔)。
+ *  载荷为真实密钥材料；进入即登记 host 配对（mesh 广播临时配对 id 等对方
+ *  回连，收到 HS 后展示 SAS 供双方肉眼比对确认）。
  */
 @Composable
 fun ShowMyCodeScreen(onBack: () -> Unit) {
@@ -202,40 +221,68 @@ fun ShowMyCodeScreen(onBack: () -> Unit) {
             )
         }
     }
-    LaunchedEffect(myPayload) {
-        myPayload?.let { BleMesh.startPairingAsHost(it.token, it.bucket, it.ble) }
+    // 蓝牙连接帧的当场挑战：与配对登记共用同一份（回连方须原样回传才获应答），
+    // 载荷重生成（节点地址就绪等）时随之重生成
+    val challenge = remember(myPayload) { ByteArray(16).also(security::nextBytes) }
+    LaunchedEffect(myPayload, challenge) {
+        myPayload?.let { BleMesh.startPairingAsHost(it, challenge) }
     }
     DisposableEffect(myPayload) {
         onDispose { if (myPayload != null) BleMesh.stopPairingAsHost() }
     }
-    val sid = remember {
-        ByteArray(4).also(security::nextBytes).joinToString("") { "%02x".format(it) }
-    }
-    val dataFrames = remember(myPayload, sid) { myPayload?.let { FrameCodec.split(it, sid) } }
-    var frameBmp by remember(myPayload) {
-        mutableStateOf(dataFrames?.firstOrNull()?.let { QrCodec.encode(it, 480) })
-    }
-    LaunchedEffect(dataFrames) {
-        val frames = dataFrames ?: return@LaunchedEffect
-        var dataSeq = 0
+    val pairSnap by BleMesh.pairing.collectAsState()
+    // 两阶段展示当前阶段（UI 提示用）：1 蓝牙搭线 → 2 身份交换；0 = 降级混合
+    var showPhase by remember(myPayload) { mutableStateOf(SHOW_PHASE_HANDSHAKE) }
+    var frameBmp by remember(myPayload) { mutableStateOf<Bitmap?>(null) }
+    LaunchedEffect(myPayload, challenge) {
+        val payload = myPayload ?: return@LaunchedEffect
+        // 静态内容一次算好：数据段 / sid / 蓝牙搭线信息整场不变——每轮变化的
+        // 只有帧包装（随机盐 + 随之重算的 CRC）
+        val sid = FrameCodec.sidOf(payload)
+        val segments = FrameCodec.segments(payload)
+        val bleInfo = BleConnectInfo(
+            sid = sid,
+            name = payload.name,
+            bleId = payload.ble,
+            serviceUuid = chat.dc.app.ble.LinkUuids.SERVICE_UUID.toString(),
+            challenge = challenge,
+        )
+        val pacer = AdaptiveFramePacer()
+        val shownAt = System.currentTimeMillis()
         while (true) {
-            // 每 4 个数据帧才插 1 个噪声帧：噪声只为防单帧截屏，1:1 会把
-            // 有效帧率砍半——高密度帧解码本来就慢，跳一帧就「总差最后一帧」
-            val showNoise = dataSeq > 0 && dataSeq % 4 == 0
-            val f = if (showNoise) {
-                FrameCodec.noiseFrame(sid, security)
-            } else {
-                frames[dataSeq % frames.size].also { dataSeq += 1 }
+            // 两阶段防混暴露 + 降级：
+            //  阶段 1（蓝牙搭线）：只滚 f=2（对方读到即回连，不出示任何数据帧）；
+            //  阶段 2（身份交换）：本端握手完成（SAS 在手 = 蓝牙链路建立）后只滚
+            //    f=1+f=3+f=0——完整身份经加密蓝牙通道交换，f=2 与 f=1 绝不同序列；
+            //  降级：开场 HANDSHAKE_PHASE_MS 仍无链路（对方不支持快连/没扫）→
+            //    旧式 f=1/f=2 交替（对方走数据帧采集路径，安全码比对兜底）。
+            val snap = pairSnap
+            showPhase = when {
+                snap != null && snap.asHost && snap.sas != null -> SHOW_PHASE_EXCHANGE
+                System.currentTimeMillis() - shownAt > HANDSHAKE_PHASE_MS -> SHOW_PHASE_FALLBACK
+                else -> SHOW_PHASE_HANDSHAKE
             }
-            frameBmp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
-                QrCodec.encode(f, 480)
+            // 每轮开始重新生成随机盐：帧内 nonce 变化 → CRC 随之重算 → 同一张
+            // 物理二维码每轮在字节层不同（防长曝光拼接）；sid 与数据内容不变
+            // （sid 绑定的是载荷文本，不是 nonce）。
+            val nonce = FrameCodec.nonce(security)
+            val pass = when (showPhase) {
+                SHOW_PHASE_EXCHANGE -> FrameCodec.dataPass(sid, segments, bleInfo = null, nonce, security)
+                SHOW_PHASE_FALLBACK -> FrameCodec.dataPass(sid, segments, bleInfo = bleInfo, nonce, security)
+                else -> FrameCodec.handshakePass(bleInfo, nonce)
             }
-            // 150ms/帧：全部数据帧 ~2.2s 一轮，配合扫描端 3 秒时长门槛，
-            // 正常情况 3-4 秒内必能集齐
-            delay(150)
+            for (frame in pass) {
+                // 实测单帧编码耗时（zxing 矩阵 + 位图写入，CPU 密集）喂给节拍器
+                val encodeStart = System.nanoTime()
+                frameBmp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+                    QrCodec.encode(frame, 480)
+                }
+                // 自适应帧率：间隔 = max(实测编码耗时 EWMA, 最小视觉间隔 150ms)。
+                // 全程循环多播，接收端缺帧靠奇偶帧恢复或下一轮补齐
+                delay(pacer.afterEncode((System.nanoTime() - encodeStart) / 1_000_000))
+            }
         }
     }
-    val pairSnap by BleMesh.pairing.collectAsState()
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -266,6 +313,19 @@ fun ShowMyCodeScreen(onBack: () -> Unit) {
                     .testTag("qr_image"),
             )
         }
+        // 两阶段状态提示：蓝牙搭线 → 身份经加密通道交换 / 降级兼容模式
+        Text(
+            stringResource(
+                when (showPhase) {
+                    SHOW_PHASE_EXCHANGE -> R.string.add_friend_show_phase_exchange
+                    SHOW_PHASE_FALLBACK -> R.string.add_friend_show_phase_fallback
+                    else -> R.string.add_friend_show_phase_handshake
+                },
+            ),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(bottom = 8.dp).testTag("show_phase_hint"),
+        )
         // 对方已连接并发来握手：进入 SAS 比对确认
         val snap = pairSnap
         if (snap != null && snap.asHost && snap.sas != null) {
@@ -311,10 +371,12 @@ fun ShowMyCodeScreen(onBack: () -> Unit) {
 }
 
 /**
- * 「我扫别人」：只开相机采集对方动态码，集齐全部数据帧且 ≥3 秒才完成。
- * 完成后：解析出的真实 bundle 立即跑 PQXDH 建会话（内存 store），
- * 并计算真 SAS（绑定双方长期身份公钥）供用户带外比对；
- * token-MAC 首条消息与 BLE 传输在阶段 3 接入。
+ * 「我扫别人」：扫码即搭线——读到蓝牙连接帧（f=2）立即经常驻 BLE 扫描回连对方
+ * （不等数据帧集齐），3 秒防偷拍时长门槛到期后经蓝牙上的 Signal 加密通道交换
+ * 完整身份（token 只走密文），随后 SAS 比对（SP-3 原则不变）。
+ * UI 只有取景器 + 提示文案；配对卡片在蓝牙帧到手/身份交换后出现。
+ * 旧版对端（无 f=2 帧）仍走数据帧全集采集回退（原流程不变），缺失数据帧可由
+ * f=3 奇偶帧 XOR 即时恢复（FEC，不必等循环重播）。
  */
 @Composable
 fun ScanToAddScreen(onBack: () -> Unit) {
@@ -333,10 +395,20 @@ fun ScanToAddScreen(onBack: () -> Unit) {
     // 会话延迟到「采集完成建会话」时才取：无相机权限的引导分支不触碰 Keystore/native
     val collector = remember { FrameCollector() }
     var collectorState by remember { mutableStateOf<FrameCollector.State?>(null) }
-    val peerPayload = collectorState?.takeIf { it.complete }?.payload
+    // 蓝牙连接帧（f=2）搭线信息：先到先冻——读到即触发 BLE 回连（QR 快连）
+    var bleInfo by remember { mutableStateOf<BleConnectInfo?>(null) }
+    val pairSnap by BleMesh.pairing.collectAsState()
 
-    // 采集完成 → PQXDH 建会话 + 登记 joiner 配对（mesh 负责扫到配对 id 后
-    // 回连、发 HS、S_i 接收）。established: 0 失败 / 1 成功 / 2 对方身份已变更
+    // 旧版回退路径：对端无蓝牙帧（f=2）时，数据帧集齐 + 3 秒仍可完成（原流程）。
+    // 蓝牙帧在手则快连路径接管，数据帧重组结果不再触发重复建会话。
+    val legacyPayload = collectorState?.takeIf { it.complete && it.ble == null }?.payload
+    var peerPayload by remember { mutableStateOf<AddFriendPayload?>(null) }
+    LaunchedEffect(legacyPayload) {
+        if (peerPayload == null && legacyPayload != null) peerPayload = legacyPayload
+    }
+
+    // 快连路径：登记搭线（BleMesh 常驻扫描命中对方配对广播即回连）。
+    // established: 0 失败 / 1 成功 / 2 对方身份已变更（仅旧版回退路径使用）
     var established by remember { mutableStateOf<Int?>(null) }
     LaunchedEffect(peerPayload) {
         peerPayload?.let { p ->
@@ -358,7 +430,12 @@ fun ScanToAddScreen(onBack: () -> Unit) {
     DisposableEffect(peerPayload) {
         onDispose { if (peerPayload != null) BleMesh.stopPairingAsJoiner() }
     }
+    // 快连路径清理：页面退出即撤销（已完成的配对不动，链路保留为聊天链路）
+    DisposableEffect(bleInfo) {
+        onDispose { if (bleInfo != null) BleMesh.stopPairingAsJoiner() }
+    }
     // 真 SAS：绑定双方长期身份公钥 + 双方地址名，两端各算一端、结果一致
+    // （快连路径的 SAS 由 BleMesh 在 QR_ID 到达时算好，随 pairSnap 下发）
     val sas = remember(peerPayload, established) {
         peerPayload?.takeIf { established == 1 }?.let { p ->
             runCatching {
@@ -366,7 +443,8 @@ fun ScanToAddScreen(onBack: () -> Unit) {
             }.getOrNull()
         }
     }
-    val pairSnap by BleMesh.pairing.collectAsState()
+    // 快连卡片：蓝牙帧在手 + 扫码端配对对象在场（SAS/错误/交换中三态）
+    val fastSnap = pairSnap?.takeIf { bleInfo != null && !it.asHost }
 
     Column(
         modifier = Modifier
@@ -383,6 +461,66 @@ fun ScanToAddScreen(onBack: () -> Unit) {
             modifier = Modifier.padding(bottom = 4.dp),
         )
         when {
+            fastSnap != null -> Card(modifier = Modifier.fillMaxWidth().padding(top = 4.dp).testTag("pairing_card")) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    when (fastSnap.dialError) {
+                        2 -> {
+                            Text(
+                                stringResource(R.string.add_friend_identity_changed),
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            return@Card
+                        }
+                        1 -> {
+                            Text(stringResource(R.string.add_friend_establish_failed), style = MaterialTheme.typography.bodySmall)
+                            return@Card
+                        }
+                    }
+                    if (fastSnap.sas == null) {
+                        // 已回连、正在等 3 秒门槛到期后交换完整身份（token 只走密文）
+                        Text(
+                            stringResource(R.string.add_friend_fast_exchanging),
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(vertical = 8.dp),
+                        )
+                        return@Card
+                    }
+                    Text(stringResource(R.string.add_friend_verify), style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        stringResource(R.string.add_friend_safety_code, fastSnap.sas!!.six),
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(vertical = 8.dp),
+                    )
+                    Text(
+                        stringResource(R.string.add_friend_safety_code_full, fastSnap.sas!!.full),
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(bottom = 8.dp),
+                    )
+                    if (!fastSnap.localConfirmed) {
+                        Button(
+                            onClick = { BleMesh.confirmSas() },
+                            modifier = Modifier.fillMaxWidth().padding(top = 4.dp).testTag("sas_confirm"),
+                        ) {
+                            Text(stringResource(R.string.add_friend_sas_confirm))
+                        }
+                    } else {
+                        Text(
+                            if (fastSnap.peerConfirmed) stringResource(R.string.add_friend_peer_confirmed)
+                            else stringResource(R.string.add_friend_local_confirmed_wait),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    if (fastSnap.finished) {
+                        Text(
+                            stringResource(R.string.add_friend_done),
+                            color = MaterialTheme.colorScheme.primary,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
+                }
+            }
             peerPayload != null -> Card(modifier = Modifier.fillMaxWidth().padding(top = 4.dp).testTag("pairing_card")) {
                 Column(modifier = Modifier.padding(12.dp)) {
                     when (established) {
@@ -451,7 +589,17 @@ fun ScanToAddScreen(onBack: () -> Unit) {
                 DisposableEffect(Unit) {
                     barcodeView.decodeContinuous(object : BarcodeCallback {
                         override fun barcodeResult(result: BarcodeResult) {
-                            collectorState = collector.onFrame(result.text, System.currentTimeMillis())
+                            val now = System.currentTimeMillis()
+                            // 蓝牙连接帧（f=2）：读到立即回调搭线（不等数据帧集齐）——
+                            // 第二参 = 3 秒时长门槛到期时刻（防偷拍门槛不变，到点才
+                            // 交换完整身份）。重复帧不重复回调。
+                            collector.tryBluetoothConnect(result.text, now) { info, readyAtMs ->
+                                if (bleInfo == null) {
+                                    bleInfo = info
+                                    BleMesh.startQrDialAsJoiner(info.name, info.bleId, info.challenge, readyAtMs)
+                                }
+                            }
+                            collectorState = collector.onFrame(result.text, now)
                         }
 
                         override fun possibleResultPoints(points: MutableList<ResultPoint>?) = Unit
@@ -472,42 +620,13 @@ fun ScanToAddScreen(onBack: () -> Unit) {
                         .height(260.dp)
                         .testTag("scan_view"),
                 )
-                val st = collectorState
-                if (st != null && st.total > 0) {
-                    LinearProgressIndicator(
-                        progress = {
-                            val framesPart = if (st.total == 0) 0f else st.collected.toFloat() / st.total
-                            val timePart = (st.elapsedMs.toFloat() / FrameCodec.MIN_COLLECT_MS).coerceAtMost(1f)
-                            (framesPart * 0.6f + timePart * 0.4f).coerceIn(0f, 1f)
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 8.dp)
-                            .testTag("collect_progress"),
-                    )
-                    Text(
-                        if (st.collected >= st.total) {
-                            // 全部帧已到手、只剩 3 秒防截屏时长门槛：明确告知
-                            // 用户不是「总差一帧」，避免误解为识别失败
-                            stringResource(R.string.add_friend_collected_waiting)
-                        } else {
-                            stringResource(
-                                R.string.add_friend_progress,
-                                st.collected,
-                                st.total,
-                                // 时间门槛满足后秒数封顶在阈值，不再无限上涨
-                                st.elapsedMs.coerceAtMost(FrameCodec.MIN_COLLECT_MS) / 1000.0,
-                            )
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                } else {
-                    Text(
-                        stringResource(R.string.add_friend_collect_hint),
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.padding(vertical = 8.dp),
-                    )
-                }
+                // 只提示，不做帧数进度：3 秒门槛到期（蓝牙帧已扫到）或数据帧
+                // 集齐即自动完成，无须用户盯数字
+                Text(
+                    stringResource(R.string.add_friend_collect_hint),
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(vertical = 8.dp),
+                )
             }
         }
     }

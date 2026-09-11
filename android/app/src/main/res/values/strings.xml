@@ -30,12 +30,14 @@
     <string name="add_friend_role_scan">扫码添加</string>
     <string name="add_friend_role_scan_desc">扫描对方的动态码来添加对方</string>
     <string name="add_friend_show_hint">让对方扫描这个码</string>
+    <string name="add_friend_show_phase_handshake">阶段 1/2 · 蓝牙搭线：对方扫码后自动建立蓝牙连接</string>
+    <string name="add_friend_show_phase_exchange">阶段 2/2 · 蓝牙已连接：身份经加密蓝牙通道交换，二维码不再出示蓝牙信息</string>
+    <string name="add_friend_show_phase_fallback">兼容模式：蓝牙帧与数据帧交替出示（安全码比对兜底）</string>
     <string name="add_friend_qr_desc">我的加好友二维码</string>
     <string name="add_friend_scan">扫描对方的动态码</string>
     <string name="add_friend_grant_camera">授权相机开始扫描</string>
-    <string name="add_friend_progress">已采集 %1$d/%2$d 帧 · %3$.1f 秒 / 3.0 秒</string>
-    <string name="add_friend_collected_waiting">全部帧已到手，校验中…</string>
-    <string name="add_friend_collect_hint">对准对方滚动的动态码，保持约 3 秒即可读全</string>
+    <string name="add_friend_collect_hint">对准对方的动态码</string>
+    <string name="add_friend_fast_exchanging">已发现对方，正在通过蓝牙交换身份…</string>
     <string name="add_friend_verify">核对安全码（双方必须一致）</string>
     <string name="add_friend_safety_code">安全码：%1$s</string>
     <string name="add_friend_safety_code_full">完整校验串：%1$s</string>

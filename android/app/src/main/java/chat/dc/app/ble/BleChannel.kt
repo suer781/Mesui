@@ -27,6 +27,12 @@ object Wire {
     const val AUTH_B_CHA = 8    // 反向认证①：[type][nonce:16]（initiator 出 nonce）
     const val AUTH_B_RSP = 9    // 反向认证②：[type][hmac:16]（responder 证明持有 S_i）
 
+    // QR 快连（SP-3 蓝牙搭线）：扫码端读到 f=2 帧即回连，完整身份经加密通道交换
+    const val QR_DIAL = 10      // 快连①（扫码端→出示端）：[type][challenge:16]——f=2 帧挑战原样回传
+    const val QR_OFFER = 11     // 快连②（出示端→扫码端）：[type][nameLen:1][name][bundle...]（PreKeyBundle 公开材料，明文）
+    const val QR_REQ = 12       // 快连③（扫码端→出示端）：[type][nameLen:1][name][sigMsgType:1][Signal密文 "dc-idreq"]
+    const val QR_ID = 13        // 快连④（出示端→扫码端）：[type][sigMsgType:1][Signal密文 完整身份 dc://add URI——token 只走密文]
+
     const val HEADER_LEN = 3    // [type:1][bodyLen:2 BE]
     // 单帧 body 上限：真实最大帧 = HS（name+MAC+PreKeyBundle ≈2.6KB），留余量取 4KB。
     // 必须远小于 len 域的 65535：FrameSink 靠「声明长度超限」识别恶意/坏头并立即

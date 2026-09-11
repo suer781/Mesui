@@ -1,6 +1,8 @@
 # 开发环境备忘（Windows 10, 本机实测）
 
 > 本文档记录 2026-09-04 搭建过程中的全部环境坑位与解法。换机器时按此清单操作。
+> （2026-09-11 核对：SDK/NDK 已安装、Rust 交叉编译与 APK 构建链路已通；权威构建流程
+> 以 `.github/workflows/build.yml` 为准，本文只记本机差异。）
 
 ## 工具链清单
 
@@ -8,9 +10,10 @@
 |---|---|---|---|
 | Rust (x86_64-pc-windows-gnu) | 1.98.1 | rustup-init.exe 静默安装 | **GNU 工具链**，因 VS Build Tools 的 UAC 提权无人值守会失败 |
 | MSYS2 (便携) | 2026-06-11 sfx | USTC 镜像 `distrib/x86_64/msys2-base-x86_64-*.sfx.exe` | `sfx.exe -y -o"C:/Users/13682/"` 解压即用，无需管理员 |
-| mingw-w64 gcc | 16.2.0 | `pacman -Sy mingw-w64-x86_64-gcc` | 提供 gcc/dlltool/binutils |
-| Java | OpenJDK 21 (Microsoft) | 预装 | Gradle/Android 可用 |
-| Android SDK/NDK | 未安装 | 待装（Android Studio 或 sdkmanager） | 阶段 1 Android 构建前必须 |
+| mingw-w64 gcc | 16.2.0 | `pacman -Sy mingw-w64-x86_64-gcc` | 提供 gcc/dlltool/binutils；`.cargo/config.toml` 的 linker 指向它 |
+| Java | OpenJDK 21 (Microsoft) | 预装 | Gradle/Android 可用（CI 用 temurin 17） |
+| Android SDK | platform-35 / build-tools 34.0.0 | 腾讯镜像手动解包（见踩坑 15） | `%LOCALAPPDATA%\Android\Sdk`，`local.properties` 的 sdk.dir 已写入 |
+| Android NDK | 27.0.12077973 | SDK ndk 目录 | cargo-ndk 从 `ANDROID_NDK_HOME`/ndk/* 定位（CI 上用 runner 预装版并 fail-fast 校验） |
 
 ## 踩坑记录（按遇到顺序）
 
@@ -59,8 +62,11 @@
     `android.overridePathCheck=true` 后 aapt2/d8 全链路实测可过。
 19. **gradle wrapper 生成**会先校验 services.gradle.org（被墙）→
     `gradle wrapper --gradle-distribution-url <腾讯镜像URL>` 跳过官方源校验。
-20. **构建产物**：`android/app/build/outputs/apk/debug/app-debug.apk`（16MB，debug 签名）；
-    NDK 尚未安装（Rust 交叉编译阶段再从腾讯镜像取 android-ndk-r28b-windows.zip）。
+20. **构建产物**：`android/app/build/outputs/apk/debug/app-debug.apk`（debug 签名）；
+    NDK 已装（27.0.12077973）；Windows 下交叉编译 Android 需 `--features vendored-openssl`
+    （openssl-src 从源码 vendor，走 cargo-ndk 注入的 NDK 工具链），并注意本机
+    `.cargo/config.toml` 的 `[env] OPENSSL_DIR` 指向 MSYS2——CI 上用空目录覆盖它
+    （环境变量优先于 config [env]）。
 21. **Gradle 测试 worker CNFE 之谜**（编码墙之四）：daemon→worker 的 classpath 经
     **@argfile** 传递，`java.exe` 的 C 启动器在 JVM 启动前按系统 ANSI(GBK) 解码该文件
     → classpath 里的中文路径（项目 build 目录）全部变乱码 → 所有测试类 CNFE，
@@ -83,7 +89,15 @@ cargo test --no-default-features
 
 # 全量（libsignal + iroh + SQLCipher + zstd）
 cargo check && cargo test
+
+# Android APK（构建目录已迁到 C:/Users/13682/dc-build/app，见踩坑 21；
+# 需先有 jniLibs 的 libdc_core.so——CI 用 cargo-ndk 产出，本机跑一次即可）
+cd android && ./gradlew assembleDebug
 ```
+
+> Rust 侧 `.cargo/config.toml` 现状：`target-dir = C:/Users/13682/cargo-target/dc-chat`
+> （纯 ASCII，见踩坑 6/13）、linker = `x86_64-w64-mingw32-gcc`、
+> `[env] OPENSSL_DIR` 指向 MSYS2（Android 目标改用 vendored-openssl）。
 
 ## 国内网络可达性速查（本机实测）
 

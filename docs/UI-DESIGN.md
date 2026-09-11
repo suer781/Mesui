@@ -20,5 +20,11 @@
 ## 组件规则
 
 - 列表页整页滚动用 LazyColumn（头内容作 item），**禁止** verticalScroll 嵌 LazyColumn
-- 语义重名用 testTag 消歧；所有可交互元素必须有 testTag（Robolectric 验收依赖）
-- 演示数据集中在 ui/DemoData.kt，核心接入后整文件退役
+- 语义重名用 testTag 消歧；所有可交互元素必须有 testTag（Robolectric 验收依赖；
+  Kotlin 单测已入 CI `testDebugUnitTest`）
+- ~~演示数据集中在 ui/DemoData.kt，核心接入后整文件退役~~ **DemoData.kt 已删除**；
+  四页（消息/联系人/聊天/我的）全部读真实 SQLCipher 数据，空态仍优先（无数据即空态，
+  不造演示条目）
+- 重活全部离主线程：QR 编码在 `Dispatchers.Default`（自适应帧率节拍器）；
+  `MeScreen`/`NodeService` 的会话初始化（SQLCipher 首开含 KDF）在 IO 线程——
+  组合期同步开库会掉帧/ANR，属回归红线
