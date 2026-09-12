@@ -52,6 +52,18 @@ pub mod ffi;
 #[cfg(feature = "ffi")]
 uniffi::setup_scaffolding!();
 
+/// windows-gnu 工具链的 cdylib 导出锚点。
+///
+/// 不开 `ffi` 特性时本 crate 没有任何 `#[no_mangle]` 导出，windows-gnu 的 ld
+/// 会回退到 `--export-all-symbols`（把 iroh/libsignal 全部静态符号 13 万+ 个
+/// 塞进导出表）→「export ordinal too large」链接失败——`cargo test --test …`
+/// / `cargo build --lib`（默认特性）因此挂掉。一个显式导出让 ld 回到按
+/// list.def 导出的路径。对 FFI/Android 无影响（仅多导出一个版本探针符号）。
+#[unsafe(no_mangle)]
+pub extern "C" fn dc_core_abi_probe() -> u32 {
+    1
+}
+
 /// 统一错误类型。全部经字符串穿透，避免把第三方错误泛型漏进公共 API。
 #[derive(thiserror::Error, Debug)]
 pub enum CoreError {

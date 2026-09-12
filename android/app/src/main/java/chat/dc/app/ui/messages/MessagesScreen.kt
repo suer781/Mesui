@@ -63,14 +63,18 @@ fun MessagesScreen(onOpenChat: (String) -> Unit, onOpenAddFriend: () -> Unit = {
     val scope = rememberCoroutineScope()
     var query by remember { mutableStateOf("") }
     var chats by remember { mutableStateOf<List<ChatMessage>>(emptyList()) }
+    // K2-12：并发 reload 完成顺序不保序——IO 查询晚归的旧结果会把新数据覆盖回旧值。
+    // generation 计数：发起时取号，落地前校验仍是最新一代才写状态
+    var reloadGeneration by remember { mutableStateOf(0) }
 
     // reload 统一挪 IO（P2）：入站消息触发的 lastMessages 查询不再阻塞主线程
     fun reload() {
+        val gen = ++reloadGeneration
         scope.launch {
             val list = withContext(Dispatchers.IO) {
                 runCatching { SignalCore.contactStore(context).lastMessages() }.getOrDefault(emptyList())
             }
-            chats = list
+            if (gen == reloadGeneration) chats = list
         }
     }
 

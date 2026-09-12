@@ -56,7 +56,11 @@ import com.google.zxing.ResultPoint
 import com.journeyapps.barcodescanner.BarcodeCallback
 import com.journeyapps.barcodescanner.BarcodeResult
 import com.journeyapps.barcodescanner.DecoratedBarcodeView
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
+import androidx.compose.runtime.snapshotFlow
 import java.security.SecureRandom
 
 /**
@@ -204,25 +208,36 @@ fun ShowMyCodeScreen(onBack: () -> Unit) {
     RequestNearbyPermissionOnEntry()
     val context = LocalContext.current
     val security = remember { SecureRandom() }
-    // Keystore/native 失败（厂商机型异常、测试环境）不能崩页面：降级为明确错误态
-    val session = remember { runCatching { SignalCore.session(context) }.getOrNull() }
     val irohSnap by chat.dc.app.core.IrohNodeManager.state.collectAsState()
     // 红队盲审 P0-2 修复：payload 首次生成后冻结——不随 irohSnap.naddr 重生成。
     // naddr 迟到/变化不影响 QR 载荷（BLE 是传输管道，iroh 地址走加密通道交换）。
     // 随 naddr 重生成会导致 challenge/bleId 全换 → 已扫旧码的扫码端永久卡死。
-    val myPayload = remember(session) {
-        session?.let {
-            fun random(n: Int) = ByteArray(n).also(security::nextBytes)
-            AddFriendPayload(
-                name = SignalCore.deviceName(context),
-                identity = it.identityKey(),
-                bundle = it.prekeyBundleWire(),
-                bucket = random(32),
-                token = random(48),
-                ble = random(8),
-                naddr = "",
-            )
+    // K2-5：SignalCore.session（dlopen native + SQLCipher KDF）与 prekeyBundleWire
+    // （Kyber-1024）是重活，remember{} 里同步跑在主线程——首启弱机 ANR。挪
+    // LaunchedEffect + Dispatchers.IO，主线程只显示加载态；Keystore/native 失败
+    // （厂商机型异常、测试环境）置 identityFailed 降级为明确错误态，不崩页面。
+    var myPayload by remember { mutableStateOf<AddFriendPayload?>(null) }
+    var identityFailed by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching {
+                val session = SignalCore.session(context)
+                fun random(n: Int) = ByteArray(n).also(security::nextBytes)
+                AddFriendPayload(
+                    name = SignalCore.deviceName(context),
+                    identity = session.identityKey(),
+                    bundle = session.prekeyBundleWire(),
+                    bucket = random(32),
+                    token = random(48),
+                    ble = random(8),
+                    naddr = "",
+                    // 红队 R2-7：token 时效界 = 生成时刻 + 10 分钟（覆盖一次出示
+                    // 会话；进 token-MAC 输入并受验方过期检查——拍摄物不是永久能力）
+                    expiresAtMs = System.currentTimeMillis() + 10 * 60_000L,
+                )
+            }.getOrNull()
         }
+        if (loaded == null) identityFailed = true else myPayload = loaded
     }
     // 蓝牙连接帧的当场挑战：与配对登记共用同一份（回连方须原样回传才获应答），
     // 载荷重生成（节点地址就绪等）时随之重生成
@@ -238,6 +253,21 @@ fun ShowMyCodeScreen(onBack: () -> Unit) {
         onDispose { if (registered != null) BleMesh.stopPairingAsHost() }
     }
     val pairSnap by BleMesh.pairing.collectAsState()
+    // K2-10：出码循环感知生命周期——退后台（ON_STOP）暂停编码/刷 bitmap（省电），
+    // 回前台（ON_START）恢复。用 State 承载，循环内经 snapshotFlow 挂起等待恢复
+    var foreground by remember { mutableStateOf(true) }
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_START -> foreground = true
+                androidx.lifecycle.Lifecycle.Event.ON_STOP -> foreground = false
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     // 两阶段展示当前阶段（UI 提示用）：1 蓝牙搭线 → 2 身份交换；0 = 降级混合
     var showPhase by remember(myPayload) { mutableStateOf(SHOW_PHASE_HANDSHAKE) }
     var frameBmp by remember(myPayload) { mutableStateOf<Bitmap?>(null) }
@@ -257,6 +287,8 @@ fun ShowMyCodeScreen(onBack: () -> Unit) {
         val pacer = AdaptiveFramePacer()
         val shownAt = System.currentTimeMillis()
         while (true) {
+            // K2-10：退后台暂停循环（不再每 150ms 编码刷新 bitmap 耗电），回前台继续
+            if (!foreground) snapshotFlow { foreground }.first { it }
             // 两阶段防混暴露 + 降级：
             //  阶段 1（蓝牙搭线）：只滚 f=2（对方读到即回连，不出示任何数据帧）；
             //  阶段 2（身份交换）：本端握手完成（SAS 在手 = 蓝牙链路建立）后只滚
@@ -299,13 +331,23 @@ fun ShowMyCodeScreen(onBack: () -> Unit) {
     ) {
         SubPageTopBar(title = stringResource(R.string.add_friend_role_show), onBack = onBack)
         IdentityResetNotice()
-        if (myPayload == null) {
+        if (identityFailed) {
             // 身份不可用（Keystore/native 异常）：明确降级提示，不出码也不登记配对
             Text(
                 stringResource(R.string.identity_unavailable),
                 color = MaterialTheme.colorScheme.error,
                 style = MaterialTheme.typography.bodyMedium,
                 modifier = Modifier.padding(vertical = 24.dp).testTag("identity_unavailable"),
+            )
+            return@Column
+        }
+        if (myPayload == null) {
+            // K2-5：会话/载荷在 IO 线程构建中——主线程只显示加载态（不复用
+            // identity_unavailable 失败态，避免加载期闪现误导性错误文案）
+            Text(
+                stringResource(R.string.identity_loading),
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.padding(vertical = 24.dp).testTag("identity_loading"),
             )
             return@Column
         }
@@ -430,7 +472,7 @@ fun ScanToAddScreen(onBack: () -> Unit) {
                     session == null -> 0
                     else -> try {
                         session.processBundle(p.name, p.bundle)
-                        BleMesh.startPairingAsJoiner(p.name, p.identity, p.token, p.bucket, p.ble, p.naddr)
+                        BleMesh.startPairingAsJoiner(p.name, p.identity, p.token, p.bucket, p.ble, p.naddr, p.expiresAtMs)
                         1
                     } catch (_: DcException.RemoteIdentityChanged) {
                         2
@@ -459,9 +501,17 @@ fun ScanToAddScreen(onBack: () -> Unit) {
         onDispose { if (dial != null) BleMesh.stopPairingAsJoiner() }
     }
     // 真 SAS：绑定双方长期身份公钥 + 双方地址名，两端各算一端、结果一致
-    // （快连路径的 SAS 由 BleMesh 在 QR_ID 到达时算好，随 pairSnap 下发）
-    val sas = remember(peerPayload, established) {
-        peerPayload?.takeIf { established == 1 }?.let { p ->
+    // （快连路径的 SAS 由 BleMesh 在 QR_ID 到达时算好，随 pairSnap 下发）。
+    // K2-11：sasWith 是 native 调用，旧码 remember{} 里同步跑在主线程——挪 IO 协程，
+    // 计算期间 UI 显示「……」占位（与既有空态占位一致），确认按钮保持禁用
+    var sas by remember { mutableStateOf<chat.dc.core.SasCode?>(null) }
+    LaunchedEffect(peerPayload, established) {
+        val p = peerPayload
+        if (p == null || established != 1) {
+            sas = null
+            return@LaunchedEffect
+        }
+        sas = withContext(Dispatchers.IO) {
             runCatching {
                 SignalCore.session(context).sasWith(SignalCore.deviceName(context), p.name, p.identity)
             }.getOrNull()

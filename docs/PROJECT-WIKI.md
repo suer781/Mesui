@@ -27,6 +27,8 @@
 | `nodekey.rs` | 节点密钥轮换公告：长期钥签名、单调 serial、7 天过渡窗、30 天有效期上限、按 serial 取钥匙、单身份公告数上限、state()/restore() 持久化接口（未接传输） | 常开 |
 | `mailbox.rs` | 信箱桶门禁：256 位随机桶地址、keyed-BLAKE3 MAC（绑定信封全部字段）、±5min 重放窗、msg_id 过期台账（满 fail-closed）、verify_inbound 强制「先验签后去重」顺序 | 常开 |
 | `queue.rs` | SQLCipher 整库加密的待发队列 + 收件去重；重试调度；u64→i64 钳制 | `db` |
+| `maildrop.rs` | 信箱节点服务（SP-1 v9.2）：MailboxManager 按 SP-1 顺序执行「MAC→窗口→nonce 去重→限速→入库」；per-pair 分区 NonceCache + per-pair 限速（≤30 写/分/对）；pair_key 派生 | `db` |
+| `delivery.rs` | DeliveryManager：把 queue.rs 接到实际发送回调（SendFn）；tick 驱动重试/退避（catch_unwind 包裹回调）；cleanup（prune_seen 7 天 + prune_dead 30 天）；revive 复活死信 | `db` |
 | `contacts.rs` | 联系人 + 聊天记录落库（identity 33 字节契约、link_secret、node_id/node_naddr 跨网快照列）；与 Signal store 同库双连接（busy_timeout 串行） | `db` |
 | `relay.rs` | 陌生人人群转发票：握手挑战绑定 + 指纹缓存（活条目永不驱逐、满 fail-closed）+ TTL ≤2h 强制 | 常开 |
 | `adaptive.rs` | 负载三档引擎（轻/中/重）：升档即时可跳级、降档逐级防抖；NaN 指标 fail-closed | 常开 |

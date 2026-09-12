@@ -4,12 +4,24 @@
 //! 二维码携带的「节点地址快照」（本端直连 IP 列表 + 可选自建中继 URL），联系人
 //! 表落盘该快照；发消息按快照建连（同 WiFi/热点直连命中，配了自建中继则可跨网）。
 //!
-//! 信道协议：一条消息 = 一个双向 QUIC 流，发送方写满后 finish，接收方读
-//! `read_to_end` 交上层并回 1 字节 ACK——send 返回即「对端应用层已收」。
-//! 载荷语义（msg_type+密文）与 BLE Wire.MSG 体一致，由 FFI 上层（Kotlin）
-//! 统一解密落库，本模块只管不透明字节管道。
+//! 信道协议：一条消息 = 一个双向 QUIC 流，发送方写满后 finish，接收方交上层
+//! 后回 **ACK 帧**——send 返回即「对端应用层已受理」。载荷语义（msg_type+密文）
+//! 与 BLE Wire.MSG 体一致，由 FFI 上层（Kotlin）统一解密落库，本模块只管不透明
+//! 字节管道。
+//!
+//! 红队 R2-2 修复（假投递回执）：ACK 必须真实代表「应用层受理」——此前接收循环
+//! 在 on_message 回调返回后立刻回 ACK，而回调只是把载荷转交上层；Kotlin 侧异步
+//! 解密失败/联系人反查失败静默 return，发送侧却记「已送达」→ 消息永久丢失
+//! （at-least-once 退化成 at-most-once）。现协议：
+//! - 接收端为本条消息生成 8 字节回执句柄（ack id），应用层判定 =
+//!   [`NodeSink::on_message`] 返回值：`Some(true)` = 受理（ACK）、`Some(false)` =
+//!   拒收（NAK）、`None` = 异步判定——稍后经 [`Node::ack`] 回执；
+//! - ACK 帧 = 1 字节判定 + 8 字节 ack id 回显；应用层**5 秒**未回执按 NAK；
+//! - 发送方收到 NAK / 短帧 / 超时一律 Err → 上层（DeliveryManager）走
+//!   fail_and_reschedule 重试，不再出现假「已送达」。
 
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr, endpoint::presets};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,22 +32,41 @@ pub const ALPN: &[u8] = b"dc-chat/msg/1";
 pub const MAX_MSG_LEN: usize = 256 * 1024;
 /// 建连兜底超时（send 的 timeout_ms 另行约束读写）。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// ACK 字节数（0x01 = 应用层已收）。
-const ACK: u8 = 0x01;
+/// ACK 帧判定字节：0x01 = 应用层受理；0x00 = NAK（拒收/超时/解密失败）。
+const ACK_OK: u8 = 0x01;
+const ACK_NAK: u8 = 0x00;
+/// ACK 帧 = 1 字节判定 + 8 字节回执句柄（红队 R2-2：显式 ACK 帧，非裸字节）。
+const ACK_ID_LEN: usize = 8;
+const ACK_FRAME_LEN: usize = 1 + ACK_ID_LEN;
+/// 应用层异步回执等待窗：超时按 NAK（发送方走重试，宁重投不假送达）。
+const APP_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 上层接收回调（FFI 侧适配 UniFFI callback interface）。
 pub trait NodeSink: Send + Sync {
-    /// 收到一条消息。from_node_id_hex 为对端节点 id（64 位小写 hex）。
-    fn on_message(&self, from_node_id_hex: String, payload: Vec<u8>);
+    /// 收到一条消息。from_node_id_hex 为对端节点 id（64 位小写 hex）；
+    /// ack_hex 为本条消息的回执句柄（16 hex 字符）——`None` 返回时须在
+    /// [`Node::ack`] 超时窗内回执。
+    ///
+    /// 返回值 = 应用层受理判定（红队 R2-2）：
+    /// - `Some(true)`：已受理（解密成功并投递/落库）→ 回 ACK；
+    /// - `Some(false)`：拒收（解密失败/联系人反查失败）→ 回 NAK；
+    /// - `None`：异步判定——处理后经 [`Node::ack(ack_hex, ok)`] 回执，
+    ///   5 秒未回执按 NAK 处理。
+    fn on_message(&self, from_node_id_hex: String, ack_hex: String, payload: Vec<u8>) -> Option<bool>;
     /// 端点就绪（绑定完成，地址快照可用）。进程生命周期内一次。
     fn on_ready(&self, node_id_hex: String, naddr: String);
 }
+
+/// 应用层异步回执登记表：ack id → 完成信号（Node ↔ 接收任务共享）。
+type PendingAcks = Arc<Mutex<HashMap<[u8; ACK_ID_LEN], tokio::sync::oneshot::Sender<bool>>>>;
 
 /// 常驻节点。内部持有独立 tokio runtime（FFI 宿主线程非 async 上下文）。
 pub struct Node {
     rt: tokio::runtime::Runtime,
     ep: Endpoint,
     accept_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// 应用层异步回执登记表（红队 R2-2）。
+    pending_acks: PendingAcks,
 }
 
 impl Node {
@@ -71,12 +102,15 @@ impl Node {
 
         cb.on_ready(hex(ep.id().as_bytes()), naddr_string(&ep, false));
 
-        // 接收循环：accept → 每连接一个任务 → 每流一条消息 → 回 ACK
+        // 接收循环：accept → 每连接一个任务 → 每流一条消息 → 应用层判定 → ACK/NAK
         let cb = cb.clone();
         let ep2 = ep.clone();
+        let pending: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+        let pending_task = pending.clone();
         let accept_task = rt.spawn(async move {
             while let Some(incoming) = ep2.accept().await {
                 let cb = cb.clone();
+                let pending = pending_task.clone();
                 tokio::spawn(async move {
                     let conn = match incoming.accept() {
                         Ok(accepting) => match accepting.await {
@@ -95,9 +129,34 @@ impl Node {
                             Ok(bytes) => bytes,
                             Err(_) => return,
                         };
-                        cb.on_message(remote.clone(), payload);
-                        // 应用层已收：回 ACK（忽略写失败，连接即将关闭）
-                        let _ = send.write_all(&[ACK]).await;
+                        // 红队 R2-2：本条消息的回执句柄 + 应用层受理判定。
+                        // 无句柄（解析失败/空载荷）直接断流：发送方 ack 超时失败重试。
+                        let mut ack_id = [0u8; ACK_ID_LEN];
+                        if getrandom::fill(&mut ack_id).is_err() {
+                            return;
+                        }
+                        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+                        pending.lock().expect("pending acks poisoned").insert(ack_id, tx);
+                        let decision = cb.on_message(remote.clone(), hex(&ack_id), payload);
+                        let verdict = match decision {
+                            Some(ok) => {
+                                pending.lock().expect("pending acks poisoned").remove(&ack_id);
+                                ok
+                            }
+                            // 异步判定：应用层在超时窗内经 Node::ack 回执，过期按 NAK
+                            None => match tokio::time::timeout(APP_ACK_TIMEOUT, rx).await {
+                                Ok(Ok(ok)) => ok,
+                                _ => {
+                                    pending.lock().expect("pending acks poisoned").remove(&ack_id);
+                                    false // 超时/回调丢失 = NAK：宁重投不假送达
+                                }
+                            },
+                        };
+                        // ACK 帧 = 1 字节判定 + 8 字节句柄回显（忽略写失败，连接即将关闭）
+                        let mut reply = [0u8; ACK_FRAME_LEN];
+                        reply[0] = if verdict { ACK_OK } else { ACK_NAK };
+                        reply[1..].copy_from_slice(&ack_id);
+                        let _ = send.write_all(&reply).await;
                         let _ = send.finish();
                     }
                 });
@@ -108,7 +167,19 @@ impl Node {
             rt,
             ep,
             accept_task: Mutex::new(Some(accept_task)),
+            pending_acks: pending,
         })
+    }
+
+    /// 应用层异步回执（红队 R2-2）：`ack_hex` 为 on_message 回调携带的
+    /// 16 hex 字符句柄。`true` = 解密成功并投递（ACK）；`false` = 失败（NAK）。
+    /// 句柄无效或已超时回执为 no-op（接收任务侧已按 NAK 处理）。
+    pub fn ack(&self, ack_hex: &str, ok: bool) {
+        let Some(bytes) = unhex(ack_hex) else { return };
+        let Ok(id) = <[u8; ACK_ID_LEN]>::try_from(bytes.as_slice()) else { return };
+        if let Some(tx) = self.pending_acks.lock().expect("pending acks poisoned").remove(&id) {
+            let _ = tx.send(ok);
+        }
     }
 
     /// 本端节点 id（64 位小写 hex）。
@@ -151,13 +222,18 @@ impl Node {
                 .map_err(|e| crate::CoreError::Io(format!("write: {e}")))?;
             send.finish()
                 .map_err(|e| crate::CoreError::Io(format!("finish: {e}")))?;
-            // 等 ACK = 对端应用层已收
-            let ack = tokio::time::timeout(Duration::from_millis(timeout_ms), recv.read_to_end(1))
+            // 等 ACK 帧（红队 R2-2）：1 字节判定 + 8 字节句柄回显。
+            // NAK / 短帧 / 超时一律 Err → 上层走 fail_and_reschedule 重试，
+            // 「已送达」只可能来自对端应用层的真实受理。
+            let ack = tokio::time::timeout(Duration::from_millis(timeout_ms), recv.read_to_end(ACK_FRAME_LEN))
                 .await
                 .map_err(|_| crate::CoreError::Io("ack timeout".into()))?
                 .map_err(|e| crate::CoreError::Io(format!("ack read: {e}")))?;
-            if ack != [ACK] {
+            if ack.len() != ACK_FRAME_LEN {
                 return Err(crate::CoreError::Io("ack missing".into()));
+            }
+            if ack[0] != ACK_OK {
+                return Err(crate::CoreError::Io("receiver rejected payload (nak)".into()));
             }
             Ok(())
         })
@@ -359,8 +435,9 @@ mod tests {
 
     struct Sink(mpsc::Sender<(String, Vec<u8>)>);
     impl NodeSink for Sink {
-        fn on_message(&self, from: String, payload: Vec<u8>) {
+        fn on_message(&self, from: String, _ack: String, payload: Vec<u8>) -> Option<bool> {
             let _ = self.0.send((from, payload));
+            Some(true)
         }
         fn on_ready(&self, _: String, _: String) {}
     }
@@ -454,5 +531,74 @@ mod tests {
     fn drop_without_stop_is_safe() {
         let (tx, _rx) = std::sync::mpsc::channel::<(String, Vec<u8>)>();
         let _n = Node::start("", &seed(4), Arc::new(Sink(tx))).unwrap();
+    }
+
+    // ══════════ 红队 R2-2 回归：ACK = 应用层受理判定 ══════════
+
+    /// 应用层拒收（Some(false)）→ NAK → send 必须 Err（不再假投递回执）。
+    #[test]
+    fn sink_rejection_naks_and_send_fails() {
+        struct RejectSink;
+        impl NodeSink for RejectSink {
+            fn on_message(&self, _: String, _: String, _: Vec<u8>) -> Option<bool> {
+                Some(false) // 等价于联系人反查失败/解密失败路径
+            }
+            fn on_ready(&self, _: String, _: String) {}
+        }
+        let (tx, _rx) = mpsc::channel();
+        let a = Node::start("", &seed(8), Arc::new(Sink(tx))).unwrap();
+        let b = Node::start("", &seed(9), Arc::new(RejectSink)).unwrap();
+        let naddr_b = naddr_string(&b.ep, true);
+        let err = a
+            .send(&naddr_b, b"rejected-payload", 15_000)
+            .expect_err("GREEN: 应用层拒收必须让 send 失败（NAK）");
+        assert!(err.to_string().contains("nak"), "实际: {err}");
+        a.stop();
+        b.stop();
+    }
+
+    /// 异步判定（None）+ Node::ack(true) → send Ok；ack(false) → send Err；
+    /// 非法/未知句柄回执是 no-op。
+    #[test]
+    fn deferred_ack_completes_or_naks_send() {
+        struct DeferredSink(mpsc::Sender<String>);
+        impl NodeSink for DeferredSink {
+            fn on_message(&self, _: String, ack: String, _: Vec<u8>) -> Option<bool> {
+                let _ = self.0.send(ack);
+                None // Kotlin 异步路径：稍后经 Node::ack 回执
+            }
+            fn on_ready(&self, _: String, _: String) {}
+        }
+        let (ata, _atr) = mpsc::channel();
+        let (btx, brx) = mpsc::channel::<String>();
+        let a = Node::start("", &seed(10), Arc::new(Sink(ata))).unwrap();
+        let b = Arc::new(Node::start("", &seed(11), Arc::new(DeferredSink(btx))).unwrap());
+        let naddr_b = naddr_string(&b.ep, true);
+
+        // 后台回执线程：第 1 条 ACK(true)，第 2 条 NAK(false)。
+        // 接收窗 30s > 首连的 ep.online() 建连等待（本机实测 ~10s+）：
+        // 接收端的 5s 回执窗从 on_message 起算——句柄一送达即刻回执，
+        // 必然落在窗内。
+        let acker_b = b.clone();
+        let acker = std::thread::spawn(move || {
+            let ack1 = brx.recv_timeout(Duration::from_secs(30)).expect("ack handle 1");
+            acker_b.ack(&ack1, true);
+            let ack2 = brx.recv_timeout(Duration::from_secs(30)).expect("ack handle 2");
+            acker_b.ack(&ack2, false);
+        });
+
+        a.send(&naddr_b, b"deferred-accept", 15_000)
+            .expect("GREEN: 异步受理回执后 send 必须成功");
+        let err = a
+            .send(&naddr_b, b"deferred-reject", 15_000)
+            .expect_err("GREEN: 异步失败回执（NAK）必须让 send 失败");
+        assert!(err.to_string().contains("nak"), "实际: {err}");
+        acker.join().unwrap();
+
+        // 非法/未知句柄：no-op（不 panic、无副作用）
+        b.ack("00", true);
+        b.ack(&"ab".repeat(8), true);
+        a.stop();
+        b.stop();
     }
 }

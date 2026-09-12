@@ -224,3 +224,40 @@ C1/C3 这两个 P0/P1，盲审一次命中。
 
 **做得好（子 Agent 确认）**：verify_strict、指纹域分隔、MAX_FRAME_SIZE 先检后缓冲、
 full-jitter 退避、DB 损坏行报错、时钟残余风险的诚实注释。
+
+---
+
+# 第九轮：红队二轮（BLE/QR/iroh/投递链，2026-09-13）
+
+> 应用户「后端也要找」要求，红队 Agent 从全新角度攻击传输链与投递链。
+> 产出 crates/core/tests/redteam2.rs（12 测试：7 RED + 5 GREEN）。
+
+| 编号 | 严重度 | 发现 | 处置 |
+|---|---|---|---|
+| R2-1 | P1 | QR_OFFER 明文帧无认证灌 TOFU 信任表，抢注真名 → 真人扫码永久 IdentityChanged | ✅ 同名 30s 限频（BleMesh.kt）+ upsert_identity_confirmed 覆盖保护（signal_store.rs） |
+| R2-2 | P1 | iroh sink 丢弃消息但 send 返回 Ok → mark_sent → 消息永久丢失（假投递回执） | ✅ ACK 协议重做：sink 判定 Option<bool> + 9 字节判定帧 + Node::ack + 5s 超时按 NAK，仅 Ok(true) 才 mark_sent |
+| R2-3 | P1 | 信箱重放台账（NonceCache）无持久化，进程重启 ±5min 窗内重放复活 | ✅ export/import_state + FFI export_ledger/import_ledger（JSON 落盘）。**当前 Android 壳 MailboxManager 尚无宿主接线 → 实际暴露面为零；接线时须同步接持久化循环（遗留登记）** |
+| R2-4 | P2 | 读桶 nonce 台账全局 FIFO 无限速，洪泛挤掉他桶未过期 nonce（读侧重放复活） | ✅ ReadLedger 按桶对分区（pair_key 指纹为键）+ 分区表 4096 硬顶，洪泛只占自己分区 |
+| R2-5 | P2 | outbox sent 行连密文永不清理；revive 无 state 守卫可复活已送达消息 | ✅ revive 守卫进 SQL WHERE 同语句（AND state='dead'，无 TOCTOU）+ prune_sent 7 天接入 delivery::cleanup |
+| R2-6 | P2 | inbox_seen 台账无容量上限（与 NonceCache 防御强度不一致） | ✅ INBOX_SEEN_CAP=16384，满员先补裁剪窗外记录，仍满 fail-closed 拒收不驱逐 |
+| R2-7 | P2 | 首条握手 token-MAC 无一次性/无上下文绑定，拍下载荷=永久握手能力 | ✅ 域分隔 v2：长度前缀 name + expiry 大端进 MAC 输入；过期先拒；无 v1 回退门 |
+
+**独立验证官裁决（2026-09-13，新开 Agent、不带修复者结论）**：8/8 修复项真实、完整、
+无绕过、无回归；208 测试通过（lib 156 / redteam2 12 / redteam 20 / adversarial 18 /
+bruteforce 1 / iroh_pair 1）、clippy 0 错误。**通过**。
+
+验证官附带 P3 登记（均不重开攻击路径）：
+- P3-1 ~~文档状态未回写~~（本节即回写）
+- P3-2 QR_OFFER 限频键用 32 位 contentHashCode，可构造碰撞换包；伤害被 Rust 覆盖保护封顶，残余仅为 PQXDH 算力消耗
+- P3-3 不同假名仍可按名累积信任行（TOFU 首次信任的设计取舍，测试注释明示）
+- P3-4 NonceCache::import_state 不重验 expiry（本地可信写入者可达，方向 fail-closed）
+- P3-5 node.rs on_message panic 时 pending 表项泄漏（方向安全：发送方超时重试）
+- P3-6 本地 dc_core.kt 为陈旧生成物（git-ignored，CI 构建前重生成）；本地构建需先 uniffi-bindgen
+- 遗留登记：upsert_identity_confirmed 的用户确认恢复通道未暴露 FFI（同 R2-3「核心就绪、宿主待接线」）
+- 越界观察：BleMesh.sendText BLE 分支 GATT 写成功即记「已发送」无应用层 ACK = 已知 A4 待办（非本批回归）
+
+**Kotlin 侧独立二轮审查（同日）**：1 P0 + 2 P1 + 4 P2 + 7 P3，共 14 项，
+已登记 .project-memory/MEMORY.md（K2-1~K2-14），修复 Agent 进行中。
+
+最狠两条：K2-1（AUTH_CAND 解析无上界 → 未认证远程崩溃于 GATT binder 线程）、
+K2-2（joiner 配对完成后 MSG 静默丢弃 → 单向聊天失效）。

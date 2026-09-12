@@ -30,6 +30,8 @@
 | contacts.rs | 联系人/消息落库 | identity 接受 33 字节（32 保留兼容），bucket/link_secret 固定 32；node_id/node_naddr 为跨网快照列（旧库自动迁移） |
 | node.rs | iroh endpoint + NodeSink 回调 | presets::Minimal（零 n0 依赖）；一消息一流 + 1 字节 ACK；dc://node 快照编解码；无并发流上限 = 已知 P1-3 |
 | queue.rs | 加密队列+重试调度 | 已实现但**未接入 Android 发送路径**（已知待办，勿重复报） |
+| maildrop.rs | 信箱节点服务 SP-1 v9.2 | MailboxManager 按「MAC→窗口→nonce 去重→限速→入库」强制顺序；per-pair 分区 NonceCache + ≤30 写/分/对限速 |
+| delivery.rs | DeliveryManager 投递管理 | 把 queue.rs 接到实际发送回调；tick 重试/退避（catch_unwind）；cleanup（seen 7 天/死信 30 天）；revive 复活死信 |
 | retry.rs | 指数退避+全抖动（纯计算） | 驱动方为通道状态机（未接） |
 | settings.rs | serde JSON 设置模型 | 含 strict_crypto（默认开）、NodeServiceCfg.scope 三档等；UI 仅部分接入 |
 | ffi.rs | UniFFI 导出 | SignalSession/ContactStore/IrohNode/NodeCallback/DcError(RemoteIdentityChanged 单独成类)/first_message_mac 等；`smoke_test_all_modules` 是防链接器裁剪的探针，**不是功能** |

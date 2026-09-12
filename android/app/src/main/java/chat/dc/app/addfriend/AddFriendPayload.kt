@@ -23,6 +23,9 @@ private val B64URL_RE = Regex("[A-Za-z0-9_-]+")
  * - [ble] BLE 匹配 id：与 BLE 广播携带同一 id，扫码方据此定位设备（阶段 3）
  * - [naddr] 出示方 iroh 节点地址快照（dc://node?v=1&…，跨网络直连入口；
  *   节点未就绪时省略——parse 侧可选，旧版载荷缺省为空串）
+ * - [expiresAtMs] token 时效界（epoch ms，红队 R2-7）：进首条消息 token-MAC
+ *   的输入并受验方过期检查——完整拍摄的载荷只在窗口内、只对本次配对会话
+ *   有效，不再是「永久握手能力」。旧版载荷缺省 0（验方 fail-closed 拒绝）。
  *
  * 身份↔节点密钥的绑定只在双方 Signal 会话内生效；token 单次有效。
  */
@@ -34,6 +37,7 @@ data class AddFriendPayload(
     val token: ByteArray,
     val ble: ByteArray,
     val naddr: String = "",
+    val expiresAtMs: Long = 0,
 ) {
     init {
         // 编码进 URI 前先断言，防止非法名破坏 dc://add 解析
@@ -48,9 +52,11 @@ data class AddFriendPayload(
 
     fun encode(): String {
         val b64 = { bytes: ByteArray -> java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes) }
-        return "dc://add?v=2&name=$name&id=${b64(identity)}&bundle=${b64(bundle)}" +
-            "&bucket=${b64(bucket)}&token=${b64(token)}&ble=${b64(ble)}" +
-            if (naddr.isEmpty()) "" else "&naddr=${b64(naddr.toByteArray(Charsets.UTF_8))}"
+        var uri = "dc://add?v=2&name=$name&id=${b64(identity)}&bundle=${b64(bundle)}" +
+            "&bucket=${b64(bucket)}&token=${b64(token)}&ble=${b64(ble)}"
+        if (naddr.isNotEmpty()) uri += "&naddr=${b64(naddr.toByteArray(Charsets.UTF_8))}"
+        if (expiresAtMs > 0) uri += "&exp=$expiresAtMs"
+        return uri
     }
 
     companion object {
@@ -75,7 +81,9 @@ data class AddFriendPayload(
             val ble = b64(params["ble"]) ?: return null
             // 可选：iroh 节点地址快照（文本字段经 b64 穿越 URI）
             val naddr = b64(params["naddr"])?.toString(Charsets.UTF_8) ?: ""
-            return runCatching { AddFriendPayload(name, id, bundle, bucket, token, ble, naddr) }.getOrNull()
+            // 可选：token 时效界（红队 R2-7；旧版载荷缺省 0 = 验方 fail-closed 拒绝）
+            val expiresAtMs = params["exp"]?.toLongOrNull() ?: 0L
+            return runCatching { AddFriendPayload(name, id, bundle, bucket, token, ble, naddr, expiresAtMs) }.getOrNull()
         }
     }
 }
@@ -219,6 +227,12 @@ object FrameCodec {
     // 全部数据帧 ~2s 一轮，配合 3 秒时长门槛，正常 3-4 秒集齐。
     // 单帧 QR 约 400 字符（版本 13），纠错 L 换取更快解码，可扫。
     const val CHUNK_SIZE = 256
+
+    /** 总帧数上限（K2-3）：帧解析直接拒绝 n 超限的会话——恶意二维码可声明
+     *  百万级 n 锁定采集端会话（首帧先到先锁），令 snapshot 每 200ms 构建全量
+     *  missing 列表、tryRecover 遍历全部 FEC 组、chunks 无界增长 → ANR/OOM。
+     *  真实载荷 ~2.6KB / [CHUNK_SIZE]=256 ≈ 11 帧，64 留有约 6 倍余量。 */
+    const val MAX_TOTAL = 64
 
     /** 一帧解析结果（结构 + 校验字段；[crc] 是否有效由 [crcOf] 复核）。
      *  [nonce] 帧内随机盐（无 x 段 = 旧式帧，空串）；[parity] = f=3 奇偶帧
@@ -449,7 +463,9 @@ object FrameCodec {
         val sid = p["s"]?.takeIf { it.length == SID_LEN } ?: return null
         val i = p["i"]?.toIntOrNull() ?: return null
         val n = p["n"]?.toIntOrNull() ?: return null
-        if (n <= 0 || i < 0 || i >= n) return null
+        // K2-3：n 上限钳制（见 [MAX_TOTAL]）——恶意大 n 会话在解析层即拒收，
+        // 永远无法锁定采集端；i 越界同样拒绝
+        if (n <= 0 || n > MAX_TOTAL || i < 0 || i >= n) return null
         val f = p["f"] ?: return null
         if (f != "0" && f != "1" && f != "3") return null
         // 帧级校验字段必须在场：旧 v1 无 c 帧、缺 c 帧一律拒收
@@ -602,6 +618,12 @@ class FrameCollector(
         }
         if (f.sid != sid || f.total != total) {
             rejectedCount++ // 异会话帧
+            return snapshot(nowMs)
+        }
+        // K2-3 防御纵深：chunks 容量上限（total 已被 parse 钳 ≤ MAX_TOTAL，
+        // 正常流不会触达；兜底防后续改动引入无界增长）——超限帧计拒绝、不入库
+        if (f.index !in chunks && chunks.size >= FrameCodec.MAX_TOTAL) {
+            rejectedCount++
             return snapshot(nowMs)
         }
         chunks[f.index] = f.data

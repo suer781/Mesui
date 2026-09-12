@@ -9,6 +9,14 @@ pub struct Db {
     conn: Connection,
 }
 
+/// 收件去重台账硬上限（红队 R2-6 修复）。与 mailbox::NonceCache 的硬顶
+/// 同语义：洪泛只换来 fail-closed 拒收，不驱逐未过期的去重状态。
+pub const INBOX_SEEN_CAP: u32 = 16384;
+
+/// 去重台账保留窗（7 天，与 delivery::SEEN_RETENTION_MS 同值）。
+/// 红线：必须 ≥ 最大消息投递延迟，否则旧消息可能被二次接受。
+const SEEN_RETENTION_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS outbox (
     msg_id BLOB PRIMARY KEY,
@@ -266,10 +274,15 @@ impl Db {
     }
 
     /// 重新入队死信（用户手动「再试一次」时）。
+    /// 红队 R2-5 修复：加 state='dead' 守卫——**只有死信可复活**。此前对任意
+    /// msg_id 生效：把已送达（sent）行的 id 传进来（死信 UI id 混用 / 上层 bug /
+    /// 未来批处理）会把已送达消息复活成 pending → 二次投递。守卫后非 dead 行
+    /// 一律 no-op。
     pub fn revive(&self, msg_id: &MsgId) -> Result<()> {
         self.conn
             .execute(
-                "UPDATE outbox SET state='pending', attempts=0, next_attempt_ms=0 WHERE msg_id=?1",
+                "UPDATE outbox SET state='pending', attempts=0, next_attempt_ms=0
+                 WHERE msg_id=?1 AND state='dead'",
                 params![msg_id.as_slice()],
             )
             .map_err(|e| CoreError::Db(e.to_string()))?;
@@ -312,7 +325,33 @@ impl Db {
     /// 收件去重：返回 true = 首次见到（应投递），false = 重复（静默丢弃）。
     /// now_ms 钳制进 i64 正数域——u64::MAX 入库会变 -1，
     /// 随后的 prune_seen(0) 立即删除该记录，构成「重放复活」链。
+    ///
+    /// 红队 R2-6 修复：台账硬上限 [`INBOX_SEEN_CAP`]。msg_id 是线上攻击者
+    /// 自选字段（信封外层明文），无上限 = 任何能投递信封的路径灌 N 条异
+    /// msg_id 即 N 行持久化记录、7 天保留窗内只增不减（磁盘版洪泛）。
+    /// 语义与 mailbox::NonceCache 对齐：满员先补裁剪窗外记录（保留窗 = 7 天，
+    /// 必须 ≥ 最大投递延迟），仍满则拒收新记录（fail-closed）——洪泛只换来
+    /// 拒收，绝不驱逐未过期的去重状态（重放防线完整）。
     pub fn record_seen(&self, msg_id: &MsgId, now_ms: u64) -> Result<bool> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM inbox_seen", [], |r| r.get(0))
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        if count >= INBOX_SEEN_CAP as i64 {
+            // 补裁剪：窗外记录（seen_ms < now-7天）本就该被例行清理清掉，
+            // 这里在容量压力下提前触发（prune_seen 只按时间不按容量）
+            let cutoff = Self::clamp_ms(now_ms.saturating_sub(SEEN_RETENTION_WINDOW_MS));
+            self.conn
+                .execute("DELETE FROM inbox_seen WHERE seen_ms < ?1", params![cutoff])
+                .map_err(|e| CoreError::Db(e.to_string()))?;
+            let left: i64 = self
+                .conn
+                .query_row("SELECT COUNT(*) FROM inbox_seen", [], |r| r.get(0))
+                .map_err(|e| CoreError::Db(e.to_string()))?;
+            if left >= INBOX_SEEN_CAP as i64 {
+                return Ok(false); // fail-closed：满员拒新，不驱逐窗内去重状态
+            }
+        }
         let n = self
             .conn
             .execute(
@@ -345,6 +384,28 @@ impl Db {
             )
             .map_err(|e| CoreError::Db(e.to_string()))?;
         // 红队 P2 修复：同步清理对应的 outbox_env 存档（防孤儿行）
+        self.conn
+            .execute(
+                "DELETE FROM outbox_env WHERE msg_id NOT IN (SELECT msg_id FROM outbox)",
+                [],
+            )
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        Ok(n)
+    }
+
+    /// 清理已发送行（红队 R2-5 修复：sent 行连密文此前永久堆积——存储无界
+    /// 增长）。仅删 state='sent' 且创建时间早于 cutoff 的行（死信不受影响，
+    /// 其清理走 prune_dead 的 30 天窗）；outbox_env 孤儿同步清理。
+    /// cutoff 由调用方按保留窗计算（delivery::SENT_RETENTION_MS = 7 天，
+    /// 给「已送达」的 UI 状态留展示期）。
+    pub fn prune_sent(&self, created_before_ms: u64) -> Result<usize> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM outbox WHERE state='sent' AND created_ms < ?1",
+                params![Self::clamp_ms(created_before_ms)],
+            )
+            .map_err(|e| CoreError::Db(e.to_string()))?;
         self.conn
             .execute(
                 "DELETE FROM outbox_env WHERE msg_id NOT IN (SELECT msg_id FROM outbox)",

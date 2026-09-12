@@ -97,17 +97,25 @@ object IrohNodeManager {
         scope.launch {
             try {
                 val callback = object : NodeCallback {
-                    override fun onMessage(fromNodeIdHex: String, payload: ByteArray) {
+                    override fun onMessage(fromNodeIdHex: String, ackHex: String, payload: ByteArray) {
                         // 世代守卫：本回调属于某一代启动，stop() 换代后到达的消息不再投递
                         if (gen != startGen) return
                         // 本回调运行在 iroh 的 tokio worker 线程（node.rs 仅 2 个 worker）：
                         // 同步做 SQLite 全表反查 + 解密会拖垮端点调度（心跳/建连），
                         // 故投递到 IO 线程执行，绝不阻塞 iroh 线程（缺陷 B）。
+                        //
+                        // 红队 R2-2 修复（假投递回执）：Rust 侧不再在回调返回后自动
+                        // ACK——处理完成后必须经 IrohNode.ack 显式回执：解密成功并
+                        // 落库 = ACK(true)；联系人反查失败/解密失败/落库失败 =
+                        // NAK(false)；5 秒未回执接收端按 NAK。发送方因此走重试，
+                        // 「已送达」不再可能来自假回执（消息不再永久丢失）。
                         scope.launch {
                             if (gen != startGen) return@launch
                             val ctx = appContext ?: return@launch
-                            val name = resolveNameByNodeId(ctx, fromNodeIdHex) ?: return@launch
-                            BleMesh.deliverRemote(name, payload)
+                            val ok = resolveNameByNodeId(ctx, fromNodeIdHex)
+                                ?.let { BleMesh.deliverRemote(it, payload) } == true
+                            runCatching { node?.ack(ackHex, ok) }
+                                .onFailure { android.util.Log.w(TAG, "iroh 回执失败 ack=$ackHex", it) }
                         }
                     }
 

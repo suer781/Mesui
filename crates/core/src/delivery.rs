@@ -38,6 +38,11 @@ pub const SEEN_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// 死信保留窗：给用户 30 天时间在 UI 上手动 revive，过后由 cleanup 清除。
 pub const DEAD_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
+/// 已发送行保留窗（红队 R2-5 修复）：mark_sent 只改 state，行 + 密文此前
+/// 永久堆积（存储无界增长）。投递完成的行保留 7 天给 UI 展示期，
+/// 过后由 cleanup → queue::prune_sent 清除。
+pub const SENT_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
 /// 一拍投递的结果盘点（测试断言 + Kotlin UI 反馈）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TickReport {
@@ -57,6 +62,7 @@ pub struct TickReport {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CleanupReport {
     pub pruned_seen: u32,
+    pub pruned_sent: u32,
     pub pruned_dead: u32,
 }
 
@@ -167,12 +173,13 @@ impl DeliveryManager {
         Ok(report)
     }
 
-    /// 周期清理（低频，如每日一次）：过期去重台账 + 过期死信。
+    /// 周期清理（低频，如每日一次）：过期去重台账 + 过期已发送行 + 过期死信。
     pub fn cleanup(&self, now_ms: u64) -> Result<CleanupReport> {
         let db = self.db.lock().expect("db mutex poisoned");
         let pruned_seen = db.prune_seen(now_ms.saturating_sub(SEEN_RETENTION_MS))? as u32;
+        let pruned_sent = db.prune_sent(now_ms.saturating_sub(SENT_RETENTION_MS))? as u32;
         let pruned_dead = db.prune_dead(now_ms.saturating_sub(DEAD_RETENTION_MS))? as u32;
-        Ok(CleanupReport { pruned_seen, pruned_dead })
+        Ok(CleanupReport { pruned_seen, pruned_sent, pruned_dead })
     }
 }
 

@@ -303,23 +303,45 @@ pub fn sas_code(
 
 /// 首条握手消息的带外认证 MAC：用 QR 里的一次性 token + 桶地址派生 keyed-BLAKE3 密钥。
 /// 没当面扫到码（拿不到 token）的人无法为第一条 PreKeySignalMessage 造出合法 MAC。
-pub fn first_message_mac(token: &[u8], bucket: &[u8; 32], ciphertext: &[u8]) -> [u8; 32] {
+///
+/// 红队 R2-7 修复：MAC 输入绑定**对端会话上下文**——
+/// - `name`：本次配对的会话名（双方一致的地址名）。重放帧不能对任意配对会话复用；
+/// - `expiry_ms`：token 时效界（epoch ms，出示端生成载荷时给出，写入 QR 载荷）。
+///   此前 (token, bucket, ct, mac) 被完整拍摄（截屏/录像逐帧）= **永久握手能力**；
+///   绑定时效 + 会话名后，拍摄物只在窗口内、只对本次配对会话有效。
+pub fn first_message_mac(
+    token: &[u8],
+    bucket: &[u8; 32],
+    name: &str,
+    expiry_ms: u64,
+    ciphertext: &[u8],
+) -> [u8; 32] {
     let key = crate::mailbox::derive_mailbox_secret(token, bucket, 0);
     *blake3::Hasher::new_keyed(&key)
-        .update(b"dc-first-msg-v1")
+        .update(b"dc-first-msg-v2")
+        .update(&(name.len() as u64).to_be_bytes())
+        .update(name.as_bytes())
+        .update(&expiry_ms.to_be_bytes())
         .update(ciphertext)
         .finalize()
         .as_bytes()
 }
 
 /// 校验首条握手消息的 token-MAC（常量时间比较）。
+/// `now_ms > expiry_ms` 即拒（时效窗一次性语义，红队 R2-7）。
 pub fn verify_first_message_mac(
     token: &[u8],
     bucket: &[u8; 32],
+    name: &str,
+    expiry_ms: u64,
     ciphertext: &[u8],
     mac: &[u8; 32],
+    now_ms: u64,
 ) -> Result<()> {
-    let expected = first_message_mac(token, bucket, ciphertext);
+    if now_ms > expiry_ms {
+        return Err(CoreError::Crypto("first-message token mac expired".into()));
+    }
+    let expected = first_message_mac(token, bucket, name, expiry_ms, ciphertext);
     let diff = mac
         .iter()
         .zip(expected.iter())
@@ -535,21 +557,40 @@ mod tests {
         );
     }
 
-    /// 首条消息 token-MAC：正确 token 通过；错 token / 改密文均拒。
+    /// 首条消息 token-MAC：正确 token 通过；错 token / 改密文 / 换会话名 /
+    /// 过期（R2-7）均拒。
     #[test]
     fn first_message_token_mac() {
         let token = [7u8; 48];
         let bucket = [9u8; 32];
         let ct = b"prekey-signal-message-bytes";
-        let mac = first_message_mac(&token, &bucket, ct);
-        verify_first_message_mac(&token, &bucket, ct, &mac).unwrap();
+        let name = "bob-uuid";
+        let expiry = 10_000_000u64;
+        let mac = first_message_mac(&token, &bucket, name, expiry, ct);
+        verify_first_message_mac(&token, &bucket, name, expiry, ct, &mac, expiry - 1).unwrap();
+        verify_first_message_mac(&token, &bucket, name, expiry, ct, &mac, expiry).unwrap();
 
         let wrong_token = [8u8; 48];
-        assert!(verify_first_message_mac(&wrong_token, &bucket, ct, &mac).is_err());
+        assert!(verify_first_message_mac(&wrong_token, &bucket, name, expiry, ct, &mac, expiry).is_err());
 
         let mut tampered = ct.to_vec();
         tampered[0] ^= 1;
-        assert!(verify_first_message_mac(&token, &bucket, &tampered, &mac).is_err());
+        assert!(verify_first_message_mac(&token, &bucket, name, expiry, &tampered, &mac, expiry).is_err());
+
+        // 红队 R2-7 修复回归：上下文绑定 + 时效窗
+        // 过期即拒（拍摄物不是永久握手能力）
+        assert!(
+            verify_first_message_mac(&token, &bucket, name, expiry, ct, &mac, expiry + 1).is_err(),
+            "过期后必须拒绝"
+        );
+        // 换会话名验证必败（重放帧不能对任意配对会话复用）
+        assert!(
+            verify_first_message_mac(&token, &bucket, "mallory", expiry, ct, &mac, expiry).is_err(),
+            "MAC 必须绑定会话名"
+        );
+        // expiry/name 进 MAC 输入：同 token+ct 在不同上下文下 MAC 不同
+        assert_ne!(first_message_mac(&token, &bucket, name, expiry + 1, ct), mac);
+        assert_ne!(first_message_mac(&token, &bucket, "other", expiry, ct), mac);
     }
 
     /// 上线格式往返：bundle 序列化成字节再重建，仍能正常 process 并收发。
@@ -588,9 +629,12 @@ mod tests {
             .unwrap();
 
         // 3) Alice 发首条握手消息 + token-MAC；Bob 先验带外 MAC 再解密
+        //    （R2-7：MAC 绑定会话名 + 时效界，出示端生成载荷时给出 expiry）
         let (t1, ct1) = alice.encrypt(&bob_addr, b"handshake hello").unwrap();
-        let mac = first_message_mac(&token, &bucket, &ct1);
-        verify_first_message_mac(&token, &bucket, &ct1, &mac).unwrap();
+        let expiry = 9_000_000_000_000u64;
+        let mac = first_message_mac(&token, &bucket, "bob-uuid", expiry, &ct1);
+        verify_first_message_mac(&token, &bucket, "bob-uuid", expiry, &ct1, &mac, 8_000_000_000_000)
+            .unwrap();
         assert_eq!(bob.decrypt(&alice_addr, t1, &ct1).unwrap(), b"handshake hello");
 
         // 4) 双方各自算 SAS：必须一致（否则说明被中间人，用户比对 6 位短码即可发现）

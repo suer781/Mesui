@@ -420,7 +420,11 @@ class BleServer(private val context: Context) : BluetoothGattServerCallback() {
     override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
         if (newState == BluetoothProfile.STATE_CONNECTED) {
             val link = ServerLink(device)
-            links[device.address] = link
+            // K2-13：server 侧重连（同地址二次 CONNECTED，如对端断开重连）覆盖
+            // links[address] 前必须先关闭旧链路并回调 onClosed——旧 ServerLink 不
+            // drop 不回调会让发送泵/事件监听孤儿化（旧链路队列残留、上层永不清理）
+            val old = links.put(device.address, link)
+            old?.let { it.drop(); it.events?.onClosed() }
             onNewClient?.onClient(link)
         } else {
             links.remove(device.address)?.let { it.drop(); it.events?.onClosed() }

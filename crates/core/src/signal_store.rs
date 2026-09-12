@@ -144,6 +144,53 @@ impl SqlSignalStore {
             .map_err(|e| CoreError::Db(e.to_string()))?;
         Ok(u32::try_from(next).unwrap_or(1))
     }
+
+    /// 红队 R2-1 修复（TOFU pin 投毒）：同名身份的**覆盖保护**。
+    ///
+    /// QR_OFFER 是 token 门禁前的明文帧，攻击者可无认证抢先用真实联系人的
+    /// 名字 pin 上自己的钥（TOFU「无记录 = 信任」是设计）——此前真人扫码
+    /// 永久 IdentityChanged（重扫同样被拒）。本方法是唯一的恢复通道：
+    /// - 无记录：TOFU 首次信任，直接写入（设计不变；未认证 offer 的速率
+    ///   限制在 Kotlin 帧层 BleMesh.onJoinerQrOffer 执行）；
+    /// - 已有记录且同钥：幂等重写（无变化）；
+    /// - 已有记录且异钥：`user_confirmed = false` → 拒绝（返回
+    ///   [`CoreError::IdentityChanged`]，与协议路径同一错误类）——静默覆盖 /
+    ///   抢注固化 / 上层 bug 都改不动 pin；`user_confirmed = true` → **用户
+    ///   确认后覆盖**（UI 明示「该名字已绑定不同身份，确认替换？」），真人
+    ///   被抢注后可恢复，不再永久失效。
+    ///
+    /// 返回是否为首次写入（true = TOFU 新建）。
+    pub fn upsert_identity_confirmed(
+        &self,
+        name: &str,
+        device: u8,
+        identity: &IdentityKey,
+        user_confirmed: bool,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| CoreError::Db(e.to_string()))?;
+        let existing: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT identity FROM trusted_identities WHERE name = ?1 AND device = ?2",
+                params![name, device as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        if let Some(prev) = &existing {
+            let prev_key = IdentityKey::try_from(prev.as_slice())
+                .map_err(|e| CoreError::Crypto(e.to_string()))?;
+            if prev_key != *identity && !user_confirmed {
+                // 与协议路径同一错误类：UI 按「身份变更」处置并征求用户确认
+                return Err(CoreError::IdentityChanged(name.to_owned()));
+            }
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO trusted_identities (name, device, identity) VALUES (?1, ?2, ?3)",
+            params![name, device as i64, identity.serialize().to_vec()],
+        )
+        .map_err(|e| CoreError::Db(e.to_string()))?;
+        Ok(existing.is_none())
+    }
 }
 
 #[async_trait(?Send)]
@@ -480,6 +527,28 @@ mod tests {
         assert!(alice.is_trusted(&bob_addr, &bik).unwrap(), "异钥被拒后旧 pin 必须保留");
         assert!(!alice.is_trusted(&bob_addr, &bik2).unwrap());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 红队 R2-1 修复回归：同名异钥覆盖需要用户确认；确认后覆盖可恢复。
+    #[test]
+    fn upsert_identity_confirmed_gates_overwrite() {
+        let store = SqlSignalStore::open(std::path::Path::new(":memory:"), None).unwrap();
+        let mallory = Device::generate("bob").unwrap();
+        let bob = Device::generate("bob").unwrap();
+        let mkey = mallory.identity_key().unwrap();
+        let bkey = bob.identity_key().unwrap();
+
+        // TOFU 首次信任（抢注）：无记录直接写入，返回「首次」
+        assert!(store.upsert_identity_confirmed("bob", 1, &mkey, false).unwrap());
+        // 未确认覆盖（真人恢复尝试 / 上层 bug / 重复 offer）：拒绝
+        assert!(store.upsert_identity_confirmed("bob", 1, &bkey, false).is_err());
+        // 抢注者的 pin 原样保留
+        assert!(store.upsert_identity_confirmed("bob", 1, &mkey, false).is_ok(), "同钥幂等重写");
+        // 用户确认后覆盖：恢复通道打开
+        assert!(!store.upsert_identity_confirmed("bob", 1, &bkey, true).unwrap());
+        // 覆盖后旧钥被拒（抢注不可逆地失效）、新钥生效；旧钥想抢回同样需要确认
+        assert!(store.upsert_identity_confirmed("bob", 1, &mkey, false).is_err());
+        assert!(store.upsert_identity_confirmed("bob", 1, &mkey, true).is_ok());
     }
 
     /// 会话持久化：握手后重开，后续普通消息（类型 2）无需重新握手即可解密。

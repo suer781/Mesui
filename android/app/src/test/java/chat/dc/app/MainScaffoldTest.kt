@@ -3,6 +3,7 @@ package chat.dc.app
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -65,9 +66,13 @@ class MainScaffoldTest {
         compose.onNodeWithTag("role_show").assertExists()
         compose.onNodeWithTag("role_scan").assertExists()
         // 选「出示我的码」→ 只有动态码，没有取景器（Robolectric 无 AndroidKeyStore
-        // 也无 native：页面走「身份不可用」降级态，同样不出现取景器）
+        // 也无 native：页面走「身份不可用」降级态，同样不出现取景器）。
+        // K2-5：会话/载荷构建已挪 IO 协程（主线程防 ANR）——降级/成功态异步到达，
+        // 轮询等待加载落定；测试环境无 native，最终必然落到 identity_unavailable。
         compose.onNodeWithTag("role_show").performClick()
-        compose.waitForIdle()
+        compose.waitUntil(5_000) {
+            compose.onAllNodesWithTag("identity_unavailable").fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithTag("identity_unavailable").assertExists()
         compose.onNodeWithTag("qr_image").assertDoesNotExist()
         compose.onNodeWithTag("scan_view").assertDoesNotExist()

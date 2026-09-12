@@ -52,6 +52,7 @@
     <string name="add_friend_done">已添加为联系人，可开始聊天</string>
     <string name="identity_reset_notice">本地加密库无法解密（恢复出厂/换机恢复/库损坏），身份已重置：会话、联系人与聊天记录全部丢失，需与所有好友重新扫码添加</string>
     <string name="identity_unavailable">本机安全密钥（Keystore）暂不可用，无法生成本人二维码。请重启应用后重试；若持续出现，可能是系统安全组件异常</string>
+    <string name="identity_loading">正在准备本机身份…</string>
     <string name="search_desc">搜索</string>
     <string name="new_chat_desc">发起新会话</string>
     <string name="contacts_entry_qr">扫码或出示动态码</string>

@@ -270,6 +270,31 @@ impl NonceCache {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// 红队 R2-3 修复：台账导出——进程重启（Android 前台服务被杀是常态）后，
+    /// ±5min 窗内被嗅探的合法写入若台账清零即可原样重放一次。调用方
+    /// （NodeService / FFI 层）周期性调用本方法并落盘（JSON，存 settings 旁），
+    /// 启动时经 [`NonceCache::import_state`] 恢复。
+    /// 条目 = (msg_id, expiry_ms)；过期条目照常导出（导入后由
+    /// check_and_insert 的 retain 正常清扫）。
+    pub fn export_state(&self) -> Vec<(crate::envelope::MsgId, u64)> {
+        self.entries.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+
+    /// 红队 R2-3 修复：台账恢复（进程重启后启动时调用）。
+    /// 条目原样入表；同 msg_id 以先到者为准；超容量的部分按导入序丢弃
+    /// （fail-closed，与 check_and_insert 同语义：绝不驱逐已恢复的防重放状态）。
+    pub fn import_state(&mut self, entries: Vec<(crate::envelope::MsgId, u64)>) {
+        for (id, expiry) in entries {
+            if self.entries.contains_key(&id) {
+                continue;
+            }
+            if self.entries.len() >= self.hard_cap {
+                break; // fail-closed：不无限恢复，硬顶与在线语义一致
+            }
+            self.entries.insert(id, expiry);
+        }
+    }
 }
 
 /// 官方入站流程（顺序在代码里强制，阶段 5 不得自行重排）：
@@ -483,6 +508,45 @@ mod tests {
             "已过期条目被正常清扫、窗外重放按过期语义放行"
         );
         assert_eq!(c.len(), 3, "u64::MAX 饱和条目保持防重放义务，正常条目已排空");
+    }
+
+    #[test]
+    fn nonce_cache_state_export_import_roundtrip() {
+        // 红队 R2-3 修复回归：台账跨进程持久化的导出/恢复语义
+        let mut c = NonceCache::new(1000);
+        assert!(c.check_and_insert(&[0x11; 16], 1_000, 1_000));
+        assert!(c.check_and_insert(&[0x22; 16], 2_000, 2_000));
+        let saved = c.export_state();
+        assert_eq!(saved.len(), 2);
+
+        // 新进程：恢复后同 msg_id 重放仍被拒
+        let mut proc2 = NonceCache::new(1000);
+        assert!(proc2.is_empty(), "新进程台账为空（漏洞前提）");
+        proc2.import_state(saved.clone());
+        assert_eq!(proc2.len(), 2);
+        assert!(!proc2.check_and_insert(&[0x11; 16], 1_000, 1_000), "恢复后重放必须被拒");
+
+        // 超容量按导入序丢弃（fail-closed），已恢复条目不被驱逐
+        let mut small = NonceCache::new(64);
+        let flood: Vec<(crate::envelope::MsgId, u64)> = (0..100u32)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[1] = i as u8;
+                (id, 1_000)
+            })
+            .collect();
+        small.import_state(flood);
+        assert_eq!(small.len(), 64, "导入超容量 fail-closed：只保留前 64 条");
+        let mut first = [0u8; 16];
+        first[1] = 0;
+        assert!(!small.check_and_insert(&first, 1_000, 1_000), "先恢复的条目必须保留");
+        // 空导入无害、同 id 先到者为准
+        let mut base = NonceCache::new(64);
+        base.import_state(Vec::new());
+        assert!(base.is_empty());
+        base.import_state(vec![([0x33; 16], 1_000), ([0x33; 16], 2_000)]);
+        assert_eq!(base.len(), 1);
+        assert_eq!(base.export_state()[0].1, 1_000, "同 msg_id 以先到者为准");
     }
 
     // ══════════ 读桶（MailboxRead，SP-1.6） ══════════

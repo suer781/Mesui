@@ -224,6 +224,33 @@ struct SenderRate {
     last_refill_ms: u64,
 }
 
+/// 读 nonce 台账分区（红队 R2-4 修复）：与写台账（A6）同理按桶对分区——
+/// 此前是一把全局 FIFO：任一持钥者刷 16384 次合法读即可把**其他桶对**
+/// 未过期的读 nonce 逐出，被逐出对的嗅探读请求随后原样重放成功
+/// （拉回新入库密文 = 元数据新鲜度泄露 + 重复取件）。
+/// 分区后一个持钥者至多挤掉自己那对的读 nonce（自我 DoS），他对互不牵连。
+#[derive(Default)]
+struct ReadLedger {
+    seen: std::collections::HashSet<[u8; 32]>,
+    order: std::collections::VecDeque<[u8; 32]>,
+}
+
+impl ReadLedger {
+    /// true = 首次见到（放行）；false = 重放（拒绝）。
+    fn check_and_insert(&mut self, key: [u8; 32], cap: usize) -> bool {
+        if !self.seen.insert(key) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > cap {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        true
+    }
+}
+
 impl SenderRate {
     /// 首见的发送方满桶起步。
     fn new(now_ms: u64) -> Self {
@@ -265,11 +292,10 @@ pub struct MailboxManager {
     nonces: HashMap<[u8; 32], NonceCache>,
     /// 每分区台账软目标容量（NonceCache 内部再钳制到 [64, 4096]）
     ledger_cap: usize,
-    /// 红队 A2b Verifier 修复：读 nonce 独立台账——**不过期**（只 FIFO 驱逐），
-    /// 读路径无时间窗，nonce 条目若过期则同请求重放可拉取新到密文（元数据泄露）。
-    read_nonces: std::collections::HashSet<[u8; 32]>,
-    read_order: std::collections::VecDeque<[u8; 32]>,
-    /// 读 nonce 台账容量（≈800KB 内存 @16384 条 × ~48B/条）
+    /// 读 nonce 台账，按桶对分区（红队 R2-4 修复：全局 FIFO 会被单对洪泛
+    /// 驱逐其他对的防重放状态）。不过期、FIFO 驱逐，读路径无时间窗（设计使然）。
+    read_ledgers: HashMap<[u8; 32], ReadLedger>,
+    /// 读 nonce 台账每分区容量（≈800KB 内存 @16384 条 × ~48B/条）
     read_cap: usize,
     /// 限速表：键 = 桶对（红队 A5 修复：配额绑定密钥而非可伪造的 sender）
     senders: HashMap<[u8; 32], SenderRate>,
@@ -288,8 +314,7 @@ impl MailboxManager {
         Self {
             nonces: HashMap::new(),
             ledger_cap: cap,
-            read_nonces: std::collections::HashSet::new(),
-            read_order: std::collections::VecDeque::new(),
+            read_ledgers: HashMap::new(),
             read_cap: (cap.max(4096)).max(16384),
             senders: HashMap::new(),
         }
@@ -330,8 +355,12 @@ impl MailboxManager {
     /// 1. 读取 MAC（常量时间比较）——读取**无时间窗**（±5min 只限写入）；
     /// 2. nonce 台账防重放读——**独立台账，不过期**（红队 A2b Verifier 修复：
     ///    读路径无时间窗，共享写台账的过期语义会让 ~9 分钟后重放复活）。
-    ///    FIFO 驱逐在容量上限时才触发（16384 条 ≈ 800KB，移动端可承受）；
-    ///    台账必须后于鉴权：与写同理，防用重复响应探测请求有效性；
+    ///    台账**按桶对分区**（红队 R2-4 修复：此前是全局 FIFO——任一持钥者刷
+    ///    16384 次合法读即可把其他桶对未过期的读 nonce 逐出，被逐出对的嗅探
+    ///    读请求原样重放成功）。FIFO 驱逐只在分区内、容量上限时触发
+    ///    （16384 条 ≈ 800KB，移动端可承受）；分区表本身有
+    ///    [`PAIR_LEDGER_CAP`] 硬顶，制造新分区需要持钥（MAC 先行），
+    ///    超限新对 fail-closed（与写台账同一语义）；
     /// 3. 从 storage 取桶内序号 > cursor 的消息（升序；空桶/读尽 = 空表）。
     ///
     /// 需要 &mut self：nonce 台账在放行时记账（check_and_insert）。
@@ -344,18 +373,22 @@ impl MailboxManager {
         _now_ms: u64,
     ) -> std::result::Result<Vec<BucketWrite>, MailboxError> {
         read.verify_read(secret, _now_ms).map_err(classify_gate)?;
-        // 读 nonce 独立台账：FIFO 驱逐（无时间过期），键 = nonce 128 位
+        // 读 nonce 台账按桶对分区（键 = pair_key(secret)），FIFO 驱逐只在分区内
+        let pair = pair_key(secret);
+        if !self.read_ledgers.contains_key(&pair) && self.read_ledgers.len() >= PAIR_LEDGER_CAP {
+            // 分区表满：新对 fail-closed。制造新分区需要持钥（伪造字段无用）。
+            return Err(MailboxError::ReplayRejected);
+        }
+        let cap = self.read_cap;
+        let ledger = self
+            .read_ledgers
+            .entry(pair)
+            .or_insert_with(|| ReadLedger::default());
         let key: [u8; 32] = crate::identity::fingerprint1024(&[b"read-nonce", &read.nonce])[..32]
             .try_into()
             .unwrap();
-        if !self.read_nonces.insert(key) {
+        if !ledger.check_and_insert(key, cap) {
             return Err(MailboxError::ReplayRejected);
-        }
-        self.read_order.push_back(key);
-        while self.read_order.len() > self.read_cap {
-            if let Some(old) = self.read_order.pop_front() {
-                self.read_nonces.remove(&old);
-            }
         }
         storage
             .fetch_after(&read.bucket, read.cursor)
@@ -383,6 +416,34 @@ impl MailboxManager {
     /// 限速表当前跟踪的桶对数（监控/测试用）。
     pub fn tracked_senders(&self) -> usize {
         self.senders.len()
+    }
+
+    /// 红队 R2-3 修复：按桶对导出 msg_id 台账——NodeService / FFI 层周期性
+    /// 调用并落盘（JSON，存 settings 旁），进程重启（Android 前台服务被杀）
+    /// 后启动时经 [`MailboxManager::import_pair_ledger`] 恢复。否则 ±5min 窗内
+    /// 被嗅探的合法 BucketWrite 在每次进程重启后都可原样重放一次。
+    /// 该桶对无台账时返回空表。
+    pub fn export_pair_ledger(&self, secret: &[u8; 32]) -> Vec<(crate::envelope::MsgId, u64)> {
+        self.nonces
+            .get(&pair_key(secret))
+            .map(|c| c.export_state())
+            .unwrap_or_default()
+    }
+
+    /// 红队 R2-3 修复：恢复某桶对的 msg_id 台账（启动时从持久层加载后调用）。
+    /// 条目语义见 [`NonceCache::import_state`]（超容量按导入序 fail-closed，
+    /// 同 msg_id 先到者为准）。
+    pub fn import_pair_ledger(
+        &mut self,
+        secret: &[u8; 32],
+        entries: Vec<(crate::envelope::MsgId, u64)>,
+    ) {
+        let cap = self.ledger_cap;
+        let ledger = self
+            .nonces
+            .entry(pair_key(secret))
+            .or_insert_with(|| NonceCache::new(cap));
+        ledger.import_state(entries);
     }
 }
 

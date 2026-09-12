@@ -68,14 +68,18 @@ fun ChatScreen(contactId: String, onBack: () -> Unit, onAddFriend: () -> Unit) {
     val listState = rememberLazyListState()
 
     // reload 统一挪 IO（P2）：入站消息高频触发的 reload 旧码在主线程跑
-    // SQLCipher 查询（解密库读 500 行），弱机上掉帧明显
+    // SQLCipher 查询（解密库读 500 行），弱机上掉帧明显。
+    // K2-12：并发 reload 完成顺序不保序——IO 查询晚归的旧结果会把新数据覆盖回旧值。
+    // generation 计数：发起时取号，落地前校验仍是最新一代才写状态
+    var reloadGeneration by remember { mutableStateOf(0) }
     fun reload() {
+        val gen = ++reloadGeneration
         scope.launch {
             val list = withContext(Dispatchers.IO) {
                 runCatching { SignalCore.contactStore(context).messages(contactId, 500) }
                     .getOrDefault(emptyList())
             }
-            messages = list
+            if (gen == reloadGeneration) messages = list
         }
     }
 

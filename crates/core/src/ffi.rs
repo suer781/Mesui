@@ -83,6 +83,41 @@ impl MailboxManagerHandle {
         gate_register(&write);
         Ok("accepted".to_string())
     }
+
+    /// 红队 R2-3 修复：导出该桶对 msg_id 台账（JSON：
+    /// `[[msg_id 数字数组, expiry_ms], …]`）。宿主层周期性调用并落盘
+    /// （SQLCipher 表 / settings 旁文件）；进程重启后经
+    /// [`MailboxManagerHandle::import_ledger`] 恢复，±5min 窗内被嗅探的
+    /// 合法写入不再因进程死亡而可重放。
+    pub fn export_ledger(&self, secret_hex: String) -> Result<String, DcError> {
+        let secret = hex_decode_32(&secret_hex).ok_or_else(|| DcError::Core {
+            msg: "secret_hex 必须是 64 个 hex 字符（32 字节）".into(),
+        })?;
+        let entries = self
+            .inner
+            .lock()
+            .expect("maildrop mutex poisoned")
+            .export_pair_ledger(&secret);
+        serde_json::to_string(&entries)
+            .map_err(|e| DcError::Core { msg: format!("台账序列化失败: {e}") })
+    }
+
+    /// 红队 R2-3 修复：恢复某桶对的 msg_id 台账（启动时从持久层加载后调用）。
+    /// 条目格式同 [`MailboxManagerHandle::export_ledger`]；超容量按导入序
+    /// fail-closed，同 msg_id 先到者为准。
+    pub fn import_ledger(&self, secret_hex: String, entries_json: String) -> Result<(), DcError> {
+        let secret = hex_decode_32(&secret_hex).ok_or_else(|| DcError::Core {
+            msg: "secret_hex 必须是 64 个 hex 字符（32 字节）".into(),
+        })?;
+        let entries: Vec<(crate::envelope::MsgId, u64)> =
+            serde_json::from_str(&entries_json)
+                .map_err(|e| DcError::Core { msg: format!("台账 JSON 解析失败: {e}") })?;
+        self.inner
+            .lock()
+            .expect("maildrop mutex poisoned")
+            .import_pair_ledger(&secret, entries);
+        Ok(())
+    }
 }
 
 /// 信箱读桶的 UniFFI 出口（SP-1.6 读路径）：
@@ -631,22 +666,35 @@ mod signal_ffi {
     }
 
     /// 首条握手消息的带外 token-MAC（keyed-BLAKE3）。bucket 必须 32 字节。
+    /// 红队 R2-7 修复：MAC 输入绑定会话名（name）与时效界（expiryMs，
+    /// 出示端生成 QR 载荷时给出）——完整拍摄的载荷只在窗口内、只对本次
+    /// 配对会话有效，不再是永久握手能力。
     #[uniffi::export]
-    pub fn first_message_mac(token: Vec<u8>, bucket: Vec<u8>, ciphertext: Vec<u8>) -> Result<Vec<u8>, DcError> {
+    pub fn first_message_mac(
+        token: Vec<u8>,
+        bucket: Vec<u8>,
+        name: String,
+        expiry_ms: u64,
+        ciphertext: Vec<u8>,
+    ) -> Result<Vec<u8>, DcError> {
         let b: [u8; 32] = bucket
             .as_slice()
             .try_into()
             .map_err(|_| DcError::Core { msg: "bucket must be 32 bytes".into() })?;
-        Ok(handshake::first_message_mac(&token, &b, &ciphertext).to_vec())
+        Ok(handshake::first_message_mac(&token, &b, &name, expiry_ms, &ciphertext).to_vec())
     }
 
     /// 校验首条握手消息的 token-MAC；返回是否通过。
+    /// `nowMs > expiryMs` 即拒（时效窗一次性语义，红队 R2-7）。
     #[uniffi::export]
     pub fn verify_first_message_mac(
         token: Vec<u8>,
         bucket: Vec<u8>,
+        name: String,
+        expiry_ms: u64,
         ciphertext: Vec<u8>,
         mac: Vec<u8>,
+        now_ms: u64,
     ) -> Result<bool, DcError> {
         let b: [u8; 32] = bucket
             .as_slice()
@@ -656,7 +704,7 @@ mod signal_ffi {
             .as_slice()
             .try_into()
             .map_err(|_| DcError::Core { msg: "mac must be 32 bytes".into() })?;
-        Ok(handshake::verify_first_message_mac(&token, &b, &ciphertext, &m).is_ok())
+        Ok(handshake::verify_first_message_mac(&token, &b, &name, expiry_ms, &ciphertext, &m, now_ms).is_ok())
     }
 
     /// 从首条 PreKeySignalMessage 取发送方长期身份公钥（出示侧收到
@@ -800,8 +848,15 @@ mod node_ffi {
     /// Kotlin 实现的节点回调（UniFFI callback interface，Rust 任意线程回调）。
     #[uniffi::export(callback_interface)]
     pub trait NodeCallback: Send + Sync {
-        /// 收到一条消息（from 为对端节点 id hex；payload = msg_type+密文）。
-        fn on_message(&self, from_node_id_hex: String, payload: Vec<u8>);
+        /// 收到一条消息（from 为对端节点 id hex；payload = msg_type+密文；
+        /// ackHex = 16 hex 字符回执句柄）。
+        ///
+        /// 红队 R2-2 修复：Rust 侧**不再**在回调返回后自动 ACK。Kotlin 在
+        /// 本回调内启动异步处理（反查联系人 → 解密 → 落库投递），完成后必须
+        /// 经 [`IrohNode::ack`]（Kotlin 名 ack）回执：true = 解密成功并投递
+        /// （ACK），false = 失败（NAK）；5 秒未回执接收端按 NAK 处理，
+        /// 发送方走重试——「已送达」不再可能来自假回执。
+        fn on_message(&self, from_node_id_hex: String, ack_hex: String, payload: Vec<u8>);
         /// 端点就绪：本端节点 id + 地址快照（编 QR 用）。
         fn on_ready(&self, node_id_hex: String, naddr: String);
     }
@@ -809,8 +864,9 @@ mod node_ffi {
     struct SinkAdapter(Box<dyn NodeCallback>);
 
     impl crate::node::NodeSink for SinkAdapter {
-        fn on_message(&self, from_node_id_hex: String, payload: Vec<u8>) {
-            self.0.on_message(from_node_id_hex, payload);
+        fn on_message(&self, from_node_id_hex: String, ack_hex: String, payload: Vec<u8>) -> Option<bool> {
+            self.0.on_message(from_node_id_hex, ack_hex, payload);
+            None // Kotlin 异步回执：经 IrohNode::ack 完成（5s 未回执 = NAK）
         }
         fn on_ready(&self, node_id_hex: String, naddr: String) {
             self.0.on_ready(node_id_hex, naddr);
@@ -853,6 +909,13 @@ mod node_ffi {
         /// 按快照发送（阻塞至对端应用层确认；调用方放 IO 线程）。
         pub fn send(&self, naddr: String, payload: Vec<u8>, timeout_ms: u32) -> Result<(), DcError> {
             self.inner.send(&naddr, &payload, timeout_ms as u64).map_err(map_err)
+        }
+
+        /// 应用层异步回执（红队 R2-2）：onMessage 回调携带的 ackHex。
+        /// true = 解密成功并投递（ACK）；false = 失败（NAK）。
+        /// 5 秒未回执接收端按 NAK 处理（发送方重试）。
+        pub fn ack(&self, ack_hex: String, ok: bool) {
+            self.inner.ack(&ack_hex, ok);
         }
 
         pub fn stop(&self) {
@@ -912,6 +975,7 @@ mod delivery_ffi {
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, uniffi::Record)]
     pub struct CleanupReportRecord {
         pub pruned_seen: u32,
+        pub pruned_sent: u32,
         pub pruned_dead: u32,
     }
 
@@ -993,7 +1057,7 @@ mod delivery_ffi {
             })
         }
 
-        /// 周期清理（低频，如每日一次）：过期去重台账 + 过期死信。
+        /// 周期清理（低频，如每日一次）：过期去重台账 + 过期已发送行 + 过期死信。
         pub fn cleanup(&self, now_ms: u64) -> Result<CleanupReportRecord, DcError> {
             let r = self
                 .inner
@@ -1003,6 +1067,7 @@ mod delivery_ffi {
                 .map_err(map_err)?;
             Ok(CleanupReportRecord {
                 pruned_seen: r.pruned_seen,
+                pruned_sent: r.pruned_sent,
                 pruned_dead: r.pruned_dead,
             })
         }
