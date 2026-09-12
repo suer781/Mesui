@@ -9,6 +9,7 @@ import chat.dc.core.NodeCallback
 import java.io.File
 import java.security.KeyStore
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.security.SecureRandom
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -64,7 +65,10 @@ object IrohNodeManager {
 
     @Volatile private var node: IrohNode? = null
     @Volatile private var appContext: Context? = null
-    @Volatile private var starting = false
+    // 启动权标志（P3）：无锁双入竞态下「读到 false → 置 true」的 check-then-act
+    // 会让两个线程各拉起一个 iroh 节点（端口/资源冲突，旧节点成孤儿）。CAS 保证
+    // 全局只有一个启动协程能持有启动权
+    private val starting = AtomicBoolean(false)
     // 启动代次：stop() 自增使在途的启动/重试协程失效，防止 stop 后被旧协程重新拉起
     @Volatile private var startGen = 0L
 
@@ -86,8 +90,8 @@ object IrohNodeManager {
 
     /** 启动（幂等）：已在跑或正在启动则忽略；失败按 5s/15s/45s 退避自愈重试，最多 3 次。 */
     fun start(context: Context) {
-        if (node != null || starting) return
-        starting = true
+        if (node != null) return
+        if (!starting.compareAndSet(false, true)) return
         appContext = context.applicationContext
         val gen = startGen
         scope.launch {
@@ -149,7 +153,7 @@ object IrohNodeManager {
                 }
             } finally {
                 // 仅当代次未变时清 flag：stop→start 换代后，新启动协程持有该 flag
-                if (gen == startGen) starting = false
+                if (gen == startGen) starting.set(false)
             }
         }
     }
@@ -159,7 +163,7 @@ object IrohNodeManager {
         // 换代 + 释放 starting：让在途启动/重试协程失效，setRelayUrlAndRestart
         // 紧随其后的 start() 不再被旧协程的 starting flag 挡掉
         startGen++
-        starting = false
+        starting.set(false)
         val n = node
         node = null
         _state.value = IrohSnap()

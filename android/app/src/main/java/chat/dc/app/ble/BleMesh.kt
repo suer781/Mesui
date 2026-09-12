@@ -463,6 +463,16 @@ object BleMesh {
                 runCatching { SignalCore.contactStore(context).setVerified(contact.name, true) }
                 invalidateScanCache()
             }
+            Wire.AUTH_B_CHA -> {
+                // 反向认证①：能走到这里说明响应端已验证我们的 AUTH_RSP（HMAC(S_i,
+                // nonce)）并进入 B 轮——对端至少是协议兼容方。用 AUTH_CHA 时命中的
+                // 联系人 S_i（st.secret）对响应端的 nonceB 再算一次截断 HMAC 回
+                // AUTH_B_RSP，响应端验签通过才算双向认证闭环（P1：旧码无此分支，
+                // else 吞帧——AUTH_B_RSP 永远不回，响应端反向校验永远悬空）
+                val secret = st.secret ?: return
+                if (body.size != 16) return
+                handle.send(wireFrame(Wire.AUTH_B_RSP, FriendLink.hmac(secret, body)))
+            }
             Wire.MSG -> dispatchIncoming(handle, frame, st.peerName)
             else -> Unit
         }
@@ -517,7 +527,8 @@ object BleMesh {
             Wire.AUTH_RSP -> {
                 val secret = st.secret ?: return
                 val nonce = st.nonce ?: return
-                if (body.size != FriendLink.HMAC_TRUNC || !body.contentEquals(FriendLink.hmac(secret, nonce))) {
+                val expected = FriendLink.hmac(secret, nonce)
+                if (body.size != FriendLink.HMAC_TRUNC || !FriendLink.constantTimeEquals(body, expected)) {
                     link.drop(); return
                 }
                 synchronized(links) { links[st.peerHex!!] }?.closeLink()
@@ -528,8 +539,8 @@ object BleMesh {
                 link.send(wireFrame(Wire.AUTH_B_CHA, nonceB))
             }
             Wire.AUTH_B_RSP -> {
-                val ok = st.secret != null && st.nonceB != null &&
-                    body.size == FriendLink.HMAC_TRUNC && body.contentEquals(FriendLink.hmac(st.secret!!, st.nonceB!!))
+                val expected = FriendLink.hmac(st.secret ?: return, st.nonceB ?: return)
+                val ok = body.size == FriendLink.HMAC_TRUNC && FriendLink.constantTimeEquals(body, expected)
                 if (!ok) link.drop()
             }
             Wire.HS -> onHostHandshake(handle, body)
@@ -868,6 +879,13 @@ object BleMesh {
      * 到点才发 QR_REQ 索要完整身份，与出示端门槛共同维持防偷拍时长语义。
      */
     fun startQrDialAsJoiner(peerName: String, bleId: ByteArray, challenge: ByteArray, identityReadyAtMs: Long) {
+        // 双路径互踩守卫（P2）：降级序列下数据帧可能先集齐（startPairingAsJoiner
+        // 已建配对、SAS 进行中），之后才读到 f=2 蓝牙帧——旧码无条件覆盖
+        // pairingObj，正在 SAS 的旧配对被孤儿化（其链路回调仍写旧对象，UI 快照
+        // 却换成空壳新对象，状态机与界面脱钩）。已有活跃配对在 SAS 阶段即拒绝
+        // 新搭线，先到先得
+        val existing = pairingObj
+        if (existing != null && !existing.finished && existing.sas != null) return
         pairingObj = PairingInternal(asHost = false).apply {
             this.peerName = peerName
             this.bleId = bleId

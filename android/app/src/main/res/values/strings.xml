@@ -5,6 +5,7 @@
     <string name="tab_contacts">联系人</string>
     <string name="tab_me">我的</string>
     <string name="node_service_title">节点运行中</string>
+    <string name="bt_permission_denied">蓝牙权限被拒绝，节点服务未能启动：请在系统设置中授予「附近的设备」权限后重新打开应用</string>
     <string name="nearby_title">发现附近设备</string>
     <string name="nearby_need_permission">需要附近的设备权限才能扫描蓝牙节点</string>
     <string name="nearby_grant">授予权限</string>

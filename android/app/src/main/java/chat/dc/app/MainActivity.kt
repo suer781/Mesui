@@ -26,6 +26,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import android.widget.Toast
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavType
@@ -62,7 +63,13 @@ class MainActivity : ComponentActivity() {
         val btOk = Build.VERSION.SDK_INT < 31 ||
             checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED ||
             grants[Manifest.permission.BLUETOOTH_CONNECT] == true
-        if (btOk) startNodeService()
+        if (btOk) {
+            startNodeService()
+        } else {
+            // 永久拒绝时系统不再弹窗，这里至少给一条提示（P3）：服务没起，
+            // 蓝牙收发与跨网节点全部不可用，用户需要知道去设置里补授权
+            Toast.makeText(this, R.string.bt_permission_denied, Toast.LENGTH_LONG).show()
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {

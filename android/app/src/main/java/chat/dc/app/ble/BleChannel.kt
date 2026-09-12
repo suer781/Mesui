@@ -90,6 +90,19 @@ fun splitForChunk(frame: ByteArray, chunkSize: Int): List<ByteArray> =
     if (frame.size <= chunkSize) listOf(frame)
     else frame.asList().asIterable().chunked(chunkSize).map { it.toByteArray() }
 
+/** GATT 单次写/通知的物理预算下界：BLE 最小 MTU=23，减 ATT 头 3 字节 = 20。
+ *  旧码下界钳 23 会把 MTU=23 时的真实预算 20 抬到 23——写 23 字节必失败（P2）。 */
+internal const val MIN_CHUNK_SIZE = 20
+
+/**
+ * MTU → 分片尺寸（纯逻辑可测）：mtu − 3（ATT 头），钳制到 [MIN_CHUNK_SIZE, WANT_MTU]。
+ * [negotiated] = onMtuChanged 的 status 是否 GATT_SUCCESS——协商失败时报告的 mtu
+ * 不可信，回退保守最小预算 20（实际链路保持默认 MTU 23，20 字节写恒可行）。
+ */
+internal fun chunkSizeFor(mtu: Int, negotiated: Boolean): Int =
+    if (negotiated) (mtu - Wire.HEADER_LEN).coerceIn(MIN_CHUNK_SIZE, LinkUuids.WANT_MTU)
+    else MIN_CHUNK_SIZE
+
 /** 单链路发送队列：一次只在途一分片，写/通知确认回调驱动下一片。
  *  GATT 单操作限制：writeCharacteristic/notifyCharacteristicChanged 必须等
  *  回调后才能发起下一次。仅靠「队列空」判定在途有竞态——写进行中、队列已空时
@@ -169,8 +182,15 @@ class BleClientLink(
 
     /** 订阅就绪（CCC 写成功）后回调一次；已就绪立即回 true。 */
     fun whenReady(cb: (Boolean) -> Unit) {
-        val already = rxChar != null
-        if (already) cb(true) else synchronized(readyWaiters) { readyWaiters += cb }
+        // 判空与登记必须同一把锁内完成（P3 check-then-act）：旧码先在锁外读
+        // rxChar 再进锁登记——就绪瞬间恰好在两步之间时，flushWaiters 已跑完、
+        // 本回调登记进永远不会再 flush 的列表，握手静默挂死
+        var ready = false
+        synchronized(readyWaiters) {
+            ready = rxChar != null
+            if (!ready) readyWaiters += cb
+        }
+        if (ready) cb(true)
     }
 
     fun send(frame: ByteArray) {
@@ -226,7 +246,9 @@ class BleClientLink(
     }
 
     override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
-        chunkSize = (mtu - Wire.HEADER_LEN).coerceIn(23, LinkUuids.WANT_MTU - Wire.HEADER_LEN)
+        // 协商失败（status≠GATT_SUCCESS）时 mtu 报告值不可信：按保守预算 20 走，
+        // 绝不拿失败回调里的 mtu 抬高写预算（P2）
+        chunkSize = chunkSizeFor(mtu, status == BluetoothGatt.GATT_SUCCESS)
         runCatching { g.discoverServices() }
     }
 
@@ -312,6 +334,9 @@ class BleServer(private val context: Context) : BluetoothGattServerCallback() {
             pump.enqueue(splitForChunk(frame, chunkSize))
             pumpOnce()
         }
+
+        /** 诊断日志用：当前排队未发的分片数。 */
+        internal fun pendingChunks(): Int = pump.pendingCount()
 
         @SuppressLint("MissingPermission")
         private fun pumpOnce() {
@@ -403,7 +428,8 @@ class BleServer(private val context: Context) : BluetoothGattServerCallback() {
     }
 
     override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
-        links[device.address]?.chunkSize = (mtu - Wire.HEADER_LEN).coerceIn(23, LinkUuids.WANT_MTU - Wire.HEADER_LEN)
+        // server 侧回调无 status 参数：能到达即协商完成，按成功钳制（同 client 侧下界 20）
+        links[device.address]?.chunkSize = chunkSizeFor(mtu, true)
     }
 
     @SuppressLint("MissingPermission")
@@ -442,9 +468,15 @@ class BleServer(private val context: Context) : BluetoothGattServerCallback() {
 
     @SuppressLint("MissingPermission")
     override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+        val link = links[device.address] ?: return
         if (status != BluetoothGatt.GATT_SUCCESS) {
-            links[device.address]?.drop()
+            // 通知分片失败：与 client 侧 onCharacteristicWrite 对称（P2）——
+            // 只清队列不断链会让上层把链路当健康，后续帧继续走死链静默丢失
+            android.util.Log.w("BleChannel", "onNotificationSent status=$status，断链（丢 ${link.pendingChunks()} 片）")
+            link.drop()
+            link.events?.onClosed()
+            return
         }
-        links[device.address]?.pumpContinue()
+        link.pumpContinue()
     }
 }

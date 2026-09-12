@@ -131,6 +131,14 @@ object FriendLink {
             doFinal(data).copyOf(HMAC_TRUNC)
         }
 
+    /** 常量时间字节数组比较（P2-1：防时序侧信道泄露匹配前缀长度）。 */
+    fun constantTimeEquals(a: ByteArray, b: ByteArray): Boolean {
+        if (a.size != b.size) return false
+        var diff = 0
+        for (i in a.indices) diff = diff or (a[i].toInt() xor b[i].toInt())
+        return diff == 0
+    }
+
     /** 广播 serviceData 负载组装：版本+过滤器。 */
     fun advertisePayload(bloom: ByteArray): ByteArray = byteArrayOf(PAYLOAD_VERSION) + bloom
 

@@ -1,6 +1,8 @@
 package chat.dc.app.ble
 
+import chat.dc.app.friendlink.FriendLink
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -51,5 +53,42 @@ class BleFrameTest {
         assertTrue(chunks.all { it.size <= 100 })
         // ByteArray 非 Iterable，flatten 需逐元素展开
         assertEquals(frame.toList(), chunks.flatMap { it.toList() })
+    }
+
+    @Test
+    fun chunk_size_budget_lower_bound_is_20_not_23() {
+        // BLE 最小 MTU=23：ATT 写预算 = 23 − 3 = 20。旧码下界钳 23 会把真实预算
+        // 20 抬到 23，写 23 字节超预算必失败（P2）
+        assertEquals(20, chunkSizeFor(23, true))
+        // 异常小/零值 MTU 同样钳回下界，不出负数或 0 尺寸分片
+        assertEquals(20, chunkSizeFor(3, true))
+        assertEquals(20, chunkSizeFor(0, true))
+        // 满配 MTU=517：预算 514
+        assertEquals(514, chunkSizeFor(517, true))
+        // 协商失败（status≠GATT_SUCCESS）：mtu 报告值不可信，保守回退最小预算
+        assertEquals(20, chunkSizeFor(517, false))
+        // 最小预算下任何帧都能被完整切分且逐片 ≤ 预算
+        val frame = wireFrame(Wire.HS, ByteArray(60))
+        assertTrue(splitForChunk(frame, chunkSizeFor(23, true)).all { it.size <= 20 })
+    }
+
+    @Test
+    fun auth_b_round_trip_initiator_answer_matches_responder_check() {
+        // P1 回归：发起端收到 AUTH_B_CHA(nonceB) 后必须回 AUTH_B_RSP =
+        // HMAC(S_i, nonceB) 截断 16 字节——响应端（onResponderFrame 的
+        // AUTH_B_RSP 分支）校验的正是这个值；双向认证由此闭环
+        val si = ByteArray(32) { (it * 11 + 5).toByte() }
+        val nonceB = ByteArray(16) { 0x5A }
+        val challenge = wireFrame(Wire.AUTH_B_CHA, nonceB)
+        assertEquals(Wire.AUTH_B_CHA, challenge[0].toInt())
+        val body = challenge.copyOfRange(Wire.HEADER_LEN, challenge.size)
+        assertEquals(16, body.size)
+        val rsp = wireFrame(Wire.AUTH_B_RSP, FriendLink.hmac(si, body))
+        assertEquals(Wire.AUTH_B_RSP, rsp[0].toInt())
+        val rspBody = rsp.copyOfRange(Wire.HEADER_LEN, rsp.size)
+        assertEquals(FriendLink.HMAC_TRUNC, rspBody.size)
+        assertTrue(rspBody.contentEquals(FriendLink.hmac(si, nonceB)))
+        // 错误 S_i 的应答必须被响应端拒绝
+        assertFalse(rspBody.contentEquals(FriendLink.hmac(ByteArray(32) { 1 }, nonceB)))
     }
 }
