@@ -79,6 +79,8 @@ impl MailboxManagerHandle {
             .expect("maildrop mutex poisoned")
             .submit_write(&write, &secret, now_ms)
             .map_err(map_sig)?;
+        // 红队 A9 修复：验收成功即登记凭据，后续 store_write 凭此入库
+        gate_register(&write);
         Ok("accepted".to_string())
     }
 }
@@ -87,6 +89,10 @@ impl MailboxManagerHandle {
 /// 包装桶存储（内存 HashMap 实现；生产由 Kotlin 侧 SQLCipher 按
 /// maildrop::BucketStorage 的语义实现后替换），并持有读桶防重放台账
 /// （写桶台账在 MailboxManagerHandle，读/写键空间独立、互不串扰）。
+///
+/// 写路径与门禁的绑定（红队 A9 修复）：store_write 只接受本进程内经
+/// MailboxManagerHandle::submit 验收过的同一份写——门禁与存储虽是两个
+/// 句柄，验收凭据（内容寻址指纹）在进程级台账中衔接，凭空入库被拒。
 ///
 /// 读请求（MailboxRead）必须经 `seal_bucket_read` 产出——读取 MAC 是
 /// keyed-BLAKE3，只能出自核心，Kotlin 侧无法伪造。
@@ -109,12 +115,21 @@ impl BucketStorageHandle {
 
     /// 入库一条已验收的写（Kotlin 在 submit() 返回 "accepted" 后调用）。
     /// 返回桶内序号（从 1 起单调递增，即读路径游标的刻度）。
+    ///
+    /// 红队 A9 修复：入库必须持「门禁验收凭据」——同一份写未经 submit()
+    /// 放行（或验收后被篡改）一律拒绝；MAC 无效的写不再能经任何拿到
+    /// 存储句柄的路径绕过门禁直接入库。
     pub fn store_write(&self, bucket_hex: String, write_json: String) -> Result<u64, DcError> {
         let bucket = hex_decode_32(&bucket_hex).ok_or_else(|| DcError::Core {
             msg: "bucket_hex 必须是 64 个 hex 字符（32 字节）".into(),
         })?;
         let write: crate::mailbox::BucketWrite = serde_json::from_str(&write_json)
             .map_err(|e| DcError::Core { msg: format!("write_json 解析失败: {e}") })?;
+        if !gate_was_accepted(&write) {
+            return Err(DcError::Core {
+                msg: "写未经门禁验收：必须先经 submit() 放行后原样入库".into(),
+            });
+        }
         self.storage.store(&bucket, &write).map_err(map_sig)
     }
 
@@ -387,7 +402,7 @@ pub fn smoke_test_all_modules() -> String {
     results.push(format!("settings_strict={}", s.strict_crypto));
 
     // governor
-    let mut g = crate::governor::RelayGovernor::new(120);
+    let g = crate::governor::RelayGovernor::new(120);
     results.push(format!("governor_share={:.2}", g.share()));
 
     // queue — 只在 db feature 启用时编译
@@ -415,13 +430,60 @@ pub fn smoke_test_all_modules() -> String {
 }
 
 /// 跨 FFI 的统一错误：Core 为一般失败；RemoteIdentityChanged 单独成类——
-/// TOFU 拒绝是「对方换长期钥匙」的安全信号，UI 须区别处理。
+/// TOFU 拒绝是「对方换长期身份钥」的安全信号，UI 须区别处理。
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum DcError {
     #[error("{msg}")]
     Core { msg: String },
     #[error("对方身份已变更（{name} 已绑定不同的长期身份钥），需重新带外验证")]
     RemoteIdentityChanged { name: String },
+}
+
+// ══════════ 红队 A9 修复：门禁验收 ↔ 入库的进程级绑定 ══════════
+//
+// 此前 `store_write` 与门禁（submit）零绑定：MAC 无效的写可经任何拿到
+// 存储句柄的路径（备份恢复/同步/未来的中继实现）直接入库，被读路径
+// 当「已验收」内容原样端给持钥者。现以内容寻址指纹做验收凭据：
+// submit() 验收成功后登记该写；store_write() 只放行登记过的**同一份**
+// 写（任何字节——包括 MAC——被篡改即指纹失配）。容量 FIFO 上界防无界增长。
+/// 验收台账：HashSet（凭据判定）+ VecDeque（FIFO 驱逐序），Option = 惰性初始化。
+type GateAcceptedLedger = Option<(
+    std::collections::HashSet<[u8; 32]>,
+    std::collections::VecDeque<[u8; 32]>,
+)>;
+
+static GATE_ACCEPTED_WRITES: std::sync::Mutex<GateAcceptedLedger> = std::sync::Mutex::new(None);
+
+const GATE_ACCEPTED_CAP: usize = 65536;
+
+/// 验收凭据键：域分离指纹（写 CBOR 全文）。内容寻址 = 篡改即失配。
+fn gate_write_key(write: &crate::mailbox::BucketWrite) -> [u8; 32] {
+    let cbor = write.to_cbor().unwrap_or_default();
+    crate::identity::fingerprint1024(&[b"dc-gate-accepted-v1", &cbor])[..32]
+        .try_into()
+        .expect("fingerprint1024 输出长度固定")
+}
+
+fn gate_register(write: &crate::mailbox::BucketWrite) {
+    let key = gate_write_key(write);
+    let mut guard = GATE_ACCEPTED_WRITES.lock().expect("gate ledger poisoned");
+    let ledger = guard.get_or_insert_with(Default::default);
+    if ledger.0.insert(key) {
+        ledger.1.push_back(key);
+        while ledger.1.len() > GATE_ACCEPTED_CAP {
+            if let Some(old) = ledger.1.pop_front() {
+                ledger.0.remove(&old);
+            }
+        }
+    }
+}
+
+fn gate_was_accepted(write: &crate::mailbox::BucketWrite) -> bool {
+    let key = gate_write_key(write);
+    let guard = GATE_ACCEPTED_WRITES.lock().expect("gate ledger poisoned");
+    guard
+        .as_ref()
+        .is_some_and(|ledger| ledger.0.contains(&key))
 }
 
 fn map_err(e: crate::CoreError) -> DcError {
@@ -1141,8 +1203,11 @@ mod mailbox_ffi_tests {
         let bucket = generate_bucket_address().unwrap();
         let secret = derive_mailbox_secret(b"ffi-read", &bucket, 1);
         let ts = 3_000_000u64;
+        let gate = MailboxManagerHandle::new(1024);
         let st = BucketStorageHandle::new();
         let w = sealed_write(&sender, &secret, 1, ts);
+        // 红队 A9 修复后：入库必须先经门禁验收（生产顺序：submit → store_write）
+        gate.submit(serde_json::to_string(&w).unwrap(), hex32(&secret), ts).unwrap();
         st.store_write(hex32(&bucket), serde_json::to_string(&w).unwrap()).unwrap();
         // 未授权 secret：攻击者用自选钥匙封读请求，桶主用自己的 secret 验 → 失配
         let wrong = derive_mailbox_secret(b"attacker", &bucket, 1);
@@ -1159,6 +1224,42 @@ mod mailbox_ffi_tests {
         // 坏 JSON / 坏 hex
         assert!(st.read_bucket("not json".into(), hex32(&secret), 0, ts).is_err());
         assert!(seal_bucket_read("zz".repeat(32), hex32(&secret), 1, 0).is_err());
+    }
+
+    #[test]
+    fn store_write_requires_gate_acceptance() {
+        // 红队 A9 修复回归：store_write 与门禁绑定——未经 submit() 验收的写
+        // （哪怕 MAC 本身有效）不得入库；验收后被篡改的写同样被拒
+        let sender = Identity::generate().unwrap();
+        let bucket = generate_bucket_address().unwrap();
+        let secret = derive_mailbox_secret(b"ffi-a9", &bucket, 1);
+        let ts = 4_000_000u64;
+        let gate = MailboxManagerHandle::new(1024);
+        let st = BucketStorageHandle::new();
+        let w = sealed_write(&sender, &secret, 1, ts);
+        // 未经验收：拒绝
+        assert!(
+            st.store_write(hex32(&bucket), serde_json::to_string(&w).unwrap()).is_err(),
+            "RED: 未经验收的写直接入库（store_write 与门禁零绑定）"
+        );
+        assert_eq!(st.count(hex32(&bucket)).unwrap(), 0, "拒绝的写不得占桶");
+        // 经门禁验收后原样入库：放行
+        gate.submit(serde_json::to_string(&w).unwrap(), hex32(&secret), ts).unwrap();
+        assert_eq!(
+            st.store_write(hex32(&bucket), serde_json::to_string(&w).unwrap()).unwrap(),
+            1
+        );
+        // 验收后被篡改的写（MAC 失效）：内容寻址凭据失配 → 拒绝
+        let mut bad = w.clone();
+        bad.mac[0] ^= 1;
+        assert!(st.store_write(hex32(&bucket), serde_json::to_string(&bad).unwrap()).is_err());
+        // 桶里只有验收过的那条
+        assert_eq!(st.count(hex32(&bucket)).unwrap(), 1);
+        // 已验收的写重复入库是幂等的（同一份内容）
+        assert_eq!(
+            st.store_write(hex32(&bucket), serde_json::to_string(&w).unwrap()).unwrap(),
+            2
+        );
     }
 }
 
@@ -1282,7 +1383,7 @@ mod announcement_ffi_tests {
         assert!(h.rotate(hex32(&[0; 32]), "ab".repeat(31), t0).is_err());
 
         // 伪造公告：合法 JSON 但签名与内容不符 → distribute_signed 验签拒绝
-        let (seed, alice) = fresh_seed();
+        let (_seed, alice) = fresh_seed();
         let k1 = Identity::generate().unwrap().node_id();
         let mut ann =
             NodeKeyAnnouncement::new(&alice.node_id(), &k1, 1, t0, DEFAULT_OVERLAP_MS);

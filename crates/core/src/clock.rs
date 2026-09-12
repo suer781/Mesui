@@ -25,6 +25,21 @@ pub const NETWORK_ADOPTION_CAP_MS: i64 = 2 * 60_000;
 /// 网络采纳冷却——回拨速度（≤2min/10min）永远追不上
 /// 真实时间前进，旧写入与「现在」的差距单调拉大，重放永不可行。
 pub const NETWORK_ADOPTION_COOLDOWN_MS: i64 = 10 * 60_000;
+/// 本地钟读数的合理上界（2100-01-01 前后的毫秒数）。
+/// 红队 A1 修复：FFI 边界的 local_ms 直通 `now()`，i64::MAX 一类的值会把
+/// `internal = local_ms + offset` 推到极大并把内部钟高水位钉死在极大值——
+/// 此后所有真实时间戳的合法写入全部 WindowExceeded（门禁级 DoS）。
+/// 进入安全状态机的读数先钳制到 `[0, MAX_PLAUSIBLE_LOCAL_MS]`。
+pub const MAX_PLAUSIBLE_LOCAL_MS: i64 = 4_102_444_800_000;
+/// 单次 `now()` 调用允许采纳进高水位的最大前跳（7 天 = 24h 偏移限幅 +
+/// 充裕的诚实挂起时长）。红队 A1 修复的另一面：即使读数落在合理区间内，
+/// 一次调用把本地钟前跳超过该值也视为毒化读数——高水位一律不采纳
+/// （毒化调用影响至多本次判定，绝不能把基线钉死在不可达的未来）。
+pub const MAX_TRUSTED_ADVANCE_MS: i64 = 7 * 86_400_000;
+/// 双源配对挂起槽的超时。红队 A3 修复：`pending_network` 是单槽，
+/// 毒源占槽后诚实双源永远等不到配对——槽内样本 5 分钟未获配对即自动
+/// 失效清空，允许新来源重新占槽（陈旧偏移参与配对只会产出垃圾均值）。
+pub const NETWORK_PENDING_TIMEOUT_MS: i64 = 5 * 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -48,8 +63,8 @@ pub enum ClockError {
 pub struct InternalClock {
     network_offset_ms: Option<i64>,
     network_fresh_until: i64,
-    /// 双源交叉验证的挂起首读（来源 id，偏移）
-    pending_network: Option<(u8, i64)>,
+    /// 双源交叉验证的挂起首读（来源 id，偏移，挂起时刻的本地钟）
+    pending_network: Option<(u8, i64, i64)>,
     /// 上次网络采纳时刻（本地钟），冷却期内忽略新的采纳
     last_network_adopted_at: i64,
     /// 只有**已验证联系人**（加好友流程产出）的校时交换才被接受——
@@ -135,8 +150,18 @@ impl InternalClock {
         // 两输入均为外部可控，饱和减法防 i64 溢出 panic
         let raw = network_ms.saturating_sub(local_ms);
         let clamped = raw.clamp(-MAX_CORRECTION_MS, MAX_CORRECTION_MS);
+        // 红队 A3 修复：挂起槽带超时——毒源占槽后，槽内陈旧样本（超过
+        // NETWORK_PENDING_TIMEOUT_MS 未获配对）自动失效清空，诚实来源可以
+        // 重新占槽配对；陈旧偏移与新样本配对只会产出垃圾均值，宁可作废。
+        let pending_stale = match self.pending_network {
+            Some((_, _, at)) => local_ms.saturating_sub(at) > NETWORK_PENDING_TIMEOUT_MS,
+            None => false,
+        };
+        if pending_stale {
+            self.pending_network = None;
+        }
         match self.pending_network.take() {
-            Some((prev_source, prev_offset)) if prev_source != source_id => {
+            Some((prev_source, prev_offset, _)) if prev_source != source_id => {
                 // 双源交叉验证：一致 → 采纳均值；分歧 → 双双弃用
                 if (prev_offset - clamped).abs() <= CROSS_CHECK_TOLERANCE_MS {
                     let adopted = (prev_offset + clamped) / 2;
@@ -159,8 +184,8 @@ impl InternalClock {
                 }
             }
             _ => {
-                // 首个来源：挂起等待第二来源
-                self.pending_network = Some((source_id, clamped));
+                // 首个来源（或同源更新）：挂起等待第二来源
+                self.pending_network = Some((source_id, clamped, local_ms));
             }
         }
     }
@@ -217,7 +242,9 @@ impl InternalClock {
     /// 最大共识簇：按偏移排序后，相邻差 ≤CLUSTER_TOLERANCE 的连续段中成员最多的一段
     /// （段大小须 ≥PEER_QUORUM）——离群毒样本自然落单被排除。
     fn peak_cluster(&self, local_ms: i64) -> Option<Vec<i64>> {
-        let fresh_cut = local_ms - 30 * 60 * 1000; // 样本 30 分钟内有效
+        // 样本 30 分钟内有效；local_ms 可为 i64::MIN/MAX 级极端输入
+        // （FFI 边界可达）——饱和运算防溢出 panic（红队 A10 修复）
+        let fresh_cut = local_ms.saturating_sub(30 * 60 * 1000);
         let mut offsets: Vec<i64> = self
             .peers
             .values()
@@ -231,7 +258,8 @@ impl InternalClock {
         let mut best: Vec<i64> = Vec::new();
         let mut run: Vec<i64> = vec![offsets[0]];
         for w in offsets.windows(2) {
-            if w[1] - w[0] <= CLUSTER_TOLERANCE_MS {
+            // 偏移本身已限幅 ±24h，差值不会溢出——饱和运算兜底极端输入
+            if w[1].saturating_sub(w[0]) <= CLUSTER_TOLERANCE_MS {
                 run.push(w[1]);
             } else {
                 if run.len() > best.len() {
@@ -254,21 +282,45 @@ impl InternalClock {
     /// 偏移变化时重置内部高水位基线——毒偏移撤离后不残留旧峰；
     /// 本地钟回拨（回滚攻击）单独检测，回拨期间内部钟钉在高水位。
     /// 内部钟全程保持在 i64 正数域，杜绝 `as i64` 回绕。
+    ///
+    /// 红队 A1 修复：进入安全状态机的本地读数先钳制到合理区间
+    /// （`MAX_PLAUSIBLE_LOCAL_MS`），且高水位只采纳「可信」读数——
+    /// 相对本地高水位的单次前跳超过 `MAX_TRUSTED_ADVANCE_MS`（毒化 FFI
+    /// 输入/被拨快多年的系统钟）一律不写入基线。毒化读数至多影响本次
+    /// 判定（返回值仍按原始读数计算，窗口判定逐调用生效），绝不能把
+    /// 高水位钉死在不可达的未来、让此后所有真实时间戳的合法写入全拒。
     pub fn now(&mut self, local_ms: i64) -> i64 {
-        let offset = self.effective_offset(local_ms);
-        if local_ms < self.local_high_water_ms.saturating_sub(60_000) {
+        // 状态路径用合理值；返回路径用原始读数（两者只在极端输入下分叉）
+        let plausible = local_ms.clamp(0, MAX_PLAUSIBLE_LOCAL_MS);
+        let offset = self.effective_offset(plausible);
+        if plausible < self.local_high_water_ms.saturating_sub(60_000) {
             self.rollback_detected = true; // 系统钟被拨回超过 1 分钟：回滚攻击
         }
-        if local_ms > self.local_high_water_ms {
-            self.local_high_water_ms = local_ms;
+        // 高水位采纳的可信性判定：首次观测锚定（但恰好顶着钳制上界的
+        // 首读数视为垃圾，不锚定）；此后单次前跳超限即毒化。
+        let first_observation = self.local_high_water_ms == i64::MIN / 2;
+        let forward_jump = plausible.saturating_sub(self.local_high_water_ms);
+        let trusted = (first_observation && plausible < MAX_PLAUSIBLE_LOCAL_MS)
+            || (!first_observation && forward_jump <= MAX_TRUSTED_ADVANCE_MS);
+        if plausible > self.local_high_water_ms && trusted {
+            self.local_high_water_ms = plausible;
             self.rollback_detected = false; // 本地钟追平高水位：解除
         }
-        let internal = local_ms.saturating_add(offset).max(0);
+        let internal = plausible.saturating_add(offset).max(0);
         if offset != self.last_offset_ms {
-            // 偏移变化（重校准）：重置基线，允许内部钟跟随新偏移回落
-            self.last_offset_ms = offset;
-            self.internal_high_water_ms = internal as u64;
-        } else {
+            // 偏移变化（重校准）：重置基线，允许内部钟跟随新偏移回落。
+            // 红队 A2 修复：回滚期间若新内部钟比旧高水位低超过 1 小时，
+            // 这是「系统钟拨回 + 偏移变化」的组合攻击（把高水位整体洗回
+            // 一年前、防回拨钳制被一次普通偏移变化击穿）——拒绝重置。
+            let candidate = internal as u64;
+            let significant_drop = (self.internal_high_water_ms as i64)
+                .saturating_sub(candidate as i64)
+                > 60 * 60 * 1000;
+            if trusted && !(self.rollback_detected && significant_drop) {
+                self.last_offset_ms = offset;
+                self.internal_high_water_ms = candidate;
+            }
+        } else if trusted {
             self.internal_high_water_ms = self
                 .internal_high_water_ms
                 .max(internal as u64);
@@ -276,7 +328,8 @@ impl InternalClock {
         if self.rollback_detected {
             return self.internal_high_water_ms as i64;
         }
-        internal.max(self.internal_high_water_ms as i64)
+        let raw_internal = local_ms.saturating_add(offset).max(0);
+        raw_internal.max(self.internal_high_water_ms as i64)
     }
 }
 
@@ -455,5 +508,127 @@ mod tests {
             .unwrap();
         }
         assert_eq!(c.now(t + 1_000), t + 1_000 + MAX_CORRECTION_MS);
+    }
+
+    // ══════════ 红队修复回归测试（adversarial.rs 对应项的内核级细粒度覆盖） ══════════
+
+    #[test]
+    fn red_a1_poison_local_ms_never_pins_high_water() {
+        // 一次毒化 FFI 读数（i64::MAX）不得把高水位钉死——
+        // 后续真实时间戳的内部钟必须照常流动
+        let t = 1_700_000_000_000i64;
+        let mut c = InternalClock::new();
+        assert_eq!(c.now(t), t, "基线：诚实读数锚定高水位");
+        // 毒化调用：返回值按读数主张计算，但不得污染任何基线
+        let poisoned = c.now(i64::MAX);
+        assert_eq!(poisoned, i64::MAX, "返回值按调用方主张（窗口判定逐调用）");
+        assert!(
+            c.high_water_ms() <= MAX_PLAUSIBLE_LOCAL_MS as u64,
+            "RED: 高水位被毒化读数抬到 {:?}",
+            c.high_water_ms()
+        );
+        // 毒化后诚实钟照常流动，高水位照常跟随
+        assert_eq!(c.now(t + 1_000), t + 1_000);
+        assert_eq!(c.high_water_ms(), (t + 1_000) as u64);
+        // 首个调用就是毒化读数：不锚定，后续诚实调用照常锚定
+        let mut c2 = InternalClock::new();
+        let _ = c2.now(i64::MAX);
+        assert_eq!(c2.high_water_ms(), 0, "毒化首读不得锚定高水位");
+        assert_eq!(c2.now(t + 2_000), t + 2_000, "诚实读数照常生效");
+        // 恰好顶着钳制上界的读数同样不进基线
+        let mut c3 = InternalClock::new();
+        let _ = c3.now(MAX_PLAUSIBLE_LOCAL_MS);
+        assert_eq!(c3.high_water_ms(), 0);
+    }
+
+    #[test]
+    fn red_a2_offset_change_during_rollback_keeps_high_water() {
+        let t = 1_700_000_000_000i64;
+        let mut c = InternalClock::new();
+        assert_eq!(c.now(t), t);
+        // 回滚 1 小时（> 1 分钟触发回滚检测）+ 偏移变化 -2min：
+        // 新内部钟比旧高水位低超过 1 小时 → 拒绝重置，高水位保持
+        c.on_network_sync(1, t + 60_000, t + 60_000 - 120_000);
+        c.on_network_sync(2, t + 60_000, t + 60_000 - 120_000);
+        let rolled = t - 3_600_000;
+        assert_eq!(c.now(rolled), t, "RED: 回滚期间偏移变化把高水位洗掉");
+        assert!(c.high_water_ms() >= t as u64);
+        // 对照组：无回滚时的偏移变化允许重置基线（毒偏移撤离后不残留旧峰）
+        let mut c2 = InternalClock::new();
+        c2.trust_peer([1; 32]);
+        c2.trust_peer([2; 32]);
+        c2.trust_peer([3; 32]);
+        for p in 1..=3u8 {
+            c2.on_peer_exchange(
+                [p; 32],
+                t,
+                t + MAX_CORRECTION_MS + 100,
+                t + MAX_CORRECTION_MS + 150,
+                t + 250,
+            )
+            .unwrap();
+        }
+        assert_eq!(c2.now(t + 1_000), t + 1_000 + MAX_CORRECTION_MS, "毒偏移抬钟");
+        assert_eq!(c2.high_water_ms(), (t + 1_000 + MAX_CORRECTION_MS) as u64);
+        // 6 小时后网络校准/样本过期 → 偏移回落 0（偏移变化、非回滚）→ 基线重置
+        let later = t + NETWORK_FRESH_MS + 31 * 60_000;
+        assert_eq!(c2.now(later), later, "非回滚的偏移回落必须允许基线重置");
+        assert_eq!(c2.high_water_ms(), later as u64, "旧毒峰不残留");
+    }
+
+    #[test]
+    fn red_a3_stale_pending_slot_expires_and_fresh_pair_adopts() {
+        let t = 1_700_000_000_000i64;
+        let mut c = InternalClock::new();
+        // 诚实源 1 在 t 时刻报了 +2min 的偏移读数（瞬时毛刺），占住挂起槽
+        c.on_network_sync(1, t, t + 120_000);
+        // 超时前：旧槽仍活跃——毒源 2 与陈旧样本失配 → 双双作废（单槽语义不变）
+        c.on_network_sync(2, t + 200_000, t + 200_000);
+        assert_eq!(c.now(t + 201_000), t + 201_000);
+        // 源 1 重新挂起同样的陈旧偏移后销声匿迹
+        c.on_network_sync(1, t + 201_000, t + 201_000 + 120_000);
+        // 超时后（距上次挂起 > 5min）：挂起槽自动失效——
+        // 诚实源 2 的新读数不再与陈旧样本互耗，随后与源 1 的新读数正常配对
+        c.on_network_sync(2, t + 501_002, t + 501_002); // 陈旧槽清空，源 2 挂起
+        c.on_network_sync(1, t + 501_003, t + 501_003); // 源 1 新读数与源 2 配对
+        assert_eq!(
+            c.source(t + 502_000),
+            Source::Network,
+            "RED: 陈旧挂起槽永不失效时，诚实双源永远等不到配对"
+        );
+        assert_eq!(c.now(t + 502_000), t + 502_000, "诚实双源采纳 +0");
+    }
+
+    #[test]
+    fn red_a10_peak_cluster_extreme_inputs_no_panic() {
+        let mut c = InternalClock::new();
+        c.trust_peer([1; 32]);
+        c.trust_peer([2; 32]);
+        c.trust_peer([3; 32]);
+        // 样本带 +5s 正常偏移；随后用极端 local_ms 走 source/now
+        // （peak_cluster 的 fresh_cut 与簇内差值必须饱和而非溢出 panic）
+        let t = 1_700_000_000_000i64;
+        for p in 1..=3u8 {
+            c.on_peer_exchange([p; 32], t, t + 5_000, t + 5_100, t + 300).unwrap();
+        }
+        let r = quiet_panic(|| c.source(i64::MIN));
+        assert!(r.is_ok(), "RED: source(i64::MIN) 在 peak_cluster 减法上溢出 panic");
+        let r = quiet_panic(|| c.source(i64::MAX));
+        assert!(r.is_ok(), "RED: source(i64::MAX) 溢出 panic");
+        let r = quiet_panic(|| c.now(i64::MIN));
+        assert!(r.is_ok(), "RED: now(i64::MIN) 溢出 panic");
+        let v = c.now(i64::MIN);
+        assert!(
+            (0..=MAX_CORRECTION_MS).contains(&v),
+            "极端负读数下内部钟必须保持在非负且限幅的值域（实际 {v}）"
+        );
+    }
+
+    fn quiet_panic<R>(f: impl FnOnce() -> R) -> std::thread::Result<R> {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::panic::set_hook(prev);
+        r
     }
 }

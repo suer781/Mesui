@@ -227,7 +227,10 @@ impl MailboxRead {
 ///   窗内的条目永不被驱逐，窗内重放零逃逸
 /// - 容量满是 fail-closed：拒绝新写入（可用性损失随窗口自然排空），
 ///   绝不驱逐未过期防重放状态
-/// - 构造参数 = 软目标；攻击_backstop = max(cap, 4096)（约 200KB 内存上界）
+/// - 构造参数双向钳制到 [64, 4096]：下限保底（过小台账频繁 fail-closed
+///   的可用性自伤），上限钉死内存背板（约 4096 条 ≈ 200KB）——
+///   红队 A7 修复：FFI 构造参数（如 u32::MAX）直通 hard_cap 会让
+///   「内存上界」变成无界内存炸弹开关
 /// - 跨重启持久化由调用方负责（与 inbox_seen 同层）
 pub struct NonceCache {
     entries: std::collections::HashMap<crate::envelope::MsgId, u64>, // msg_id → expiry_ms
@@ -238,15 +241,18 @@ impl NonceCache {
     pub fn new(cap: usize) -> Self {
         Self {
             entries: std::collections::HashMap::new(),
-            hard_cap: cap.max(4096),
+            hard_cap: cap.clamp(64, 4096),
         }
     }
 
     /// true = 首次见到（放行）；false = 重放（拒绝）或容量满（fail-closed）。
     pub fn check_and_insert(&mut self, msg_id: &crate::envelope::MsgId, ts_ms: u64, now_ms: u64) -> bool {
         let expiry = ts_ms.saturating_add(REPLAY_WINDOW_MS + 2 * 60_000);
-        // 逐过期条（它们的防重放义务已随窗口终结）
-        self.entries.retain(|_, exp| *exp + 2 * 60_000 > now_ms);
+        // 逐过期条（它们的防重放义务已随窗口终结）；
+        // 红队 A8 修复：条目过期值可达 u64::MAX（合同上接受任意 u64 ts_ms），
+        // 裸加法 `exp + 120_000` 会溢出 panic——必须饱和
+        self.entries
+            .retain(|_, exp| exp.saturating_add(2 * 60_000) > now_ms);
         if self.entries.contains_key(msg_id) {
             return false;
         }
@@ -419,6 +425,64 @@ mod tests {
         bad.envelope.body.push(1);
         bad.nonce = [9; 16];
         assert!(verify_inbound(&bad, &secret, &mut nonces, 1000).is_err());
+    }
+
+    // ══════════ 红队修复回归测试（adversarial.rs 对应项的内核级细粒度覆盖） ══════════
+
+    #[test]
+    fn nonce_cache_cap_clamped_both_ways() {
+        // 红队 A7 修复：构造参数双向钳制 [64, 4096]——
+        // u32::MAX 直通不再是内存炸弹开关，合理容量下背板照常工作
+        let mut bomb = NonceCache::new(u32::MAX as usize);
+        let mut accepted = 0u32;
+        for i in 0..10_000u32 {
+            let mut id = [0u8; 16];
+            id[0] = (i >> 8) as u8;
+            id[1] = i as u8;
+            if bomb.check_and_insert(&id, 1_000_000, 1_000_000) {
+                accepted += 1;
+            }
+        }
+        assert_eq!(bomb.len(), 4096, "RED: 上界钳制缺失，10000 条全部驻留");
+        assert_eq!(accepted, 4096);
+        // 小容量保底到 64：new(0) / new(1) 不会造成即刻 fail-closed 自伤
+        let mut floor = NonceCache::new(0);
+        for i in 0..64u32 {
+            let mut id = [0u8; 16];
+            id[1] = i as u8;
+            assert!(floor.check_and_insert(&id, 1_000_000, 1_000_000), "下限保底 64");
+        }
+        let mut id65 = [0u8; 16];
+        id65[1] = 64;
+        assert!(!floor.check_and_insert(&id65, 1_000_000, 1_000_000), "第 65 条 fail-closed");
+        // 合理容量原样保留
+        let mut mid = NonceCache::new(1000);
+        let mut id = [0u8; 16];
+        id[2] = 1;
+        assert!(mid.check_and_insert(&id, 1_000_000, 1_000_000));
+    }
+
+    #[test]
+    fn nonce_cache_expiry_saturates_no_overflow() {
+        // 红队 A8 修复：台账条目过期值可达 u64::MAX（合同上接受任意 u64
+        // ts_ms），retain 的裸加法会溢出 panic——必须饱和
+        let mut c = NonceCache::new(100);
+        let id1 = [0x11; 16];
+        let id2 = [0x22; 16];
+        assert!(c.check_and_insert(&id1, u64::MAX, 0), "首插应成功");
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c.check_and_insert(&id2, u64::MAX, 0)
+        }));
+        assert!(r.is_ok(), "RED: 第二次 check_and_insert 在过期算术上 u64 溢出 panic");
+        assert_eq!(c.len(), 2, "u64::MAX 条目在 now=0 时未过期（饱和比较，不 panic）");
+        // 正常条目的过期清扫不受饱和影响
+        assert!(c.check_and_insert(&[0x33; 16], 1_000, 1_000));
+        assert_eq!(c.len(), 3);
+        assert!(
+            c.check_and_insert(&[0x44; 16], 1_000, 600_000),
+            "已过期条目被正常清扫、窗外重放按过期语义放行"
+        );
+        assert_eq!(c.len(), 3, "u64::MAX 饱和条目保持防重放义务，正常条目已排空");
     }
 
     // ══════════ 读桶（MailboxRead，SP-1.6） ══════════

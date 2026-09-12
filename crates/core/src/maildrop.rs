@@ -21,7 +21,6 @@
 //! Android 侧多线程经 UniFFI Object 的 &self 并发进入时串行化。
 
 use crate::envelope::{Envelope, PayloadKind};
-use crate::identity::NodeId;
 use crate::mailbox::{verify_inbound, BucketWrite, MailboxRead, NonceCache};
 use crate::nodekey::NodeKeyAnnouncement;
 use crate::CoreError;
@@ -42,6 +41,26 @@ const SENDER_IDLE_EVICT_MS: u64 = 2 * 60_000;
 /// 限速表软上限：超过才触发闲置清扫（正常联系人规模远达不到），
 /// 防止表随「被 MAC 放行的写入方数量」无界增长。
 const SENDER_SOFT_CAP: usize = 4096;
+/// msg_id 台账分区（桶对）数上限：每个新分区都需要持钥（secret），
+/// 伪造 sender 字段无法制造新分区——上限只是内存背板，超限时新对
+/// fail-closed（与台账满员同一语义：洪泛只换来拒绝）。
+const PAIR_LEDGER_CAP: usize = 4096;
+
+/// 限速表 / msg_id 台账分区的键 = **桶对身份**（mailbox secret 的域分离指纹）。
+///
+/// 红队 A5 修复：`envelope.sender` 由发送方自行填写、MAC 也由发送方自算——
+/// 持钥者可以给每条写入签一个不同的 sender，按 sender 限速 = 按**可伪造
+/// 字段**限速，30 封/分钟/对 的配额被多身份整体绕过。SP-1 的「对」由
+/// secret 唯一标识（派生自握手秘密 + 桶地址 + 版本），持钥者不换密钥
+/// 就无法拆分该配额。
+///
+/// 红队 A6 修复：msg_id 台账同样按对分区——一个持钥者至多灌满自己那本
+/// 台账，其他桶的诚实写入不再被 fail-closed 误判为重放。
+fn pair_key(secret: &[u8; 32]) -> [u8; 32] {
+    crate::identity::fingerprint1024(&[b"dc-maildrop-pair-v1", secret])[..32]
+        .try_into()
+        .expect("fingerprint1024 输出长度固定")
+}
 
 /// 信箱写桶门禁错误。刻意与 CoreError 分离：这是协议层判定结果，
 /// UI/调用方要按种类区别处置（重放 ≠ 限速 ≠ 篡改 ≠ 时钟漂移）。
@@ -212,13 +231,15 @@ impl SenderRate {
     }
 
     /// 尝试取 1 个令牌；返回是否放行。时钟回拨只停止补充、不倒扣
-    /// （saturating 语义：不产生负时间差）。
+    /// （saturating 语义：不产生负时间差）；锚点随读数回拨重置——
+    /// 一次毒化的 now_ms（如 i64::MAX）可以把锚点推到极大，若不回拨
+    /// 重置，后续诚实读数将永远等不到补充（红队 A1 同源问题的限速面）。
     fn try_take(&mut self, now_ms: u64) -> bool {
-        if now_ms > self.last_refill_ms {
+        if now_ms >= self.last_refill_ms {
             let elapsed = now_ms - self.last_refill_ms;
             self.tokens = (self.tokens + elapsed as f64 * REFILL_PER_MS).min(BUCKET_CAPACITY);
-            self.last_refill_ms = now_ms;
         }
+        self.last_refill_ms = now_ms;
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
@@ -232,19 +253,26 @@ impl SenderRate {
     }
 }
 
-/// 信箱管理器：msg_id 去重台账（NonceCache）+ 按写入方限速表。
+/// 信箱管理器：按桶对分区的 msg_id 去重台账 + 按桶对限速表。
 ///
-/// 每个实例服务一个桶（一对联系人一个 secret）；跨桶复用同一实例也
-/// 安全——去重键是 128 位随机 msg_id，限速键是发送方 NodeId，互不串扰。
+/// 红队 A5/A6 修复后的键空间：两者都以 `pair_key(secret)`（桶对身份）
+/// 为键——「30 封/分钟/对」的配额与 msg_id 台账都绑定在密钥上，
+/// `envelope.sender` 是持钥者可伪造的字段，不参与任何判定键。
+/// 单实例服务多个桶（FFI 的真实形态）因此安全：一个持钥者至多
+/// 灌满自己那对的政策状态，其他桶的诚实写入互不牵连。
 pub struct MailboxManager {
-    nonces: NonceCache,
+    /// msg_id 去重台账，按桶对分区（红队 A6 修复：跨对 fail-closed 隔离）
+    nonces: HashMap<[u8; 32], NonceCache>,
+    /// 每分区台账软目标容量（NonceCache 内部再钳制到 [64, 4096]）
+    ledger_cap: usize,
     /// 红队 A2b Verifier 修复：读 nonce 独立台账——**不过期**（只 FIFO 驱逐），
     /// 读路径无时间窗，nonce 条目若过期则同请求重放可拉取新到密文（元数据泄露）。
     read_nonces: std::collections::HashSet<[u8; 32]>,
     read_order: std::collections::VecDeque<[u8; 32]>,
     /// 读 nonce 台账容量（≈800KB 内存 @16384 条 × ~48B/条）
     read_cap: usize,
-    senders: HashMap<NodeId, SenderRate>,
+    /// 限速表：键 = 桶对（红队 A5 修复：配额绑定密钥而非可伪造的 sender）
+    senders: HashMap<[u8; 32], SenderRate>,
 }
 
 // Android 侧多线程经 FFI 并发调用：编译期钉死 Send + Sync。
@@ -254,10 +282,12 @@ const _: () = {
 };
 
 impl MailboxManager {
-    /// `cap` = msg_id 去重台账软目标容量（实际下限 4096，满则 fail-closed）。
+    /// `cap` = 每对 msg_id 去重台账软目标容量（NonceCache 内部钳制到
+    /// [64, 4096]，满则 fail-closed）。
     pub fn new(cap: usize) -> Self {
         Self {
-            nonces: NonceCache::new(cap),
+            nonces: HashMap::new(),
+            ledger_cap: cap,
             read_nonces: std::collections::HashSet::new(),
             read_order: std::collections::VecDeque::new(),
             read_cap: (cap.max(4096)).max(16384),
@@ -268,8 +298,8 @@ impl MailboxManager {
     /// 信箱写桶完整验收（SP-1 第 3/5 条顺序，代码强制不可重排）：
     /// 1. MAC（常量时间比较）→ 2. ±5min 时间窗 → 3. msg_id 去重
     ///    ——以上三步由 `verify_inbound()` 强制，去重必须后于验签
-    ///    （防用重复响应探测 msg_id 存在性）；
-    /// 4. 按写入方限速（令牌桶，≤30 封/分/对，超限拒绝）。
+    ///    （防用重复响应探测 msg_id 存在性）；去重台账按桶对分区；
+    /// 4. 按桶对限速（令牌桶，≤30 封/分/对，超限拒绝）。
     ///
     /// 返回 Ok 表示「可入桶」，实际存储由调用方处理。
     /// 注意：步骤 3 已把该写记入台账，被限速的写重交同一份会得到
@@ -280,8 +310,19 @@ impl MailboxManager {
         secret: &[u8; 32],
         now_ms: u64,
     ) -> std::result::Result<(), MailboxError> {
-        verify_inbound(write, secret, &mut self.nonces, now_ms).map_err(classify_gate)?;
-        self.rate_limit(&write.envelope.sender, now_ms)?;
+        let key = pair_key(secret);
+        if !self.nonces.contains_key(&key) && self.nonces.len() >= PAIR_LEDGER_CAP {
+            // 分区表满：新对 fail-closed。制造新分区需要持钥，
+            // 伪造 sender 字段无法撑大分区表（红队 A6 修复的边界）。
+            return Err(MailboxError::ReplayRejected);
+        }
+        let ledger_cap = self.ledger_cap;
+        let ledger = self
+            .nonces
+            .entry(key)
+            .or_insert_with(|| NonceCache::new(ledger_cap));
+        verify_inbound(write, secret, ledger, now_ms).map_err(classify_gate)?;
+        self.rate_limit(&key, now_ms)?;
         Ok(())
     }
 
@@ -294,7 +335,7 @@ impl MailboxManager {
     /// 3. 从 storage 取桶内序号 > cursor 的消息（升序；空桶/读尽 = 空表）。
     ///
     /// 需要 &mut self：nonce 台账在放行时记账（check_and_insert）。
-    /// 读路径不进写入限速表（限速键是发送方 NodeId，与读无关）。
+    /// 读路径不进写入限速表（限速键是桶对，与读无关）。
     pub fn read_bucket(
         &mut self,
         read: &MailboxRead,
@@ -321,12 +362,12 @@ impl MailboxManager {
             .map_err(|e| MailboxError::Storage(e.to_string()))
     }
 
-    fn rate_limit(&mut self, sender: &NodeId, now_ms: u64) -> std::result::Result<(), MailboxError> {
-        // 软上限触发闲置清扫：限速表不随写入方数量无界增长
+    fn rate_limit(&mut self, key: &[u8; 32], now_ms: u64) -> std::result::Result<(), MailboxError> {
+        // 软上限触发闲置清扫：限速表不随桶对数量无界增长
         if self.senders.len() >= SENDER_SOFT_CAP {
             self.senders.retain(|_, r| r.idle_for(now_ms) < SENDER_IDLE_EVICT_MS);
         }
-        let rate = self.senders.entry(*sender).or_insert_with(|| SenderRate::new(now_ms));
+        let rate = self.senders.entry(*key).or_insert_with(|| SenderRate::new(now_ms));
         if rate.try_take(now_ms) {
             Ok(())
         } else {
@@ -334,12 +375,12 @@ impl MailboxManager {
         }
     }
 
-    /// 去重台账当前条数（监控/测试用）。
+    /// 去重台账当前条数（跨所有桶对分区求和，监控/测试用）。
     pub fn nonce_cache_len(&self) -> usize {
-        self.nonces.len()
+        self.nonces.values().map(|c| c.len()).sum()
     }
 
-    /// 限速表当前跟踪的发送方数（监控/测试用）。
+    /// 限速表当前跟踪的桶对数（监控/测试用）。
     pub fn tracked_senders(&self) -> usize {
         self.senders.len()
     }
@@ -457,33 +498,112 @@ mod tests {
 
     #[test]
     fn senders_have_independent_buckets() {
+        // 红队 A5 修复后限速键 = 桶对（secret）：不同联系人各持各的
+        // mailbox secret（独立成对），彼此的配额互不挤占；
+        // 同一对内伪造 sender 字段不能拆分配额（见 pair_rate_binds_secret）。
         let a = Identity::generate().unwrap();
         let b = Identity::generate().unwrap();
-        let bucket = generate_bucket_address().unwrap();
-        let secret = derive_mailbox_secret(b"hs", &bucket, 1);
+        let bucket_a = generate_bucket_address().unwrap();
+        let bucket_b = generate_bucket_address().unwrap();
+        let secret_a = derive_mailbox_secret(b"hs-a", &bucket_a, 1);
+        let secret_b = derive_mailbox_secret(b"hs-b", &bucket_b, 1);
         let mut mgr = fresh_manager();
         let t0 = 10_000_000u64;
         // A 打满自己的 30 封
         for i in 0..WRITES_PER_MINUTE {
-            let w = sealed_write(&a, &secret, (i as u8) + 1, t0);
-            mgr.submit_write(&w, &secret, t0).unwrap();
+            let w = sealed_write(&a, &secret_a, (i as u8) + 1, t0);
+            mgr.submit_write(&w, &secret_a, t0).unwrap();
         }
         assert_eq!(
-            mgr.submit_write(&sealed_write(&a, &secret, 99, t0), &secret, t0),
+            mgr.submit_write(&sealed_write(&a, &secret_a, 99, t0), &secret_a, t0),
             Err(MailboxError::RateLimited)
         );
         // B 的桶独立：A 被限速不影响 B 满额可写
-        mgr.submit_write(&sealed_write(&b, &secret, 50, t0), &secret, t0).unwrap();
+        mgr.submit_write(&sealed_write(&b, &secret_b, 50, t0), &secret_b, t0).unwrap();
         // B 打满自己的 30 封（前面已用 1 封）
         for i in 1..WRITES_PER_MINUTE {
-            let w = sealed_write(&b, &secret, 60 + (i as u8), t0);
-            mgr.submit_write(&w, &secret, t0).unwrap();
+            let w = sealed_write(&b, &secret_b, 60 + (i as u8), t0);
+            mgr.submit_write(&w, &secret_b, t0).unwrap();
         }
         assert_eq!(
-            mgr.submit_write(&sealed_write(&b, &secret, 98, t0), &secret, t0),
+            mgr.submit_write(&sealed_write(&b, &secret_b, 98, t0), &secret_b, t0),
             Err(MailboxError::RateLimited)
         );
         assert_eq!(mgr.tracked_senders(), 2);
+    }
+
+    // ══════════ 红队修复回归测试（adversarial.rs 对应项的内核级细粒度覆盖） ══════════
+
+    #[test]
+    fn pair_rate_binds_secret_not_spoofable_sender() {
+        // 红队 A5 修复回归：持钥者给每条写入签一个不同的 sender，
+        // 30/min/对 的配额不得被多身份拆分
+        let secret = derive_mailbox_secret(b"adv-a5-unit", &[0xA5; 32], 1);
+        let mut mgr = fresh_manager();
+        let t0 = 10_000_000u64;
+        let mut accepted = 0u32;
+        for i in 0..100u32 {
+            let mut sender = [0u8; 32];
+            sender[0] = (i >> 8) as u8;
+            sender[1] = i as u8;
+            sender[2] = 0x5A;
+            let mut msg_id = [0u8; 16];
+            msg_id[0] = (i >> 8) as u8;
+            msg_id[1] = i as u8;
+            msg_id[2] = 0x5A;
+            let w = sealed_write(&mk_identity(sender), &secret, msg_id[1], t0);
+            if mgr.submit_write(&w, &secret, t0).is_ok() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(
+            accepted, WRITES_PER_MINUTE,
+            "RED: 持钥者伪造 sender 身份拆分配额（限速键必须绑定桶对）"
+        );
+        assert_eq!(mgr.tracked_senders(), 1, "100 个伪造 sender 只有一只桶");
+    }
+
+    #[test]
+    fn pair_ledger_partition_isolation_at_capacity() {
+        // 红队 A6 修复回归：msg_id 台账按桶对分区——把恶意对的台账直接灌满
+        // （经门禁的洪泛已被限速层挡住，这里绕过门禁验证最后一道防线的隔离
+        // 性），其他对的诚实写入不得被 fail-closed 误判为重放
+        let s_evil = derive_mailbox_secret(b"adv-a6-unit-evil", &[0xE1; 32], 1);
+        let s_honest = derive_mailbox_secret(b"adv-a6-unit-honest", &[0x03; 32], 1);
+        let mut mgr = fresh_manager();
+        let t0 = 10_000_000u64;
+
+        let evil_ledger = mgr.nonces.entry(pair_key(&s_evil)).or_insert_with(|| NonceCache::new(4096));
+        for i in 0..4096u32 {
+            let mut id = [0u8; 16];
+            id[0] = (i >> 8) as u8;
+            id[1] = i as u8;
+            id[2] = 0xEE;
+            assert!(evil_ledger.check_and_insert(&id, t0, t0), "灌满恶意对台账");
+        }
+        assert_eq!(evil_ledger.len(), 4096);
+
+        // 恶意对第 4097 条：fail-closed（洪泛的代价），且只限本对
+        let over_w = sealed_write(&mk_identity([0xEE; 32]), &s_evil, 0x42, t0);
+        assert_eq!(
+            mgr.submit_write(&over_w, &s_evil, t0),
+            Err(MailboxError::ReplayRejected),
+            "恶意对台账满员后 fail-closed"
+        );
+
+        // 诚实对（另一把 secret）：全新分区，不受恶意对满员牵连
+        let honest_w = sealed_write(&mk_identity([0x33; 32]), &s_honest, 0x33, t0);
+        assert_eq!(
+            mgr.submit_write(&honest_w, &s_honest, t0),
+            Ok(()),
+            "RED: 单对的台账洪泛把其他对的诚实写入 fail-closed 误判为重放"
+        );
+        assert_eq!(mgr.nonce_cache_len(), 4097, "台账按对分区：4096（恶意）+ 1（诚实）");
+    }
+
+    /// 测试支撑：从任意 NodeId 字节构造确定性身份。
+    fn mk_identity(node_id: [u8; 32]) -> Identity {
+        Identity::from_seed(node_id)
     }
 
     // ══════════ 读桶（read_bucket + BucketStorage，SP-1.6） ══════════

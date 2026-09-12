@@ -104,14 +104,18 @@ impl Db {
 
     /// 完整信封入队（投递管理器主路径）：outbox 行 + 完整 CBOR 存档（outbox_env）。
     /// `enqueue` 的列不含 sender/ttl_hops，补投重建会缺元数据；本方法把整个
-    /// 信封留档，`due_envelopes` 按 CBOR 精确还原。同 msg_id 重复入队：
-    /// outbox 忽略（幂等），存档覆盖（同一消息内容一致，无害；重发走 revive）。
+    /// 信封留档，`due_envelopes` 按 CBOR 精确还原。
+    /// 红队 A4 修复：同 msg_id 重复入队**首次写入为准**（INSERT OR IGNORE）——
+    /// msg_id 是线上攻击者自选的 16 字节，第二份信封的内容/收件人可以与
+    /// 首份完全不同；REPLACE 会让未投递消息在投递前被偷换（且与 outbox 行
+    /// 的元数据分叉）。存档与 outbox 行同进退（mark_sent / prune_dead 同步
+    /// 清理），重发走 revive，不走二次入队。
     pub fn enqueue_full(&self, env: &Envelope) -> Result<()> {
         self.enqueue(env)?;
         let cbor = env.to_cbor()?;
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO outbox_env (msg_id, env) VALUES (?1, ?2)",
+                "INSERT OR IGNORE INTO outbox_env (msg_id, env) VALUES (?1, ?2)",
                 params![env.msg_id.as_slice(), cbor],
             )
             .map_err(|e| CoreError::Db(e.to_string()))?;
@@ -515,5 +519,34 @@ mod tests {
         assert_eq!(db.prune_dead(5000).unwrap(), 1);
         assert!(db.dead_list(10).unwrap().is_empty());
         assert_eq!(db.stats().unwrap(), (1, 0, 0), "复活的那条仍是 pending");
+    }
+
+    #[test]
+    fn enqueue_full_same_msg_id_first_write_wins() {
+        // 红队 A4 修复回归：msg_id 是线上攻击者自选的 16 字节——
+        // 同 id 二次入队（内容/收件人完全不同）不得偷换已入队消息
+        let db = Db::open(std::path::Path::new(":memory:"), None).unwrap();
+        let bob = [0xB0; 32];
+        let mallory = [0xE5; 32];
+        let x = [0x42; 16];
+        let first = Envelope {
+            msg_id: x, sender: [1; 32], recipient: Some(bob), group: None,
+            kind: PayloadKind::Text, body: vec![1], sent_at_ms: 1000, ttl_hops: 6,
+        };
+        let second = Envelope {
+            msg_id: x, sender: [2; 32], recipient: Some(mallory), group: None,
+            kind: PayloadKind::Text, body: vec![2, 2, 2], sent_at_ms: 2000, ttl_hops: 6,
+        };
+        db.enqueue_full(&first).unwrap();
+        db.enqueue_full(&second).unwrap();
+        assert_eq!(db.pending(10).unwrap().len(), 1, "outbox 行幂等");
+        let due = db.due_envelopes(5000, 10).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].body, vec![1], "RED: 存档被 REPLACE 偷换（首次写入必须为准）");
+        assert_eq!(due[0].sender, [1; 32], "RED: sender 被二次入队偷换");
+        assert_eq!(due[0].recipient, Some(bob), "RED: 收件人被二次入队偷换");
+        assert_eq!(due[0].sent_at_ms, 1000, "RED: 时间戳被二次入队偷换");
+        // 与 outbox 行不再分叉：CBOR 存档 = 首份信封的无损还原
+        assert_eq!(due[0], first);
     }
 }
