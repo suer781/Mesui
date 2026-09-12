@@ -37,7 +37,15 @@ jobs:
         run: cargo install cargo-ndk
 
       - name: 安装 protoc（libsignal 后量子棘轮的 protobuf 代码生成需要）
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        run: |
+          # runner 镜像自带的 google-chrome apt 源上游偶尔 Hash Sum mismatch，
+          # 会让 apt-get update 以 100 退出、拖垮整条流水线（2026-09-10 实证）。
+          # 本步只需要 Ubuntu 官方仓库的 protobuf-compiler：先摘掉 chrome 源
+          # （deb822 新格式是 .sources、旧格式是 .list，glob 不带扩展名全删），
+          # update 失败再重试一次。
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          sudo apt-get update || { sleep 20 && sudo apt-get update; }
+          sudo apt-get install -y protobuf-compiler
 
       - name: 定位预装 Android NDK
         run: |
@@ -45,6 +53,12 @@ jobs:
             NDK_ROOT="${ANDROID_NDK_ROOT:-}"
             if [ -z "$NDK_ROOT" ]; then
               NDK_ROOT="$(ls -d "${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"/ndk/* 2>/dev/null | head -1)"
+            fi
+            # fail-fast：runner 镜像换了/NDK 目录为空时立即报错，
+            # 不许静默带空路径往下走（此前会在 cargo-ndk 交叉编译步才炸，报错误导排查）
+            if [ -z "$NDK_ROOT" ] || [ ! -d "$NDK_ROOT" ]; then
+              echo "::error::未找到预装 NDK（查过 ANDROID_NDK_HOME/ANDROID_NDK_ROOT 与 ${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}/ndk/*）。请在 runner 上安装固定版本 NDK 或显式设置 ANDROID_NDK_ROOT"
+              exit 1
             fi
             echo "ANDROID_NDK_HOME=$NDK_ROOT" >> "$GITHUB_ENV"
             echo "使用 NDK: $NDK_ROOT"
@@ -95,6 +109,17 @@ jobs:
           CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
           cargo test --lib -p dc-core --features vendored-openssl
 
+      # 此前 CI 只跑 --lib，tests/ 下的集成测试（redteam 20 例 /
+      # security_bruteforce 1 例 / iroh_pair 1 例）从未被执行过。三份测试
+      # 均为进程内确定性测试（iroh_pair 已禁 relay 走 loopback），不依赖外网。
+      - name: Rust 集成测试（tests/ 全量）
+        env:
+          OPENSSL_DIR: /tmp/openssl-dummy
+        run: |
+          mkdir -p /tmp/openssl-dummy/include /tmp/openssl-dummy/lib
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+          cargo test --tests -p dc-core --features vendored-openssl
+
       # ================= UniFFI Kotlin 绑定 =================
       # uniffi-bindgen 的 --library 模式靠 dlopen 读取 cdylib 里嵌入的元数据，
       # 必须是 host 架构（x86_64-linux）的 .so，不能用上面 cargo-ndk 产出的
@@ -126,6 +151,20 @@ jobs:
 
       - name: 构建 APK
         run: cd android && chmod +x gradlew && ./gradlew assembleDebug --no-daemon
+
+      # 此前 CI 只 assembleDebug，Kotlin 单测（FrameCollector / BleFrame /
+      # FriendLink / NearbyDiscovery / MainScaffold 等）只被编译从未被执行。
+      # Robolectric 镜像已在 build.gradle.kts 指到国内源，CI 上走 aliyun 亦可。
+      - name: Kotlin 单元测试
+        run: cd android && ./gradlew testDebugUnitTest --no-daemon
+
+      # release 才启用 R8 混淆（build.gradle.kts 中 isMinifyEnabled/isShrinkResources），
+      # proguard keep 规则只在 assembleRelease 时生效——此前 CI 只跑 assembleDebug，
+      # 混淆路径从未被验证过，keep 缺失会在 release 首调 JNA 核心时才暴露
+      # （UnsatisfiedLinkError / struct 字段错位崩溃）。此步专门验证 R8 通过。
+      # release 无签名配置时产出 unsigned APK，不影响混淆验证。
+      - name: Release 混淆验证
+        run: cd android && ./gradlew assembleRelease --no-daemon
 
       - name: 上传 APK
         uses: actions/upload-artifact@v4

@@ -11,11 +11,15 @@ import java.security.SecureRandom
  *
  * 载荷 = dc://add?v=2 URI（阶段 0 起为真实密钥材料）：
  * - [name] 出示方地址名（ProtocolAddress + SAS 本地标识，对端原样回传）
- * - [identity] 出示方长期身份公钥（SAS/TOFU 锚点）
+ * - [identity] 出示方长期身份公钥（SAS/TOFU 锚点）：33 字节，即 libsignal
+ *   `IdentityKey::serialize()`（1 字节曲线类型前缀 + 32 字节裸公钥），与
+ *   `SignalSession.identityKey()` 返回值、Rust 侧 `IdentityKey::decode()` 入参为同一契约
  * - [bundle] PreKeyBundle 上线格式（CBOR，含 Kyber-1024 公钥，约 1.8KB）
  * - [bucket] 随机信箱桶地址
  * - [token] 单次 bootstrap token：带外秘密，首条消息须携带其 keyed-BLAKE3 MAC
  * - [ble] BLE 匹配 id：与 BLE 广播携带同一 id，扫码方据此定位设备（阶段 3）
+ * - [naddr] 出示方 iroh 节点地址快照（dc://node?v=1&…，跨网络直连入口；
+ *   节点未就绪时省略——parse 侧可选，旧版载荷缺省为空串）
  *
  * 身份↔节点密钥的绑定只在双方 Signal 会话内生效；token 单次有效。
  */
@@ -26,11 +30,13 @@ data class AddFriendPayload(
     val bucket: ByteArray,
     val token: ByteArray,
     val ble: ByteArray,
+    val naddr: String = "",
 ) {
     init {
         // 编码进 URI 前先断言，防止非法名破坏 dc://add 解析
         require(chat.dc.app.core.SignalCore.NAME_RE.matches(name)) { "bad name" }
-        require(identity.size == 32) { "identity must be 32 bytes" }
+        // 33 = libsignal IdentityKey::serialize()（1 字节类型前缀 + 32 字节公钥），见类注释
+        require(identity.size == 33) { "identity must be 33 bytes" }
         require(bucket.size == 32) { "bucket must be 32 bytes" }
         require(token.size == 48) { "token must be 48 bytes" }
         require(ble.size == 8) { "ble must be 8 bytes" }
@@ -40,7 +46,8 @@ data class AddFriendPayload(
     fun encode(): String {
         val b64 = { bytes: ByteArray -> java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes) }
         return "dc://add?v=2&name=$name&id=${b64(identity)}&bundle=${b64(bundle)}" +
-            "&bucket=${b64(bucket)}&token=${b64(token)}&ble=${b64(ble)}"
+            "&bucket=${b64(bucket)}&token=${b64(token)}&ble=${b64(ble)}" +
+            if (naddr.isEmpty()) "" else "&naddr=${b64(naddr.toByteArray(Charsets.UTF_8))}"
     }
 
     companion object {
@@ -63,20 +70,27 @@ data class AddFriendPayload(
             val bucket = b64(params["bucket"]) ?: return null
             val token = b64(params["token"]) ?: return null
             val ble = b64(params["ble"]) ?: return null
-            return runCatching { AddFriendPayload(name, id, bundle, bucket, token, ble) }.getOrNull()
+            // 可选：iroh 节点地址快照（文本字段经 b64 穿越 URI）
+            val naddr = b64(params["naddr"])?.toString(Charsets.UTF_8) ?: ""
+            return runCatching { AddFriendPayload(name, id, bundle, bucket, token, ble, naddr) }.getOrNull()
         }
     }
 }
 
 object QrCodec {
-    /** 生成方形二维码位图（纠错 M，容损 15%）。 */
+    /** 生成方形二维码位图。纠错 L（7%）：本场景单帧截屏无意义（须集齐全部
+     *  数据帧），用更低的纠错换取更快更稳的解码——「总差最后一帧」的帮凶
+     *  之一就是高密度帧 + M 级纠错解码耗时超过展示时长导致跳帧。 */
     fun encode(content: String, size: Int): Bitmap {
         val matrix = QRCodeWriter().encode(
             content,
             BarcodeFormat.QR_CODE,
             size,
             size,
-            mapOf(EncodeHintType.MARGIN to 1),
+            mapOf(
+                EncodeHintType.MARGIN to 1,
+                EncodeHintType.ERROR_CORRECTION to com.google.zxing.qrcode.decoder.ErrorCorrectionLevel.L,
+            ),
         )
         val bmp = Bitmap.createBitmap(matrix.width, matrix.height, Bitmap.Config.ARGB_8888)
         for (x in 0 until matrix.width) {
@@ -99,8 +113,10 @@ object FrameCodec {
     const val FRAME_PREFIX = "dc://addframe?v=1&"
 
     // 真实载荷（含 ~1.8KB 的 PreKeyBundle）约 2.6KB；48 字符/帧会切出
-    // 50+ 帧（30 秒以上才能集齐），故提到 256：约 11 帧，配合 3 秒
-    // 时长门槛在 10 秒内可读全。单帧 QR 约 390 字符（版本 13），可扫。
+    // 50+ 帧（30 秒以上才能集齐），故提到 256：约 11 帧。展示端 150ms/帧、
+    // 数据:噪声 = 3:1（见 ShowMyCodeScreen），全部数据帧 ~2.2s 一轮，
+    // 配合 3 秒时长门槛，正常 3-4 秒集齐。单帧 QR 约 390 字符（版本 13），
+    // 纠错 L 换取更快解码，可扫。
     const val CHUNK_SIZE = 256
 
     fun split(payload: AddFriendPayload, sid: String): List<String> {
@@ -195,9 +211,14 @@ class FrameCollector(private val minCollectMs: Long = FrameCodec.MIN_COLLECT_MS)
         val enoughTime = elapsed >= minCollectMs
         if (allCollected && enoughTime && !parsed) {
             parsed = true
+            // 各帧 d 段是独立 b64 编码（段长非 3 倍数时填充位错位），
+            // 必须逐段 decode 后再拼接原文，不能整串 decode
             payload = (0 until total).mapNotNull { chunks[it] }
+                .mapNotNull { seg ->
+                    runCatching { String(java.util.Base64.getUrlDecoder().decode(seg), Charsets.UTF_8) }.getOrNull()
+                }
                 .joinToString("")
-                .let { runCatching { AddFriendPayload.parse(String(java.util.Base64.getUrlDecoder().decode(it), Charsets.UTF_8)) }.getOrNull() }
+                .let { runCatching { AddFriendPayload.parse(it) }.getOrNull() }
         }
         return State(chunks.keys.size, if (total < 0) 0 else total, elapsed, payload != null, payload)
     }

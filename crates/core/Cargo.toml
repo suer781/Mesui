@@ -26,7 +26,7 @@ default = ["db", "compress", "signal", "iroh-net"]
 db = ["dep:rusqlite"]                    # SQLCipher 加密本地库
 compress = ["dep:zstd"]                  # 中/重载档批量压缩
 signal = ["dep:libsignal-protocol", "dep:rand", "dep:futures", "dep:async-trait", "db"]  # Signal 官方 monorepo（vendored）+ 握手所需 RNG/executor；store 落库需 db
-iroh-net = ["dep:iroh"]                  # P2P 管道（QUIC 打洞 + 中继）
+iroh-net = ["dep:iroh", "dep:tokio"]     # P2P 管道（QUIC 打洞 + 中继）
 ffi = ["dep:uniffi"]                     # UniFFI Kotlin 绑定（Android 集成时开）
 # 交叉编译 Android 等无系统 OpenSSL 的目标时用：SQLCipher 的 C 编译需要
 # OpenSSL 头文件，改由 openssl-src 从源码 vendor（走 cargo-ndk 注入的 NDK
@@ -53,6 +53,9 @@ rand = { version = "0.9", optional = true }
 futures = { version = "0.3", optional = true }
 async-trait = { version = "0.1", optional = true } # 实现 libsignal 的 ?Send async store trait（版本随 lock 统一到 0.1.92）
 iroh = { version = "1", optional = true }
+# 自有 tokio 运行时：FFI 宿主线程（Kotlin）非 async 上下文，Node 在内部
+# 起独立 runtime 驱动 accept 循环与发送；features 与 dev-dependencies 取并集
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "time"] }
 uniffi = { version = "0.29", optional = true, features = ["build", "cli"] }
 
 [dev-dependencies]

@@ -183,17 +183,33 @@ impl IdentityKeyStore for SqlSignalStore {
             )
             .optional()
         })?;
-        let changed = match existing {
-            Some(prev) => IdentityKey::try_from(prev.as_slice())? != *identity,
-            None => false,
-        };
+        // P1-1：此前 INSERT OR REPLACE 静默覆盖已有身份、IdentityChange 被丢弃，
+        // pin_identity 换钥毫无告警。现改为：已有记录且新钥不同 → 直接拒绝。
+        // 协议路径不受影响——vendored libsignal 的所有 save_identity 调用点
+        // （process_prekey_bundle / process_prekey / session_management）都先经
+        // is_trusted_identity 拦截（本 store 对异钥返回 false → UntrustedIdentity），
+        // 异钥到不了 save 这步；能走到这里的异钥只可能来自显式 pin_identity。
+        // 无记录 = TOFU 首次自动信任（设计如此，不动）；同钥重写无变化。
+        if let Some(prev) = &existing {
+            if IdentityKey::try_from(prev.as_slice())? != *identity {
+                return Err(libsignal_protocol::SignalProtocolError::InvalidState(
+                    "save_identity",
+                    format!(
+                        "refusing to overwrite identity for {} device {}: key changed (re-scan QR to re-establish)",
+                        address.name(),
+                        u8::from(address.device_id()),
+                    ),
+                ));
+            }
+        }
         self.with_conn("save_identity", |c| {
             c.execute(
                 "INSERT OR REPLACE INTO trusted_identities (name, device, identity) VALUES (?1, ?2, ?3)",
                 params![address.name(), u8::from(address.device_id()) as i64, identity.serialize().to_vec()],
             )
         })?;
-        Ok(IdentityChange::from_changed(changed))
+        // 走到插入这一步只可能是首次写入或同钥重写，不再有 ReplacedIdentities
+        Ok(IdentityChange::from_changed(false))
     }
 
     async fn is_trusted_identity(
@@ -440,6 +456,30 @@ mod tests {
             let bob2 = Device::generate("bob").unwrap();
             assert!(!alice.is_trusted(&bob_addr, &bob2.identity_key().unwrap()).unwrap());
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P1-1：pin 异钥必须报错且旧记录保留（堵静默覆盖）；pin 同钥重复成功。
+    #[test]
+    fn pin_identity_rejects_key_change() {
+        let path = temp_db("pin-change");
+        let bob = Device::generate("bob").unwrap();
+        let bob_addr = bob.address().clone();
+        let bik = bob.identity_key().unwrap();
+        let mut alice = Device::open(&path, Some("testkey"), "alice").unwrap();
+        // 首次 pin（TOFU 无记录写入）与同钥重复 pin：都必须成功
+        alice.pin_identity(&bob_addr, &bik).unwrap();
+        alice.pin_identity(&bob_addr, &bik).unwrap();
+        // 换钥 pin：拒绝，不得覆盖
+        let bob2 = Device::generate("bob").unwrap();
+        let bik2 = bob2.identity_key().unwrap();
+        assert!(
+            alice.pin_identity(&bob_addr, &bik2).is_err(),
+            "异钥 pin 必须报错，不得静默覆盖"
+        );
+        // 旧记录原样保留：原钥仍可信、新钥仍不可信
+        assert!(alice.is_trusted(&bob_addr, &bik).unwrap(), "异钥被拒后旧 pin 必须保留");
+        assert!(!alice.is_trusted(&bob_addr, &bik2).unwrap());
         let _ = std::fs::remove_file(&path);
     }
 

@@ -165,23 +165,29 @@ fun MainScaffold() {
                 )
             }
             composable("me") {
-                MeScreen(onOpenAddFriend = { navController.navigate("add_friend") })
+                // 资料卡二维码图标应直达「本人可分享二维码」屏（add_friend_show =
+                // ShowMyCodeScreen），而非先进加好友角色选择页（缺陷 E：避免多点一下）
+                MeScreen(onOpenAddFriend = { navController.navigate("add_friend_show") })
             }
-            composable("nearby") { NearbyScreen() }
+            composable("nearby") {
+                NearbyScreen(onBack = { navController.popBackStack() })
+            }
             // 加好友入口先选角色，出示码与扫码是两个独立页，绝不同屏（安全）
             composable("add_friend") {
                 AddFriendRoleScreen(
+                    onBack = { navController.popBackStack() },
                     onShow = { navController.navigate("add_friend_show") },
                     onScan = { navController.navigate("add_friend_scan") },
                 )
             }
-            composable("add_friend_show") { ShowMyCodeScreen() }
-            composable("add_friend_scan") { ScanToAddScreen() }
+            composable("add_friend_show") { ShowMyCodeScreen(onBack = { navController.popBackStack() }) }
+            composable("add_friend_scan") { ScanToAddScreen(onBack = { navController.popBackStack() }) }
             composable(
                 route = "chat/{contactId}",
                 arguments = listOf(navArgument("contactId") { type = NavType.StringType }),
-            ) {
+            ) { entry ->
                 ChatScreen(
+                    contactId = entry.arguments?.getString("contactId").orEmpty(),
                     onBack = { navController.popBackStack() },
                     onAddFriend = { navController.navigate("add_friend") },
                 )

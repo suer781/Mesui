@@ -1,8 +1,9 @@
 //! Signal 会话层：PQXDH(Kyber-1024 + X25519) 初始协商 → Double Ratchet 逐条换钥 → SAS 带外比对。
 //!
 //! 密码学原语全部来自 vendored libsignal-protocol，本模块只做编排：
-//! - 初始密钥：`process_prekey_bundle` 跑 X3DH，内部 HKDF 从共享点派生根密钥（不直接用共享点当钥匙）。
-//!   该 libsignal 版本的 PreKeyBundle 恒含 Kyber 预密钥，故初始握手即 PQXDH（抗量子）。
+//! - 初始密钥：`process_prekey_bundle` 跑 PQXDH，内部 HKDF 从共享点派生根密钥（不直接用共享点当钥匙）。
+//!   之所以是 PQXDH 而非 X3DH：本 libsignal 版本的 PreKeyBundle 恒含 Kyber 预密钥，
+//!   X3DH 的 X25519 共享点之外还叠加了 Kyber-1024 的 KEM 共享秘密，故初始握手即抗量子。
 //! - 逐条消息：`message_encrypt` / `message_decrypt` 驱动 Double Ratchet，前向保密 + 后向自愈。
 //! - 带外认证：SAS 由 `Fingerprint` 计算，绑定双方长期身份公钥；两端算出同一串，中间人必不匹配。
 //! - 首条消息：QR 里的一次性 token 派生 keyed-BLAKE3 MAC，未扫到码者无法为第一条握手消息造出合法 MAC。
@@ -35,11 +36,29 @@ fn crypto_err<E: std::fmt::Display>(e: E) -> CoreError {
     CoreError::Crypto(e.to_string())
 }
 
+/// libsignal 错误 → CoreError：不可信身份单独成类（TOFU 拒绝是安全
+/// 信号，UI 必须能区别于普通失败）。
+fn map_signal_err(e: libsignal_protocol::SignalProtocolError) -> CoreError {
+    match e {
+        libsignal_protocol::SignalProtocolError::UntrustedIdentity(addr) => {
+            CoreError::IdentityChanged(addr.name().to_string())
+        }
+        other => crypto_err(other),
+    }
+}
+
 /// 驱动 libsignal 的 async trait：其 future 为 `?Send`，用当前线程 `block_on` 即可。
 fn block<T>(
     fut: impl std::future::Future<Output = std::result::Result<T, libsignal_protocol::SignalProtocolError>>,
 ) -> Result<T> {
     block_on(fut).map_err(crypto_err)
+}
+
+/// 同 block，但按 map_signal_err 分类（TOFU 拒绝单独成类）。
+fn block_tofu<T>(
+    fut: impl std::future::Future<Output = std::result::Result<T, libsignal_protocol::SignalProtocolError>>,
+) -> Result<T> {
+    block_on(fut).map_err(map_signal_err)
 }
 
 fn now_ts() -> Timestamp {
@@ -152,7 +171,7 @@ impl Device {
         // 两个 &mut dyn 不能同时借自一个对象 → 传共享连接的克隆（见 signal_store.rs）
         let mut session = self.store.clone();
         let mut identity = self.store.clone();
-        block(process_prekey_bundle(
+        block_tofu(process_prekey_bundle(
             remote,
             &self.address,
             &mut session,
@@ -208,7 +227,7 @@ impl Device {
         let mut prekey = self.store.clone();
         let signed = self.store.clone();
         let mut kyber = self.store.clone();
-        block(message_decrypt(
+        block_tofu(message_decrypt(
             &cm,
             remote,
             &self.address,
@@ -493,6 +512,29 @@ mod tests {
         assert!(!alice.is_trusted(&bob_addr, &bik2).unwrap());
     }
 
+    /// TOFU 拒绝必须是可分类的错误（IdentityChanged），UI 才能把
+    /// 「对方换钥匙的安全信号」与普通协商失败区分开。
+    #[test]
+    fn process_bundle_rejects_changed_identity_as_classified_error() {
+        let mut alice = Device::generate("a").unwrap();
+        let mut bob = Device::generate("b").unwrap();
+        let bob_addr = bob.address().clone();
+        alice
+            .process_bundle(&bob_addr, &bob.prekey_bundle().unwrap())
+            .unwrap();
+        alice.pin_identity(&bob_addr, &bob.identity_key().unwrap()).unwrap();
+
+        // 同名地址、新长期身份钥的 bundle：process 应被 TOFU 拒绝且错误成类
+        let mut bob2 = Device::generate("b").unwrap();
+        let err = alice
+            .process_bundle(&bob_addr, &bob2.prekey_bundle().unwrap())
+            .expect_err("换钥后必须拒绝");
+        assert!(
+            matches!(&err, CoreError::IdentityChanged(name) if name == "b"),
+            "错误须分类为 IdentityChanged，实际: {err:?}"
+        );
+    }
+
     /// 首条消息 token-MAC：正确 token 通过；错 token / 改密文均拒。
     #[test]
     fn first_message_token_mac() {
@@ -570,5 +612,32 @@ mod tests {
         );
         let (t3, ct3) = alice.encrypt(&bob_addr, b"msg after connect").unwrap();
         assert_eq!(bob.decrypt(&alice_addr, t3, &ct3).unwrap(), b"msg after connect");
+    }
+
+    /// 跨 FFI 字节契约回归：Kotlin 侧 `AddFriendPayload.identity` 必须是 **33 字节**。
+    ///
+    /// Kotlin 的 `SignalSession.identityKey()` 拿到的就是本测试里
+    /// `identity_key().serialize()` 的同一份字节（含 libsignal 的 1 字节曲线类型前缀）。
+    /// `AddFriendPayload` 的长度断言、以及 Rust 侧 `IdentityKey::decode()`
+    /// （`sas_with` / `pin_identity` 的入参解析）依赖同一个「33 字节」契约；
+    /// 历史上 Kotlin 侧误写成 32，导致出示码页面启动即崩、安全码恒为空。
+    /// 此处把该跨语言契约钉死，防止再次回归。
+    #[test]
+    fn identity_key_wire_bytes_are_33_and_roundtrip_through_decode() {
+        let device = Device::generate("x").unwrap();
+        let bytes = device.identity_key().unwrap().serialize().to_vec();
+
+        // 1 字节曲线类型前缀 + 32 字节公钥
+        assert_eq!(bytes.len(), 33, "跨 FFI 契约：identity 必须是 33 字节");
+
+        // 模拟 Kotlin 把 identityKey() 的字节原样回传给 sas_with / pin_identity
+        let decoded = IdentityKey::decode(&bytes).expect("33 字节必须能 decode 成 IdentityKey");
+        assert_eq!(decoded.serialize().to_vec(), bytes);
+
+        // 截断成裸 32 字节公钥必须失败——这正是曾经写错的契约
+        assert!(
+            IdentityKey::decode(&bytes[..32]).is_err(),
+            "32 字节截断必须 decode 失败"
+        );
     }
 }

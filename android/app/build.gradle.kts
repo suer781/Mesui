@@ -12,8 +12,17 @@ plugins {
 // 仅 Windows 生效：该变通针对 GBK 编码墙，Linux CI 项目路径纯 ASCII 无此问题；
 // 且 "C:/..." 在 Linux 上是相对路径，会把产物挪进项目树内的畸形目录，
 // 偏离默认 outputs 路径（CI 的 artifact 上传会找不到 APK）。
+// DC_BUILD_DIR 可覆盖（本机某些受限环境把 ~/dc-build 也拦掉时，指到用户可写
+// 的纯 ASCII 临时目录）。
 if (System.getProperty("os.name").lowercase().contains("windows")) {
-    layout.buildDirectory.set(File(System.getProperty("user.home"), "dc-build/app"))
+    val buildDirOverride = System.getenv("DC_BUILD_DIR")
+    layout.buildDirectory.set(
+        if (buildDirOverride.isNullOrBlank()) {
+            File(System.getProperty("user.home"), "dc-build/app")
+        } else {
+            File(buildDirOverride, "app")
+        },
+    )
 }
 
 android {

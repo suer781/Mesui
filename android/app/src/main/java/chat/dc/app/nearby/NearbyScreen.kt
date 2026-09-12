@@ -12,6 +12,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
@@ -31,6 +33,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import chat.dc.app.R
+import chat.dc.app.ui.components.SubPageTopBar
 
 /**
  * 发现附近设备子页：权限引导 → BLE 扫描（只认本应用服务 UUID）+ 对外广播。
@@ -38,7 +41,7 @@ import chat.dc.app.R
  * 里嵌 LazyColumn（无限高度约束会崩）。
  */
 @Composable
-fun NearbyScreen() {
+fun NearbyScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val discovery = remember { NearbyDiscovery(context) }
     val state by discovery.state.collectAsState()
@@ -63,7 +66,7 @@ fun NearbyScreen() {
 
     LazyColumn(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
         item {
-            Text(stringResource(R.string.nearby_title), style = MaterialTheme.typography.titleLarge)
+            SubPageTopBar(title = stringResource(R.string.nearby_title), onBack = onBack)
         }
         when (state.status) {
             NearbyDiscovery.Status.NO_PERMISSION -> item {
@@ -120,7 +123,14 @@ fun NearbyScreen() {
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(stringResource(R.string.nearby_advertise))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(stringResource(R.string.nearby_advertise))
+                    Text(
+                        stringResource(R.string.nearby_advertise_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 Switch(
                     checked = state.advertising,
                     onCheckedChange = { on ->
@@ -138,9 +148,36 @@ fun NearbyScreen() {
         }
         items(state.peers.values.toList(), key = { it.address }) { peer ->
             Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Text(peer.name ?: stringResource(R.string.nearby_unnamed), style = MaterialTheme.typography.titleSmall)
-                    Text(peer.address, style = MaterialTheme.typography.bodySmall)
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    chat.dc.app.ui.components.IconAvatar(
+                        icon = Icons.Filled.Sensors,
+                        size = 40,
+                        corner = 12,
+                    )
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(horizontal = 12.dp),
+                    ) {
+                        Text(
+                            // 隐私：只显示单向派生的匿名别名，绝不显示蓝牙 MAC
+                            // 或对方广播名——MAC 是可被追踪的硬件标识
+                            stringResource(R.string.nearby_alias, peer.alias),
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Text(
+                            if (peer.serviceMatch) {
+                                stringResource(R.string.nearby_dc_node)
+                            } else {
+                                stringResource(R.string.nearby_other_device)
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     Text(
                         if (peer.rssi == Int.MIN_VALUE) {
                             stringResource(R.string.nearby_bonded)
@@ -148,6 +185,7 @@ fun NearbyScreen() {
                             stringResource(R.string.nearby_rssi, peer.rssi)
                         },
                         style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }

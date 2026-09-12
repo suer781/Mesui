@@ -39,10 +39,25 @@ class NearbyDiscovery(private val context: Context) {
 
     data class NearbyPeer(
         val address: String,
+        /** 展示用匿名别名：由地址单向派生（SHA-256 截断），UI 一律只显示它。
+         *  蓝牙 MAC 是系统层身份，绝不能进 UI——展示明文地址等于把可被
+         *  追踪的硬件标识交给周围所有扫描者，匿名化在第一步就被击穿。 */
+        val alias: String,
         val name: String?,
         val rssi: Int,
         val serviceMatch: Boolean,
     )
+
+    /** 地址 → 单向别名：SHA-256 截断 3 字节转 hex（6 字符）。不可逆，
+     *  同一地址稳定显示同一别名（列表 diff 需要），但无法从别名还原 MAC。 */
+    private fun aliasOf(address: String): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(address.toByteArray(Charsets.UTF_8))
+        return digest.take(3).joinToString("") { "%02X".format(it) }
+    }
+
+    private fun peerOf(address: String, name: String?, rssi: Int, serviceMatch: Boolean) =
+        NearbyPeer(address = address, alias = aliasOf(address), name = name, rssi = rssi, serviceMatch = serviceMatch)
 
     data class NearbyState(
         val status: Status = Status.IDLE,
@@ -94,7 +109,7 @@ class NearbyDiscovery(private val context: Context) {
                 ?.serviceUuids
                 ?.any { it.uuid == SERVICE_UUID } == true
             _state.update { s ->
-                val peer = NearbyPeer(
+                val peer = peerOf(
                     address = address,
                     name = result.scanRecord?.deviceName,
                     rssi = result.rssi,
@@ -164,7 +179,7 @@ class NearbyDiscovery(private val context: Context) {
         val a = adapter ?: return emptyList()
         return try {
             a.bondedDevices.orEmpty().map {
-                NearbyPeer(address = it.address, name = it.name, rssi = Int.MIN_VALUE, serviceMatch = false)
+                peerOf(address = it.address, name = it.name, rssi = Int.MIN_VALUE, serviceMatch = false)
             }
         } catch (_: SecurityException) {
             emptyList()
