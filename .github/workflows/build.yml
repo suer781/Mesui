@@ -2,7 +2,7 @@ name: 构建调试 APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, GLM-Zcode]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -107,7 +107,7 @@ jobs:
         run: |
           mkdir -p /tmp/openssl-dummy/include /tmp/openssl-dummy/lib
           CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
-          cargo test --lib -p dc-core --features vendored-openssl
+          cargo test --lib -p dc-core --features vendored-openssl,ffi
 
       # 此前 CI 只跑 --lib，tests/ 下的集成测试（redteam 20 例 /
       # security_bruteforce 1 例 / iroh_pair 1 例）从未被执行过。三份测试
@@ -118,7 +118,7 @@ jobs:
         run: |
           mkdir -p /tmp/openssl-dummy/include /tmp/openssl-dummy/lib
           CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
-          cargo test --tests -p dc-core --features vendored-openssl
+          cargo test --tests -p dc-core --features vendored-openssl,ffi
 
       # ================= UniFFI Kotlin 绑定 =================
       # uniffi-bindgen 的 --library 模式靠 dlopen 读取 cdylib 里嵌入的元数据，
