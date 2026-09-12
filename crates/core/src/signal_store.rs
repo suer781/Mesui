@@ -190,8 +190,8 @@ impl IdentityKeyStore for SqlSignalStore {
         // is_trusted_identity 拦截（本 store 对异钥返回 false → UntrustedIdentity），
         // 异钥到不了 save 这步；能走到这里的异钥只可能来自显式 pin_identity。
         // 无记录 = TOFU 首次自动信任（设计如此，不动）；同钥重写无变化。
-        if let Some(prev) = &existing {
-            if IdentityKey::try_from(prev.as_slice())? != *identity {
+        if let Some(prev) = &existing
+            && IdentityKey::try_from(prev.as_slice())? != *identity {
                 return Err(libsignal_protocol::SignalProtocolError::InvalidState(
                     "save_identity",
                     format!(
@@ -201,7 +201,6 @@ impl IdentityKeyStore for SqlSignalStore {
                     ),
                 ));
             }
-        }
         self.with_conn("save_identity", |c| {
             c.execute(
                 "INSERT OR REPLACE INTO trusted_identities (name, device, identity) VALUES (?1, ?2, ?3)",
@@ -451,7 +450,7 @@ mod tests {
             alice.pin_identity(&bob_addr, &bik).unwrap();
         }
         {
-            let mut alice = Device::open(&path, Some("testkey"), "alice").unwrap();
+            let alice = Device::open(&path, Some("testkey"), "alice").unwrap();
             assert!(alice.is_trusted(&bob_addr, &bik).unwrap(), "pin 必须落盘");
             let bob2 = Device::generate("bob").unwrap();
             assert!(!alice.is_trusted(&bob_addr, &bob2.identity_key().unwrap()).unwrap());

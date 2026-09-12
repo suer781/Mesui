@@ -103,6 +103,7 @@ impl ContactStore {
     }
 
     /// 新增或整体覆盖一个联系人（重新扫码加好友即覆盖）。
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert(
         &self,
         name: &str,

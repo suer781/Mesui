@@ -20,6 +20,11 @@ pub mod settings;
 #[cfg(feature = "db")]
 pub mod queue;
 
+/// 投递管理器（Phase A 队列补投接线）：队列 ↔ 发送通道的桥，
+/// 对方离线时消息滞留队列、到期自动补投，重试耗尽转死信。
+#[cfg(feature = "db")]
+pub mod delivery;
+
 #[cfg(feature = "db")]
 pub mod contacts;
 

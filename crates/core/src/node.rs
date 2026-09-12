@@ -169,7 +169,7 @@ impl Node {
             task.abort();
         }
         let ep = self.ep.clone();
-        let _ = self.rt.block_on(async move {
+        self.rt.block_on(async move {
             let _ = tokio::time::timeout(Duration::from_secs(5), ep.close()).await;
         });
     }
@@ -296,7 +296,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     (0..s.len() / 2).map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()).collect()
@@ -305,7 +305,7 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 /// base64url 无填充编码（与 Kotlin `getUrlEncoder().withoutPadding()` 对齐）。
 fn b64(bytes: &[u8]) -> String {
     const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;

@@ -396,6 +396,19 @@ pub fn smoke_test_all_modules() -> String {
         let db = crate::queue::Db::open(std::path::Path::new(":memory:"), Some("smoke")).unwrap();
         let (pending, dead, seen) = db.stats().unwrap();
         results.push(format!("queue_pending={} dead={} seen={}", pending, dead, seen));
+
+        // delivery — 队列补投接线（Phase A）：tick 空转 + 常量出链，
+        // 保证 DeliveryManager 的符号链不被 linker --gc-sections 回收
+        let dm_db =
+            crate::queue::Db::open(std::path::Path::new(":memory:"), Some("smoke")).unwrap();
+        let ok: crate::delivery::SendFn = Box::new(|_: &crate::envelope::Envelope| Ok(false));
+        let dm = crate::delivery::DeliveryManager::new(dm_db, ok);
+        let _ = dm.tick(0).unwrap();
+        results.push(format!(
+            "delivery_batch={} seen_retention_days={}",
+            crate::delivery::DEFAULT_BATCH_LIMIT,
+            crate::delivery::SEEN_RETENTION_MS / 86_400_000,
+        ));
     }
 
     format!("smoke_test_all_modules: [{}]", results.join(", "))
@@ -792,6 +805,210 @@ mod node_ffi {
     }
 }
 
+/// 队列补投接线（Phase A）的 UniFFI 出口：
+/// Kotlin 调 `enqueue()` 把已加密信封（SignalSession.encrypt 产物装进
+/// Envelope 后 JSON 序列化）入 SQLCipher 队列，前台服务/定时器周期调
+/// `tick()` 触发补投——对方离线时消息滞留队列，不再直接丢弃。
+/// 发送通道由 Kotlin 实现 SendCallback 注入（蓝牙 BleMesh / iroh 任选或双试）。
+#[cfg(feature = "db")]
+mod delivery_ffi {
+    use super::{map_err, DcError};
+    use crate::delivery::DeliveryManager;
+    use crate::envelope::Envelope;
+    use std::sync::{Arc, Mutex};
+
+    /// Kotlin 注入的发送回调（UniFFI callback interface，Rust tick 线程回调）。
+    /// 实现：拿 envelope_json 重建信封（字节数组为 JSON 数字数组，kind 为
+    /// "Text" 等枚举名），经 BleMesh/iroh 发送。
+    /// 返回 true = 已送达；false = 对方当前不可达（tick 按退避节奏自动
+    /// 补投，Kotlin 无需自己重试）。
+    #[uniffi::export(callback_interface)]
+    pub trait SendCallback: Send + Sync {
+        fn send(&self, envelope_json: String) -> bool;
+    }
+
+    /// callback → SendFn 适配：信封在 Rust 侧序列化为 JSON 过桥。
+    fn send_fn_from_callback(cb: Arc<dyn SendCallback>) -> crate::delivery::SendFn {
+        Box::new(move |env: &Envelope| {
+            let json =
+                serde_json::to_string(env).map_err(|e| format!("envelope 序列化失败: {e}"))?;
+            Ok(cb.send(json))
+        })
+    }
+
+    /// tick 一拍的盘点（Kotlin UI 反馈「已发 X 条 / 死信 Y 条」）。
+    #[derive(Debug, Clone, Default, PartialEq, Eq, uniffi::Record)]
+    pub struct TickReportRecord {
+        pub attempted: u32,
+        pub sent: u32,
+        pub unreachable: u32,
+        pub errored: u32,
+        pub dead: u32,
+    }
+
+    /// cleanup 的盘点。
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, uniffi::Record)]
+    pub struct CleanupReportRecord {
+        pub pruned_seen: u32,
+        pub pruned_dead: u32,
+    }
+
+    /// 队列补投句柄。内部 Mutex 串行化一切操作（Db 的 rusqlite Connection
+    /// 非线程安全）：并发 tick 不会重复投递同一条消息。
+    /// 红线：SendCallback 实现内不得再调用本句柄方法——tick 持锁发送期间
+    /// 重入（如回调里调 enqueue/stats）会死锁（Mutex 不可重入）。
+    #[derive(uniffi::Object)]
+    pub struct DeliveryManagerHandle {
+        inner: Mutex<DeliveryManager>,
+    }
+
+    #[uniffi::export]
+    impl DeliveryManagerHandle {
+        /// 打开（或创建）加密队列库并接上发送通道。key 为 SQLCipher 密钥
+        /// （无引号字符，hex；与 SignalSession.open 同法）。
+        #[uniffi::constructor]
+        pub fn new(
+            path: String,
+            key: String,
+            callback: Box<dyn SendCallback>,
+        ) -> Result<Self, DcError> {
+            let db = crate::queue::Db::open(std::path::Path::new(&path), Some(key.as_str()))
+                .map_err(map_err)?;
+            Ok(Self {
+                inner: Mutex::new(DeliveryManager::new(
+                    db,
+                    send_fn_from_callback(Arc::from(callback)),
+                )),
+            })
+        }
+
+        /// 重绑发送通道（蓝牙/iroh 重连后调用）。
+        pub fn set_callback(&self, callback: Box<dyn SendCallback>) {
+            self.inner
+                .lock()
+                .expect("delivery mutex poisoned")
+                .set_send_fn(send_fn_from_callback(Arc::from(callback)));
+        }
+
+        /// 摘除发送通道：tick 变 no-op，消息滞留队列（不丢）。
+        pub fn clear_callback(&self) {
+            self.inner
+                .lock()
+                .expect("delivery mutex poisoned")
+                .clear_send_fn();
+        }
+
+        /// 完整信封 JSON 入队（sender/ttl_hops 一并存档，补投时精确重建）。
+        /// 重复 msg_id 幂等忽略（重发死信走 revive）。
+        pub fn enqueue(&self, env_json: String) -> Result<(), DcError> {
+            let env: Envelope = serde_json::from_str(&env_json)
+                .map_err(|e| DcError::Core { msg: format!("env_json 解析失败: {e}") })?;
+            self.inner
+                .lock()
+                .expect("delivery mutex poisoned")
+                .db()
+                .lock()
+                .expect("queue db mutex poisoned")
+                .enqueue_full(&env)
+                .map_err(map_err)
+        }
+
+        /// 投递一拍：到期消息按创建序逐条交回调发送；成功出队，失败退避，
+        /// 重试耗尽转死信。Kotlin 在每次 enqueue 后与前台服务定时器里调用。
+        pub fn tick(&self, now_ms: u64) -> Result<TickReportRecord, DcError> {
+            let r = self
+                .inner
+                .lock()
+                .expect("delivery mutex poisoned")
+                .tick(now_ms)
+                .map_err(map_err)?;
+            Ok(TickReportRecord {
+                attempted: r.attempted,
+                sent: r.sent,
+                unreachable: r.unreachable,
+                errored: r.errored,
+                dead: r.dead,
+            })
+        }
+
+        /// 周期清理（低频，如每日一次）：过期去重台账 + 过期死信。
+        pub fn cleanup(&self, now_ms: u64) -> Result<CleanupReportRecord, DcError> {
+            let r = self
+                .inner
+                .lock()
+                .expect("delivery mutex poisoned")
+                .cleanup(now_ms)
+                .map_err(map_err)?;
+            Ok(CleanupReportRecord {
+                pruned_seen: r.pruned_seen,
+                pruned_dead: r.pruned_dead,
+            })
+        }
+
+        /// (待发, 死信, 已见去重) 计数。
+        pub fn stats(&self) -> Result<Vec<u32>, DcError> {
+            let (pending, dead, seen) = self
+                .inner
+                .lock()
+                .expect("delivery mutex poisoned")
+                .db()
+                .lock()
+                .expect("queue db mutex poisoned")
+                .stats()
+                .map_err(map_err)?;
+            Ok(vec![pending, dead, seen])
+        }
+
+        /// 死信复活（用户点「再试一次」）：attempts 归零重新计入退避。
+        pub fn revive(&self, msg_id_hex: String) -> Result<(), DcError> {
+            let id = hex_decode_16(&msg_id_hex).ok_or_else(|| DcError::Core {
+                msg: "msg_id_hex 必须是 32 个 hex 字符（16 字节）".into(),
+            })?;
+            self.inner
+                .lock()
+                .expect("delivery mutex poisoned")
+                .db()
+                .lock()
+                .expect("queue db mutex poisoned")
+                .revive(&id)
+                .map_err(map_err)
+        }
+
+        /// 死信清单（msg_id hex，按创建序；UI 列表 + revive 入参）。
+        pub fn dead_letters(&self, limit: u32) -> Result<Vec<String>, DcError> {
+            let list = self
+                .inner
+                .lock()
+                .expect("delivery mutex poisoned")
+                .db()
+                .lock()
+                .expect("queue db mutex poisoned")
+                .dead_list(limit)
+                .map_err(map_err)?;
+            Ok(list
+                .iter()
+                .map(|id| id.iter().map(|b| format!("{b:02x}")).collect())
+                .collect())
+        }
+    }
+
+    /// 固定 16 字节 hex 解码（MsgId，大小写不敏感）。
+    fn hex_decode_16(s: &str) -> Option<[u8; 16]> {
+        let s = s.trim();
+        if s.len() != 32 {
+            return None;
+        }
+        let bytes = s.as_bytes();
+        let mut out = [0u8; 16];
+        for (i, b) in out.iter_mut().enumerate() {
+            let hi = (bytes[2 * i] as char).to_digit(16)?;
+            let lo = (bytes[2 * i + 1] as char).to_digit(16)?;
+            *b = (hi * 16 + lo) as u8;
+        }
+        Some(out)
+    }
+}
+
 /// 信箱写桶 FFI 出口的往返测试：JSON 序列化 → submit 走完整门禁。
 ///（MailboxManagerHandle 是普通 Rust 结构体，单测直接调用其方法，
 /// 与 Kotlin 经 UniFFI 调用走的是同一条路径。）
@@ -1082,5 +1299,122 @@ mod announcement_ffi_tests {
                 t0
             )
             .is_err());
+    }
+}
+
+/// 队列补投 FFI 的往返测试：直接调用 Handle 方法（与 Kotlin 经 UniFFI
+/// 调用走同一条路径；SendCallback 由 Rust 测试桩实现——callback interface
+/// 在 Rust 侧就是普通 trait，Kotlin 实现走的是同一 FFI 签名）。
+#[cfg(all(test, feature = "ffi", feature = "db"))]
+mod delivery_ffi_tests {
+    use super::delivery_ffi::{DeliveryManagerHandle, SendCallback, TickReportRecord};
+    use crate::envelope::{Envelope, PayloadKind};
+    use crate::identity::Identity;
+    use std::sync::{Arc, Mutex};
+
+    struct StubCallback {
+        delivered: Arc<Mutex<Vec<Envelope>>>,
+        fail: bool,
+    }
+
+    impl SendCallback for StubCallback {
+        fn send(&self, envelope_json: String) -> bool {
+            if self.fail {
+                return false;
+            }
+            let env: Envelope =
+                serde_json::from_str(&envelope_json).expect("FFI 桥上的信封 JSON 必须可解");
+            self.delivered.lock().unwrap().push(env);
+            true
+        }
+    }
+
+    fn hex16(id: &[u8; 16]) -> String {
+        id.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn env_json(msg_id: [u8; 16], sent_at: u64) -> String {
+        let e = Envelope {
+            msg_id,
+            sender: Identity::generate().unwrap().node_id(),
+            recipient: Some([9; 32]),
+            group: None,
+            kind: PayloadKind::Text,
+            body: vec![1, 2, 3],
+            sent_at_ms: sent_at,
+            ttl_hops: 6,
+        };
+        serde_json::to_string(&e).unwrap()
+    }
+
+    fn handle(fail: bool, delivered: Arc<Mutex<Vec<Envelope>>>) -> DeliveryManagerHandle {
+        DeliveryManagerHandle::new(
+            ":memory:".into(),
+            "test1234".into(),
+            Box::new(StubCallback { delivered, fail }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ffi_enqueue_tick_delivers_via_callback() {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let h = handle(false, delivered.clone());
+        h.enqueue(env_json([1; 16], 1000)).unwrap();
+        h.enqueue(env_json([2; 16], 2000)).unwrap();
+        let rep = h.tick(3000).unwrap();
+        assert_eq!((rep.attempted, rep.sent), (2, 2));
+        let out = delivered.lock().unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].msg_id, [1; 16], "按创建序交回调");
+        assert_eq!(out[0].body, vec![1, 2, 3], "密文原样过桥");
+        assert_eq!(h.stats().unwrap(), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn ffi_offline_waits_then_dead_then_revive() {
+        let h = handle(true, Arc::new(Mutex::new(Vec::new())));
+        h.enqueue(env_json([3; 16], 1000)).unwrap();
+        // 默认策略 8 次：每拍推进 max_delay+1ms，8 拍耗尽 → 死信
+        let step = crate::retry::RetryPolicy::default().max_delay_ms + 1;
+        let mut last = TickReportRecord::default();
+        for i in 1..=8u64 {
+            last = h.tick(i * step).unwrap();
+            if i < 8 {
+                assert_eq!(last.dead, 0, "前 7 拍不转死信（第 {i} 拍）");
+            }
+        }
+        assert_eq!(last.dead, 1, "第 8 次失败转死信");
+        assert_eq!(h.stats().unwrap(), vec![0, 1, 0]);
+        assert_eq!(h.dead_letters(10).unwrap(), vec![hex16(&[3; 16])]);
+        // 用户复活 → 回调改可达（重绑）→ 下一拍送达
+        h.revive(hex16(&[3; 16])).unwrap();
+        h.set_callback(Box::new(StubCallback {
+            delivered: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        }));
+        let rep = h.tick(100 * step).unwrap();
+        assert_eq!((rep.attempted, rep.sent), (1, 1));
+        assert_eq!(h.stats().unwrap(), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn ffi_unreachable_stays_queued_and_cleanup_runs() {
+        let h = handle(true, Arc::new(Mutex::new(Vec::new())));
+        h.enqueue(env_json([4; 16], 1000)).unwrap();
+        let rep = h.tick(1000).unwrap();
+        assert_eq!((rep.attempted, rep.unreachable, rep.sent), (1, 1, 0));
+        assert_eq!(h.stats().unwrap(), vec![1, 0, 0], "离线消息滞留队列不丢");
+        // 摘除通道 → tick no-op；重绑后恢复
+        h.clear_callback();
+        assert_eq!(h.tick(99_999).unwrap(), TickReportRecord::default());
+        // 清理（空台账/无死信）幂等无错
+        let c = h.cleanup(1_000_000).unwrap();
+        assert_eq!((c.pruned_seen, c.pruned_dead), (0, 0));
+        // 坏 JSON / 坏 hex 各自被拒
+        assert!(h.enqueue("not json".into()).is_err());
+        assert!(h.revive("zz".repeat(16)).is_err());
+        assert!(h.revive("ab".repeat(8)).is_err());
+        assert!(h.dead_letters(10).unwrap().is_empty());
     }
 }

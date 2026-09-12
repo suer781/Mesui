@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS inbox_seen (
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_state ON outbox(state, created_ms);
 CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(state, next_attempt_ms);
+CREATE TABLE IF NOT EXISTS outbox_env (
+    msg_id BLOB PRIMARY KEY,
+    env BLOB NOT NULL
+);
 ";
 
 #[derive(Debug, Clone)]
@@ -98,9 +102,29 @@ impl Db {
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(|e| CoreError::Db(e.to_string()))
     }
 
+    /// 完整信封入队（投递管理器主路径）：outbox 行 + 完整 CBOR 存档（outbox_env）。
+    /// `enqueue` 的列不含 sender/ttl_hops，补投重建会缺元数据；本方法把整个
+    /// 信封留档，`due_envelopes` 按 CBOR 精确还原。同 msg_id 重复入队：
+    /// outbox 忽略（幂等），存档覆盖（同一消息内容一致，无害；重发走 revive）。
+    pub fn enqueue_full(&self, env: &Envelope) -> Result<()> {
+        self.enqueue(env)?;
+        let cbor = env.to_cbor()?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO outbox_env (msg_id, env) VALUES (?1, ?2)",
+                params![env.msg_id.as_slice(), cbor],
+            )
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        Ok(())
+    }
+
     pub fn mark_sent(&self, msg_id: &MsgId) -> Result<()> {
         self.conn
             .execute("UPDATE outbox SET state='sent' WHERE msg_id=?1", params![msg_id.as_slice()])
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        // 红队 P2 修复：同步清理 outbox_env 存档（防孤儿行无限增长）
+        self.conn
+            .execute("DELETE FROM outbox_env WHERE msg_id=?1", params![msg_id.as_slice()])
             .map_err(|e| CoreError::Db(e.to_string()))?;
         Ok(())
     }
@@ -154,8 +178,84 @@ impl Db {
             )
             .map_err(|e| CoreError::Db(e.to_string()))?;
         let rows = stmt
-            .query_map(params![now_ms as i64, limit], |r| {
+            .query_map(params![Self::clamp_ms(now_ms), limit], |r| {
                 Self::row_to_pending(r)
+            })
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(|e| CoreError::Db(e.to_string()))
+    }
+
+    /// 到期消息的完整信封重建（delivery.rs tick 的取件口）：
+    /// 与 `due` 同一判定（pending 且 next_attempt_ms 已到，按创建序），
+    /// 优先读 outbox_env 的 CBOR 存档无损还原；旧 `enqueue` 行按 outbox
+    /// 字段尽力重建（sender 缺失置零、ttl_hops 取默认——消息不丢优先于
+    /// 元数据完整）。行被篡改/损坏时报错，不静默投出畸形信封。
+    pub fn due_envelopes(&self, now_ms: u64, limit: u32) -> Result<Vec<Envelope>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT o.msg_id, o.recipient, o.group_id, o.kind, o.body, o.created_ms, e.env
+                 FROM outbox o LEFT JOIN outbox_env e ON o.msg_id = e.msg_id
+                 WHERE o.state='pending' AND o.next_attempt_ms <= ?1
+                 ORDER BY o.created_ms LIMIT ?2",
+            )
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![Self::clamp_ms(now_ms), limit], |r| {
+                let env_blob: Option<Vec<u8>> = r.get(6)?;
+                if let Some(bytes) = env_blob {
+                    return Envelope::from_cbor(&bytes).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Blob,
+                            Box::new(e),
+                        )
+                    });
+                }
+                let msg_id_raw: Vec<u8> = r.get(0)?;
+                let msg_id: MsgId = msg_id_raw.try_into().map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(0, "msg_id".into(), rusqlite::types::Type::Blob)
+                })?;
+                let recipient: Option<Vec<u8>> = r.get(1)?;
+                let recipient = match recipient {
+                    Some(v) => Some(v.try_into().map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(1, "recipient".into(), rusqlite::types::Type::Blob)
+                    })?),
+                    None => None,
+                };
+                let group: Option<Vec<u8>> = r.get(2)?;
+                let group = match group {
+                    Some(v) => Some(v.try_into().map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(2, "group_id".into(), rusqlite::types::Type::Blob)
+                    })?),
+                    None => None,
+                };
+                let kind: i64 = r.get(3)?;
+                let kind = match kind {
+                    1 => crate::envelope::PayloadKind::Text,
+                    2 => crate::envelope::PayloadKind::SessionMgmt,
+                    3 => crate::envelope::PayloadKind::GroupMgmt,
+                    4 => crate::envelope::PayloadKind::NodeCtl,
+                    other => {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Integer,
+                            Box::new(CoreError::Db(format!("未知 PayloadKind: {other}"))),
+                        ))
+                    }
+                };
+                let body: Vec<u8> = r.get(4)?;
+                let created_ms: i64 = r.get(5)?;
+                Ok(Envelope {
+                    msg_id,
+                    sender: [0u8; 32], // 旧路径未存发送方：置零占位
+                    recipient,
+                    group,
+                    kind,
+                    body,
+                    sent_at_ms: created_ms.max(0) as u64,
+                    ttl_hops: 6,
+                })
             })
             .map_err(|e| CoreError::Db(e.to_string()))?;
         rows.collect::<std::result::Result<Vec<_>, _>>().map_err(|e| CoreError::Db(e.to_string()))
@@ -224,9 +324,47 @@ impl Db {
     pub fn prune_seen(&self, before_ms: u64) -> Result<usize> {
         let n = self
             .conn
-            .execute("DELETE FROM inbox_seen WHERE seen_ms < ?1", params![before_ms as i64])
+            .execute("DELETE FROM inbox_seen WHERE seen_ms < ?1", params![Self::clamp_ms(before_ms)])
             .map_err(|e| CoreError::Db(e.to_string()))?;
         Ok(n)
+    }
+
+    /// 清理过期死信（仅删 state='dead' 且创建时间早于 cutoff 的行）。
+    /// 库未记录死亡时刻，以入队时间（created_ms）做保守近似——
+    /// 保留窗内用户随时可 revive，过后由 delivery::cleanup 清除。
+    pub fn prune_dead(&self, created_before_ms: u64) -> Result<usize> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM outbox WHERE state='dead' AND created_ms < ?1",
+                params![Self::clamp_ms(created_before_ms)],
+            )
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        // 红队 P2 修复：同步清理对应的 outbox_env 存档（防孤儿行）
+        self.conn
+            .execute(
+                "DELETE FROM outbox_env WHERE msg_id NOT IN (SELECT msg_id FROM outbox)",
+                [],
+            )
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        Ok(n)
+    }
+
+    /// 死信清单（UI「发送失败，点按重试」用，按创建序）。
+    pub fn dead_list(&self, limit: u32) -> Result<Vec<MsgId>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT msg_id FROM outbox WHERE state='dead' ORDER BY created_ms LIMIT ?1")
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![limit], |r| {
+                let raw: Vec<u8> = r.get(0)?;
+                raw.try_into().map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(0, "msg_id".into(), rusqlite::types::Type::Blob)
+                })
+            })
+            .map_err(|e| CoreError::Db(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(|e| CoreError::Db(e.to_string()))
     }
 
     /// (待发, 死信, 已见去重) 计数。
@@ -330,5 +468,52 @@ mod tests {
         db.revive(&[1; 16]).unwrap();
         assert_eq!(db.due(99_999, 10).unwrap().len(), 1);
         assert_eq!(db.stats().unwrap(), (1, 0, 0));
+    }
+
+    // ══════════ 投递接线新增方法（delivery.rs 依赖） ══════════
+
+    #[test]
+    fn enqueue_full_and_due_envelopes_roundtrip() {
+        let db = Db::open(std::path::Path::new(":memory:"), None).unwrap();
+        let mut e = env([7; 16], Some([5; 32]));
+        e.sender = Identity::generate().unwrap().node_id();
+        e.sent_at_ms = 42_000;
+        e.ttl_hops = 3;
+        e.body = vec![9, 9, 9, 9];
+        db.enqueue_full(&e).unwrap();
+        let got = db.due_envelopes(43_000, 10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0], e, "完整信封必须无损还原（sender/ttl_hops/时间）");
+    }
+
+    #[test]
+    fn due_envelopes_falls_back_for_legacy_rows() {
+        let db = Db::open(std::path::Path::new(":memory:"), None).unwrap();
+        db.enqueue(&env([3; 16], None)).unwrap(); // 旧路径：无 CBOR 存档
+        let got = db.due_envelopes(10_000, 10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].msg_id, [3; 16]);
+        assert_eq!(got[0].body, vec![1, 2, 3]);
+        assert_eq!(got[0].sent_at_ms, 1000, "created_ms 还原为 sent_at_ms");
+    }
+
+    #[test]
+    fn prune_dead_and_dead_list() {
+        let db = Db::open(std::path::Path::new(":memory:"), None).unwrap();
+        let policy = crate::retry::RetryPolicy { max_attempts: 1, base_delay_ms: 1, max_delay_ms: 1 };
+        db.enqueue(&env([1; 16], None)).unwrap();
+        db.enqueue(&env([2; 16], None)).unwrap();
+        db.fail_and_reschedule(&[1; 16], &policy, 1000).unwrap(); // 首败即死
+        db.fail_and_reschedule(&[2; 16], &policy, 1000).unwrap();
+        assert_eq!(db.dead_list(10).unwrap().len(), 2);
+        // cutoff 边界：created_ms == 1000 不在 < 1000 内 → 全保留
+        assert_eq!(db.prune_dead(1000).unwrap(), 0);
+        assert_eq!(db.dead_list(10).unwrap().len(), 2);
+        // 复活一条 → 死信清单只剩另一条；过 cutoff 的死信被清
+        db.revive(&[1; 16]).unwrap();
+        assert_eq!(db.dead_list(10).unwrap(), vec![[2u8; 16]]);
+        assert_eq!(db.prune_dead(5000).unwrap(), 1);
+        assert!(db.dead_list(10).unwrap().is_empty());
+        assert_eq!(db.stats().unwrap(), (1, 0, 0), "复活的那条仍是 pending");
     }
 }
