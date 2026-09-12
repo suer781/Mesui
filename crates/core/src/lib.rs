@@ -10,6 +10,8 @@ pub mod governor;
 pub mod envelope;
 pub mod identity;
 pub mod mailbox;
+/// 信箱写桶管理器（SP-1 第 5 条：写桶门禁接线 + 按写入方限速）。
+pub mod maildrop;
 pub mod nodekey;
 pub mod relay;
 pub mod retry;

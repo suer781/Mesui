@@ -22,6 +22,83 @@ impl CoreInfo {
     }
 }
 
+/// 信箱写桶门禁的 UniFFI 出口（SP-1 第 3/5 条）：
+/// Kotlin 侧把线上收到的 BucketWrite 交给核心走完整验收——
+/// MAC → ±5min 时间窗 → msg_id 去重 → 按写入方限速（≤30 封/分/对）——
+/// 返回 "accepted" 表示可入桶（实际存储由 Kotlin 侧处理）。
+///
+/// 内部 Mutex 守护可变状态：UniFFI Object 按 &self 分发，
+/// Android 多线程并发 submit 在锁上串行化（与 SignalSession 同法）。
+/// A2a Verifier P2 修复：持有 InternalClock 实例——now_ms 由 Rust 侧
+/// 高水位防回拨钟产生，Kotlin 传入的 raw 时间仅作参考输入。
+#[derive(uniffi::Object)]
+pub struct MailboxManagerHandle {
+    inner: std::sync::Mutex<crate::maildrop::MailboxManager>,
+    clock: std::sync::Mutex<crate::clock::InternalClock>,
+}
+
+#[uniffi::export]
+impl MailboxManagerHandle {
+    /// `cap` = msg_id 去重台账软目标容量（实际下限 4096，满则 fail-closed）。
+    #[uniffi::constructor]
+    pub fn new(cap: u32) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(crate::maildrop::MailboxManager::new(cap as usize)),
+            clock: std::sync::Mutex::new(crate::clock::InternalClock::new()),
+        }
+    }
+
+    /// 提交一次信箱写入。
+    /// - `write_json`：BucketWrite 的 JSON 序列化（UniFFI 不跨复杂结构体；
+    ///   字节数组即 JSON 数字数组，PayloadKind 为枚举名如 "Text"）。
+    /// - `secret_hex`：该桶该版本的 mailbox secret（64 个 hex 字符）。
+    /// - `local_ms`：本地钟读数（Rust 内部钟叠加高水位/校准偏移后使用，
+    ///   调用方不可绕过防回拨——A2a Verifier P2 修复）。
+    ///
+    /// 成功返回 "accepted"；错误文案区分四类门禁判定：
+    /// 重放 / 限速 / 验签失败 / 时间窗外（见 maildrop::MailboxError）。
+    pub fn submit(
+        &self,
+        write_json: String,
+        secret_hex: String,
+        local_ms: u64,
+    ) -> Result<String, DcError> {
+        let write: crate::mailbox::BucketWrite = serde_json::from_str(&write_json)
+            .map_err(|e| DcError::Core { msg: format!("write_json 解析失败: {e}") })?;
+        let secret: [u8; 32] = hex_decode_32(&secret_hex).ok_or_else(|| DcError::Core {
+            msg: "secret_hex 必须是 64 个 hex 字符（32 字节）".into(),
+        })?;
+        // P2 修复：高水位防回拨——Kotlin 传入的 local_ms 经 Rust 内部钟处理后使用
+        let now_ms = self
+            .clock
+            .lock()
+            .expect("clock mutex poisoned")
+            .now(local_ms as i64) as u64;
+        self.inner
+            .lock()
+            .expect("maildrop mutex poisoned")
+            .submit_write(&write, &secret, now_ms)
+            .map_err(map_sig)?;
+        Ok("accepted".to_string())
+    }
+}
+
+/// 固定 32 字节 hex 解码（大小写不敏感；长度/字符非法返回 None）。
+fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        let hi = (bytes[2 * i] as char).to_digit(16)?;
+        let lo = (bytes[2 * i + 1] as char).to_digit(16)?;
+        *b = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
+
 /// 阻止 linker --gc-sections 回收核心模块。
 /// 每个 Rust 模块的公开函数被调用一次，linker 即保留该模块的全部依赖链。
 /// 没有这个函数，ffi.rs 的 CoreInfo 不引用任何核心类型，
@@ -52,6 +129,14 @@ pub fn smoke_test_all_modules() -> String {
 
     // mailbox
     results.push(format!("mailbox_replay_window={}", crate::mailbox::REPLAY_WINDOW_MS));
+
+    // maildrop — 信箱写桶门禁（SP-1 限速已接线）
+    let md = crate::maildrop::MailboxManager::new(64);
+    results.push(format!(
+        "maildrop_rate_per_min={} nonce_cache_len={}",
+        crate::maildrop::WRITES_PER_MINUTE,
+        md.nonce_cache_len(),
+    ));
 
     // nodekey
     results.push(format!("nodekey_max_validity={}", crate::nodekey::MAX_VALIDITY_MS));
@@ -472,5 +557,89 @@ mod node_ffi {
     #[uniffi::export]
     pub fn node_id_from_naddr(naddr: String) -> Result<String, DcError> {
         crate::node::node_id_of_naddr(&naddr).map_err(map_err)
+    }
+}
+
+/// 信箱写桶 FFI 出口的往返测试：JSON 序列化 → submit 走完整门禁。
+///（MailboxManagerHandle 是普通 Rust 结构体，单测直接调用其方法，
+/// 与 Kotlin 经 UniFFI 调用走的是同一条路径。）
+#[cfg(all(test, feature = "ffi"))]
+mod mailbox_ffi_tests {
+    use super::*;
+    use crate::envelope::{Envelope, PayloadKind};
+    use crate::identity::Identity;
+    use crate::mailbox::{derive_mailbox_secret, generate_bucket_address, BucketWrite};
+
+    fn sealed_write(sender: &Identity, secret: &[u8; 32], byte: u8, ts_ms: u64) -> BucketWrite {
+        let env = Envelope {
+            msg_id: [byte; 16],
+            sender: sender.node_id(),
+            recipient: Some([9; 32]),
+            group: None,
+            kind: PayloadKind::Text,
+            body: vec![7; 64],
+            sent_at_ms: ts_ms,
+            ttl_hops: 6,
+        };
+        BucketWrite::seal(env, secret, 1, ts_ms, [byte; 16])
+    }
+
+    fn hex32(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn submit_accepts_fresh_write_via_json_and_rejects_replay() {
+        let sender = Identity::generate().unwrap();
+        let bucket = generate_bucket_address().unwrap();
+        let secret = derive_mailbox_secret(b"ffi", &bucket, 1);
+        let h = MailboxManagerHandle::new(1024);
+        let ts = 1_000_000u64;
+        let w = sealed_write(&sender, &secret, 1, ts);
+        // JSON 序列化跨 FFI 边界后仍可验：首交通过
+        assert_eq!(
+            h.submit(serde_json::to_string(&w).unwrap(), hex32(&secret), ts).unwrap(),
+            "accepted"
+        );
+        // 同一写再交一次 = 重放（msg_id 台账命中），错误文案可区分
+        let err = h
+            .submit(serde_json::to_string(&w).unwrap(), hex32(&secret), ts)
+            .unwrap_err();
+        assert!(err.to_string().contains("重放"), "实际: {err}");
+    }
+
+    #[test]
+    fn submit_rejects_malformed_json_and_hex() {
+        let h = MailboxManagerHandle::new(1024);
+        let hex_ok = "ab".repeat(32);
+        // 非 JSON / 缺字段的 JSON
+        assert!(h.submit("not json".into(), hex_ok.clone(), 0).is_err());
+        assert!(h.submit("{}".into(), hex_ok.clone(), 0).is_err());
+        // hex 长度不足 / 字符非法
+        assert!(h.submit("{}".into(), "ab".repeat(31), 0).is_err());
+        assert!(h.submit("{}".into(), "zz".repeat(32), 0).is_err());
+    }
+
+    #[test]
+    fn submit_surfaces_rate_limit_error_text() {
+        let sender = Identity::generate().unwrap();
+        let bucket = generate_bucket_address().unwrap();
+        let secret = derive_mailbox_secret(b"ffi", &bucket, 1);
+        let h = MailboxManagerHandle::new(1024);
+        let ts = 2_000_000u64;
+        // 打满 30 封后第 31 封在 FFI 层得到限速文案
+        for i in 0..crate::maildrop::WRITES_PER_MINUTE {
+            let w = sealed_write(&sender, &secret, (i as u8) + 1, ts);
+            h.submit(serde_json::to_string(&w).unwrap(), hex32(&secret), ts)
+                .unwrap();
+        }
+        let err = h
+            .submit(
+                serde_json::to_string(&sealed_write(&sender, &secret, 99, ts)).unwrap(),
+                hex32(&secret),
+                ts,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("限速"), "实际: {err}");
     }
 }

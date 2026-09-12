@@ -20,3 +20,4 @@ android/app/src/main/uniffi/
 # Kotlin 编译器会话错误日志（IDE/构建噪声，误入库）
 .kotlin/
 .workbuddy/
+.project-memory/
