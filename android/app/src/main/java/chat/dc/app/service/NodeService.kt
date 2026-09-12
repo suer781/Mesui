@@ -49,15 +49,18 @@ class NodeService : Service() {
             // 启动即生成 Signal 会话（应用级单例；runCatching 防止个别机型
             // native 加载失败导致前台服务崩溃循环，页面首次访问时仍会重试）
             runCatching { SignalCore.session(this@NodeService) }
+                .onFailure { android.util.Log.w("NodeService", "Signal 会话初始化失败（页面访问时会重试）", it) }
             // 下面两步都是阻塞调用、无挂起点，cancel() 只能等它们返回后生效：
             // 在每个步骤边界主动检查，避免服务已 onDestroy 仍把 mesh/iroh 重新拉起来
             // （否则会以新代次起节点、活在 IrohNodeManager 的 scope 里 = 销毁后复活）
             ensureActive()
             runCatching { BleMesh.init(this@NodeService) }
+                .onFailure { android.util.Log.w("NodeService", "BLE mesh 初始化失败", it) }
             ensureActive()
             // iroh 远程节点：端点常驻（QUIC 直连 + 可选自建中继），联系人间跨网络收发；
             // 启动失败的自愈退避重试由 IrohNodeManager 内部负责
             runCatching { IrohNodeManager.start(this@NodeService) }
+                .onFailure { android.util.Log.w("NodeService", "iroh 节点启动失败（内部有退避重试）", it) }
         }
     }
 

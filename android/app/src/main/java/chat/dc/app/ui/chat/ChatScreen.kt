@@ -67,9 +67,16 @@ fun ChatScreen(contactId: String, onBack: () -> Unit, onAddFriend: () -> Unit) {
     var sending by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
 
+    // reload 统一挪 IO（P2）：入站消息高频触发的 reload 旧码在主线程跑
+    // SQLCipher 查询（解密库读 500 行），弱机上掉帧明显
     fun reload() {
-        messages = runCatching { SignalCore.contactStore(context).messages(contactId, 500) }
-            .getOrDefault(emptyList())
+        scope.launch {
+            val list = withContext(Dispatchers.IO) {
+                runCatching { SignalCore.contactStore(context).messages(contactId, 500) }
+                    .getOrDefault(emptyList())
+            }
+            messages = list
+        }
     }
 
     LaunchedEffect(contactId) { reload() }

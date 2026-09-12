@@ -21,8 +21,8 @@ object Wire {
     const val MSG = 1           // 信封：[type][sigMsgType:1][ct...]
     const val HS = 2            // 首条握手：[type][nameLen:1][name][mac:32][sigMsgType:1][ct...]
     const val SAS_OK = 3        // 本端 SAS 比对通过：[type]
-    const val AUTH_CAND = 5     // 回连认证①：[type][initiatorIdentity:32][count:1][slotId:4×n]
-    const val AUTH_CHA = 6      // 回连认证②：[type][nonce:16][responderIdentity:32]
+    const val AUTH_CAND = 5     // 回连认证①：[type][initiatorIdentity:33][count:1][slotId:4×n]
+    const val AUTH_CHA = 6      // 回连认证②：[type][nonce:16][responderIdentity:33]
     const val AUTH_RSP = 7      // 回连认证③：[type][hmac:16]（initiator 按候选算，命中定身份）
     const val AUTH_B_CHA = 8    // 反向认证①：[type][nonce:16]（initiator 出 nonce）
     const val AUTH_B_RSP = 9    // 反向认证②：[type][hmac:16]（responder 证明持有 S_i）
@@ -90,20 +90,39 @@ fun splitForChunk(frame: ByteArray, chunkSize: Int): List<ByteArray> =
     if (frame.size <= chunkSize) listOf(frame)
     else frame.asList().asIterable().chunked(chunkSize).map { it.toByteArray() }
 
-/** 单链路发送队列：一次只在途一分片，写/通知确认回调驱动下一片。 */
+/** 单链路发送队列：一次只在途一分片，写/通知确认回调驱动下一片。
+ *  GATT 单操作限制：writeCharacteristic/notifyCharacteristicChanged 必须等
+ *  回调后才能发起下一次。仅靠「队列空」判定在途有竞态——写进行中、队列已空时
+ *  再 send() 会并发下发；显式 inFlight 标志在 poll/settle 间串起整个在途窗口。 */
 private class SendPump {
     private val queue = ArrayDeque<ByteArray>()
+    // 写进行中标志：poll 置位，settle（写回调确认或写入被拒）复位。
+    // volatile 供 send()（任意线程）与回调线程无锁读，翻转本身都在锁内
+    @Volatile private var inFlight = false
 
-    /** @return true 表示队列原本空闲，调用方应立即泵第一片。 */
     @Synchronized
-    fun enqueue(chunks: List<ByteArray>): Boolean {
-        val wasIdle = queue.isEmpty()
+    fun enqueue(chunks: List<ByteArray>) {
         queue.addAll(chunks)
-        return wasIdle
     }
 
+    /** 取下一片并发起一次写；在途或队列空返回 null（绝不并发下发）。 */
     @Synchronized
-    fun next(): ByteArray? = queue.poll()
+    fun poll(): ByteArray? {
+        if (inFlight) return null
+        val chunk = queue.poll() ?: return null
+        inFlight = true
+        return chunk
+    }
+
+    /** 在途写已落定（写回调确认 / 写入被拒未接受）：解锁泵，允许下一片。 */
+    @Synchronized
+    fun settle() {
+        inFlight = false
+    }
+
+    /** 当前排队未发的分片数（诊断日志用）。 */
+    @Synchronized
+    fun pendingCount(): Int = queue.size
 
     @Synchronized
     fun clear() = queue.clear()
@@ -155,21 +174,38 @@ class BleClientLink(
     }
 
     fun send(frame: ByteArray) {
-        val shouldPump = pump.enqueue(splitForChunk(frame, chunkSize))
-        if (shouldPump) pumpOnce()
+        pump.enqueue(splitForChunk(frame, chunkSize))
+        pumpOnce()
     }
 
+    /** 泵下一片。poll() 内部有 inFlight 门闩：写进行中本次调用是空转，
+     *  分片由写回调驱动续发——任何时刻至多一个在途 writeCharacteristic。 */
     @SuppressLint("MissingPermission")
     private fun pumpOnce() {
-        val chunk = pump.next() ?: return
-        val char = rxChar ?: run { pump.clear(); return }
-        val g = gatt ?: run { pump.clear(); return }
-        runCatching { writeCharacteristicCompat(g, char, chunk) }.onFailure { pump.clear() }
+        val chunk = pump.poll() ?: return
+        val char = rxChar ?: run { pump.clear(); pump.settle(); return }
+        val g = gatt ?: run { pump.clear(); pump.settle(); return }
+        val ok = try {
+            writeCharacteristicCompat(g, char, chunk)
+        } catch (_: Exception) {
+            false
+        }
+        if (!ok) {
+            // 写入未被协议栈接受（忙/资源异常）：分片不得静默丢（P1），
+            // 也不会再有写回调来驱动队列——断链让上层按链路重建处理
+            android.util.Log.w("BleChannel", "GATT 写特征失败，断链（丢 ${queueDepth()} 片）")
+            pump.clear()
+            pump.settle()
+            events.onClosed()
+        }
     }
+
+    private fun queueDepth() = pump.pendingCount()
 
     @SuppressLint("MissingPermission")
     fun close() {
         pump.clear()
+        pump.settle()
         runCatching { gatt?.close() }
     }
 
@@ -230,7 +266,16 @@ class BleClientLink(
     }
 
     override fun onCharacteristicWrite(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-        if (status != BluetoothGatt.GATT_SUCCESS) pump.clear()
+        // 先释放在途标志再驱动下一片（P1：inFlight 窗口只在单次写期间闭合）
+        pump.settle()
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            // 分片写失败：剩余队列作废并断链——旧码只清队列不断链，上层仍把
+            // 链路当健康，后续帧继续走死链静默丢失
+            android.util.Log.w("BleChannel", "onCharacteristicWrite status=$status，断链（丢 ${pump.pendingCount()} 片）")
+            pump.clear()
+            events.onClosed()
+            return
+        }
         pumpOnce()
     }
 
@@ -264,27 +309,43 @@ class BleServer(private val context: Context) : BluetoothGattServerCallback() {
         var events: LinkEvents? = null
 
         fun send(frame: ByteArray) {
-            val shouldPump = pump.enqueue(splitForChunk(frame, chunkSize))
-            if (shouldPump) pumpOnce()
+            pump.enqueue(splitForChunk(frame, chunkSize))
+            pumpOnce()
         }
 
         @SuppressLint("MissingPermission")
         private fun pumpOnce() {
-            val chunk = pump.next() ?: return
-            val s = server ?: run { pump.clear(); return }
-            runCatching {
+            // poll() 内部 inFlight 门闩：notify 单操作限制，一次只在途一个通知
+            val chunk = pump.poll() ?: return
+            val s = server ?: run { pump.clear(); pump.settle(); return }
+            val ok = try {
                 @Suppress("DEPRECATION")
                 if (Build.VERSION.SDK_INT >= 33) {
-                    s.notifyCharacteristicChanged(device, txChar, false, chunk)
+                    s.notifyCharacteristicChanged(device, txChar, false, chunk) ==
+                        android.bluetooth.BluetoothStatusCodes.SUCCESS
                 } else {
                     txChar.value = chunk
                     s.notifyCharacteristicChanged(device, txChar, false)
                 }
-            }.onFailure { pump.clear() }
+            } catch (_: Exception) {
+                false
+            }
+            if (!ok) {
+                // 通知未被协议栈接受：不会再来 onNotificationSent 驱动队列——
+                // 分片不得静默丢（P1），清队列并断链让上层按断线处理
+                android.util.Log.w("BleChannel", "GATT notify 失败，断链（丢 ${pump.pendingCount()} 片）")
+                pump.clear()
+                pump.settle()
+                events?.onClosed()
+            }
         }
 
-        internal fun pumpContinue() = pumpOnce()
-        internal fun drop() { pump.clear(); sink.reset() }
+        /** 写回调驱动：释放在途标志后泵下一片。 */
+        internal fun pumpContinue() {
+            pump.settle()
+            pumpOnce()
+        }
+        internal fun drop() { pump.clear(); pump.settle(); sink.reset() }
     }
 
     private val manager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -302,10 +363,12 @@ class BleServer(private val context: Context) : BluetoothGattServerCallback() {
     private val links = mutableMapOf<String, ServerLink>()
     var onNewClient: NewClient? = null
 
+    /** @return 打开的 BluetoothGattServer；蓝牙未开（openGattServer 返回 null）
+     *  时返回 null——调用方（BleMesh.refreshRadios）稍后重建，不再永久放弃（P1）。 */
     @SuppressLint("MissingPermission")
-    fun start() {
-        if (server != null) return
-        val s = manager.openGattServer(context, this) ?: return
+    fun start(): BluetoothGattServer? {
+        server?.let { return it }
+        val s = manager.openGattServer(context, this) ?: return null
         val service = BluetoothGattService(LinkUuids.SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
         txChar.addDescriptor(
             BluetoothGattDescriptor(
@@ -317,6 +380,7 @@ class BleServer(private val context: Context) : BluetoothGattServerCallback() {
         service.addCharacteristic(rxChar)
         s.addService(service)
         server = s
+        return s
     }
 
     @SuppressLint("MissingPermission")

@@ -27,6 +27,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -43,6 +44,9 @@ import chat.dc.app.core.SignalCore
 import chat.dc.app.ui.components.EmptyState
 import chat.dc.app.ui.components.InitialsAvatar
 import chat.dc.core.ChatMessage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -56,11 +60,18 @@ import java.util.Locale
 fun MessagesScreen(onOpenChat: (String) -> Unit, onOpenAddFriend: () -> Unit = {}) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val scope = rememberCoroutineScope()
     var query by remember { mutableStateOf("") }
     var chats by remember { mutableStateOf<List<ChatMessage>>(emptyList()) }
 
+    // reload 统一挪 IO（P2）：入站消息触发的 lastMessages 查询不再阻塞主线程
     fun reload() {
-        chats = runCatching { SignalCore.contactStore(context).lastMessages() }.getOrDefault(emptyList())
+        scope.launch {
+            val list = withContext(Dispatchers.IO) {
+                runCatching { SignalCore.contactStore(context).lastMessages() }.getOrDefault(emptyList())
+            }
+            chats = list
+        }
     }
 
     LaunchedEffect(Unit) { reload() }

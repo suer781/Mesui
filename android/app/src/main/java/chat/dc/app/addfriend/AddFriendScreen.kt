@@ -228,7 +228,11 @@ fun ShowMyCodeScreen(onBack: () -> Unit) {
         myPayload?.let { BleMesh.startPairingAsHost(it, challenge) }
     }
     DisposableEffect(myPayload) {
-        onDispose { if (myPayload != null) BleMesh.stopPairingAsHost() }
+        // 必须在 effect 体内捕获本次登记的载荷：onDispose 若活读 myPayload，
+        // 载荷重生成（iroh 节点地址就绪等）时会读到新值非空 → 把「刚重新登记
+        // 的 host 配对」当成页面退出撤销掉，出示端配对随之死锁
+        val registered = myPayload
+        onDispose { if (registered != null) BleMesh.stopPairingAsHost() }
     }
     val pairSnap by BleMesh.pairing.collectAsState()
     // 两阶段展示当前阶段（UI 提示用）：1 蓝牙搭线 → 2 身份交换；0 = 降级混合
@@ -412,27 +416,43 @@ fun ScanToAddScreen(onBack: () -> Unit) {
     var established by remember { mutableStateOf<Int?>(null) }
     LaunchedEffect(peerPayload) {
         peerPayload?.let { p ->
-            val session = runCatching { SignalCore.session(context) }.getOrNull()
-            established = when {
-                session == null -> 0
-                else -> try {
-                    session.processBundle(p.name, p.bundle)
-                    BleMesh.startPairingAsJoiner(p.name, p.identity, p.token, p.bucket, p.ble, p.naddr)
-                    1
-                } catch (_: DcException.RemoteIdentityChanged) {
-                    2
-                } catch (_: Exception) {
-                    0
+            // PQXDH 建会话是重活：首取会话要 dlopen native + 开 SQLCipher，
+            // processBundle 还要跑 Kyber-1024 + X25519——全部在主线程会把
+            // 扫码 UI 整个冻住（用户报的「扫描端卡一下」）。挪 IO 线程，
+            // 与快连路径（onJoinerQrOffer 在 BleMesh 协程里建会话）同一线程纪律
+            established = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                val session = runCatching { SignalCore.session(context) }.getOrNull()
+                when {
+                    session == null -> 0
+                    else -> try {
+                        session.processBundle(p.name, p.bundle)
+                        BleMesh.startPairingAsJoiner(p.name, p.identity, p.token, p.bucket, p.ble, p.naddr)
+                        1
+                    } catch (_: DcException.RemoteIdentityChanged) {
+                        2
+                    } catch (_: Exception) {
+                        0
+                    }
                 }
             }
         }
     }
     DisposableEffect(peerPayload) {
-        onDispose { if (peerPayload != null) BleMesh.stopPairingAsJoiner() }
+        // 捕获 effect 本次登记的载荷（同上：onDispose 活读会把 key 变化时的
+        // 新值误当成「页面退出时的存量」处理）
+        val registered = peerPayload
+        onDispose { if (registered != null) BleMesh.stopPairingAsJoiner() }
     }
-    // 快连路径清理：页面退出即撤销（已完成的配对不动，链路保留为聊天链路）
+    // 快连路径清理：页面退出即撤销（已完成的配对不动，链路保留为聊天链路）。
+    // **必须捕获 effect 登记时的 bleInfo**：onDispose 里活读 state 读到的是
+    // 当前值——读到 f=2 蓝牙帧当帧 bleInfo 由 null 变为非空，key 随之变化触发
+    // 旧 effect 清理，活读会把「刚注册的 QR 快连搭线」当成存量撤销
+    // （startQrDialAsJoiner 登记的 pairingObj 被立刻 stopPairingAsJoiner 清空，
+    // 常驻扫描从此匹配不到任何配对广播，扫码端永远加不上人）；
+    // 回调里 `if (bleInfo == null)` 的先到先冻守卫又阻止重新登记 → 死锁。
     DisposableEffect(bleInfo) {
-        onDispose { if (bleInfo != null) BleMesh.stopPairingAsJoiner() }
+        val dial = bleInfo
+        onDispose { if (dial != null) BleMesh.stopPairingAsJoiner() }
     }
     // 真 SAS：绑定双方长期身份公钥 + 双方地址名，两端各算一端、结果一致
     // （快连路径的 SAS 由 BleMesh 在 QR_ID 到达时算好，随 pairSnap 下发）
@@ -474,6 +494,14 @@ fun ScanToAddScreen(onBack: () -> Unit) {
                         }
                         1 -> {
                             Text(stringResource(R.string.add_friend_establish_failed), style = MaterialTheme.typography.bodySmall)
+                            // 快连失败就地重试（P3）：清错误态并解除限频，常驻扫描
+                            // 命中对方配对广播即重新回连，不必退出重扫
+                            Button(
+                                onClick = { BleMesh.retryQrDial() },
+                                modifier = Modifier.fillMaxWidth().padding(top = 4.dp).testTag("qr_retry"),
+                            ) {
+                                Text(stringResource(R.string.add_friend_retry))
+                            }
                             return@Card
                         }
                     }
@@ -606,6 +634,21 @@ fun ScanToAddScreen(onBack: () -> Unit) {
                     })
                     barcodeView.resume()
                     onDispose { barcodeView.pause() }
+                }
+                // 相机句柄跟随 Activity 生命周期：退后台即释放（DecoratedBarcodeView
+                // 内部的相机线程/解码泵只有收到 pause 才停，Compose 不会替它做），
+                // 回前台恢复解码（decodeContinuous 回调已注册，resume 即续上）
+                val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+                DisposableEffect(lifecycleOwner) {
+                    val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                        when (event) {
+                            androidx.lifecycle.Lifecycle.Event.ON_RESUME -> barcodeView.resume()
+                            androidx.lifecycle.Lifecycle.Event.ON_PAUSE -> barcodeView.pause()
+                            else -> Unit
+                        }
+                    }
+                    lifecycleOwner.lifecycle.addObserver(observer)
+                    onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
                 }
                 LaunchedEffect(Unit) {
                     while (true) {

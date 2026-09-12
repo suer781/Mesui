@@ -36,7 +36,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.security.SecureRandom
 import java.util.UUID
@@ -123,6 +123,9 @@ private class PairingInternal(val asHost: Boolean) {
     // = 本端时长门槛到期时刻，到点才发 QR_REQ。
     @Volatile var startedAtMs = -1L
     @Volatile var identityReadyAtMs = -1L
+    // 扫码端上次回连发起时刻：常驻扫描回调高频到达（LOW_LATENCY 下每秒十余次），
+    // 配对广播在链路建立前一直在场——不去重会叠出成片的并发 GATT 连接互相踩踏
+    @Volatile var lastDialAtMs = 0L
 
     fun snap() = PairingSnap(
         asHost = asHost,
@@ -143,6 +146,8 @@ private class PairingInternal(val asHost: Boolean) {
  */
 object BleMesh {
 
+    private const val TAG = "BleMesh"
+
     // 身份公钥长度契约 = 33 字节（libsignal IdentityKey::serialize()：1 字节类型前缀 + 32）。
     // AUTH 全流程统一引用此常量，勿再手写 32——旧码 32/33 混用导致回连握手
     // 两端都建不起来（P0-1）
@@ -154,7 +159,7 @@ object BleMesh {
     @Volatile private var appContext: Context? = null
     @Volatile private var advertiser: BluetoothLeAdvertiser? = null
     @Volatile private var scanner: BluetoothLeScanner? = null
-    private var server: BleServer? = null
+    @Volatile private var server: BleServer? = null
 
     private val _peers = MutableStateFlow<Map<String, PeerState>>(emptyMap())
     val peers = _peers.asStateFlow()
@@ -165,7 +170,9 @@ object BleMesh {
     private val _incoming = MutableSharedFlow<Incoming>(extraBufferCapacity = 64)
     val incoming = _incoming.asSharedFlow()
 
-    private var pairingObj: PairingInternal? = null
+    // 主线程（UI 登记配对）写、binder 扫描/GATT 回调线程读：必须 volatile
+    // 保证可见性（P1），否则扫描线程可能永远看不到新登记的配对对象
+    @Volatile private var pairingObj: PairingInternal? = null
     private val links = mutableMapOf<String, LinkHandle>()
     private val connectingAddr = mutableSetOf<String>()
     private var advJob: Job? = null
@@ -180,14 +187,16 @@ object BleMesh {
         val bt = manager.adapter ?: return
         advertiser = bt.bluetoothLeAdvertiser
         scanner = bt.bluetoothLeScanner
-        val srv = BleServer(context)
-        srv.onNewClient = object : BleServer.NewClient {
-            override fun onClient(link: BleServer.ServerLink) = handleIncomingLink(link)
-        }
-        srv.start()
-        server = srv
+        newBleServer(context).also { srv -> if (srv.start() != null) server = srv }
         startAdvertiseLoop()
         startScanLoop()
+    }
+
+    /** 统一组装 GATT server（server 方向链路的 onNewClient 转接）。 */
+    private fun newBleServer(context: Context): BleServer = BleServer(context).apply {
+        onNewClient = object : BleServer.NewClient {
+            override fun onClient(link: BleServer.ServerLink) = handleIncomingLink(link)
+        }
     }
 
     /** NodeService.onDestroy：停回路、停广播/扫描、关 server 与全部链路。 */
@@ -204,12 +213,44 @@ object BleMesh {
         synchronized(links) { links.values.forEach { runCatching { it.closeLink() } }; links.clear() }
         synchronized(connectingAddr) { connectingAddr.clear() }
         _peers.value = emptyMap()
+        // 配对态一并作废：UI 收到 null 快照回到未配对态，扫描线程也不再匹配
+        // 已死配对的 bleId 去回连（P3）
+        pairingObj = null
+        _pairing.value = null
+        scanCache = null
         appContext = null
     }
 
     private fun ctx(): Context = appContext ?: error("BleMesh.init 未调用")
     private fun hex(b: ByteArray) = b.joinToString("") { "%02x".format(it) }
     private fun publishPairing() { _pairing.value = pairingObj?.snap() }
+
+    /** 蓝牙可能在服务冷启动（init）之后才被打开/授权：射频句柄不能只在 init
+     *  抓一次——蓝牙未开时 adapter 返回 null，旧码把 null 存死，扫描协程
+     *  `?: return` 直接熄火、广播每轮空转，之后蓝牙再开也无人重启。
+     *  每轮广播/扫描回路开始时重新解析即可自愈。 */
+    @SuppressLint("MissingPermission")
+    private fun refreshRadios() {
+        val context = appContext ?: return
+        val bt = (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter ?: return
+        if (!bt.isEnabled) {
+            // 关着时置空：下一轮蓝牙打开后再解析（持有失效句柄 startScan 会持续抛）
+            advertiser = null
+            scanner = null
+            // 蓝牙关闭时系统会回收 GATT server：丢弃旧实例，开回来后重建
+            server?.let { runCatching { it.stop() } }
+            server = null
+            return
+        }
+        if (advertiser == null) advertiser = runCatching { bt.bluetoothLeAdvertiser }.getOrNull()
+        if (scanner == null) scanner = runCatching { bt.bluetoothLeScanner }.getOrNull()
+        // GATT server 同样自愈（P1）：init 时蓝牙未开，openGattServer 返回 null
+        // 即永久放弃——server 方向链路（被回连方的应答通道）从此缺失。每轮检查，
+        // 缺失且蓝牙已就绪就重建；start 失败（仍返回 null）下一轮再试。
+        if (server == null) {
+            newBleServer(context).also { srv -> if (srv.start() != null) server = srv }
+        }
+    }
 
     // ---------------- 广播回路 ----------------
 
@@ -230,6 +271,7 @@ object BleMesh {
 
     @SuppressLint("MissingPermission")
     private suspend fun publishAdvOnce() {
+        refreshRadios()
         val adv = advertiser ?: return
         val bloom = runCatching { currentBloom() }.getOrNull() ?: return
         val p = pairingObj?.takeIf { it.asHost && !it.finished && it.link == null }
@@ -242,9 +284,12 @@ object BleMesh {
         val params = AdvertisingSetParameters.Builder()
             .setLegacyMode(false)
             .setInterval(AdvertisingSetParameters.INTERVAL_LOW)
-            // AdvertisingSetParameters.TRANSMIT_POWER_LOW（-60 dBm）——部分 SDK 面
-            // 未暴露该常量，直接用数值，语义等同
-            .setTxPowerLevel(-60)
+            // AdvertisingSetParameters.TX_POWER_LOW = -15 dBm：扫码是约一臂之遥
+            // 的场景，必须保住这个量级。注意别和旧 API 面 AdvertiseSettings
+            // .ADVERTISE_TX_POWER_LOW（=-60）混用——那是 legacy 广播的常量，
+            // 挪到扩展广播上等于把射程压到厘米级，扫码端常驻扫描在正常距离
+            // 根本收不到配对广播，快连永远搭不起来
+            .setTxPowerLevel(AdvertisingSetParameters.TX_POWER_LOW)
             .build()
         advCallback?.let { runCatching { adv.stopAdvertisingSet(it) } }
         delay(250) // stop→start 栈内序列化留量
@@ -268,7 +313,6 @@ object BleMesh {
     private fun startScanLoop() {
         scanJob?.cancel()
         scanJob = scope.launch {
-            val sc = scanner ?: return@launch
             val cb = object : ScanCallback() {
                 override fun onScanResult(callbackType: Int, result: ScanResult) {
                     runCatching { handleScanResult(result) }
@@ -277,12 +321,53 @@ object BleMesh {
             val filters = listOf(ScanFilter.Builder().setServiceUuid(SERVICE_PU).build())
             val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
             while (true) {
-                runCatching { sc.startScan(filters, settings, cb) }
-                delay(1000)
-                runCatching { sc.stopScan(cb) }
-                delay(1000)
+                refreshRadios()
+                val sc = scanner
+                if (sc == null) {
+                    // 蓝牙未就绪：不熄火，稍后重试（旧码在此 return@launch 永久退出）
+                    delay(2000)
+                } else {
+                    runCatching { sc.startScan(filters, settings, cb) }
+                    delay(1000)
+                    runCatching { sc.stopScan(cb) }
+                    delay(1000)
+                }
             }
         }
+    }
+
+    /**
+     * 扫描端每槽缓存（P2）：LOW_LATENCY 下扫描回调每秒十余条，旧码每条都跑
+     * listContacts（SQLCipher 全表查询）+ 每位好友 2 槽位 × 2 轮 HKDF。按 10 分钟
+     * 槽缓存「联系人 + 双槽派生 ID」，联系人集变动经 [invalidateScanCache] 作废，
+     * 下一轮扫描结果触发重建。
+     */
+    private class ScanCache(
+        val slot: Long,
+        val contacts: List<Contact>,
+        /** 与 contacts 对齐：[本槽 ID, 前一槽 ID]（槽边界时钟偏差容忍窗口）。 */
+        val slotIds: List<List<ByteArray>>,
+    )
+
+    @Volatile private var scanCache: ScanCache? = null
+
+    /** 联系人增删改后调用：作废扫描端每槽缓存（删除联系人等场景由
+     *  SignalCore 的 store 钩子代调）。 */
+    @Synchronized
+    fun invalidateScanCache() {
+        scanCache = null
+    }
+
+    private fun buildScanCache(slot: Long): ScanCache {
+        val contacts = runCatching { SignalCore.contactStore(ctx()).listContacts().filter { it.verified } }
+            .getOrDefault(emptyList())
+        return ScanCache(
+            slot,
+            contacts,
+            contacts.map {
+                listOf(FriendLink.slotId(it.linkSecret, slot), FriendLink.slotId(it.linkSecret, slot - 1))
+            },
+        )
     }
 
     @SuppressLint("MissingPermission")
@@ -295,23 +380,32 @@ object BleMesh {
             val target = p.bleId
             val seen = record.serviceData[PAIR_UUID]
             if (target != null && seen != null && seen.contentEquals(target)) {
-                connectJoiner(device, p)
+                // 回连限频（1 次/秒）：扫描回调远快于 GATT 连接建立，去重缺失
+                // 会并发拉起十几条 connectGatt——失败链接的 onClosed 会把在用
+                // 链路的 p.link 打掉并误标 dialError，握手必死
+                val now = System.currentTimeMillis()
+                if (now - p.lastDialAtMs >= 1_000) {
+                    p.lastDialAtMs = now
+                    connectJoiner(device, p)
+                }
                 return
             }
         }
 
         val bloom = FriendLink.parseAdvertisePayload(record.serviceData[SERVICE_PU]) ?: return
-        val contacts = runCatching { SignalCore.contactStore(ctx()).listContacts().filter { it.verified } }
-            .getOrDefault(emptyList())
-        if (contacts.isEmpty()) return
         val slot = FriendLink.currentSlot()
-        val cands = FriendLink.candidates(bloom, contacts.map { it.linkSecret }, slot)
+        val cache = scanCache?.takeIf { it.slot == slot } ?: buildScanCache(slot).also { scanCache = it }
+        if (cache.contacts.isEmpty()) return
+        // 与 FriendLink.candidates 同语义（本槽→前一槽窗口），但派生 ID 走缓存
+        val cands = cache.contacts.mapIndexed { i, c ->
+            cache.slotIds[i].firstOrNull { FriendLink.bloomHit(bloom, it) }?.let { c to it }
+        }.filterNotNull()
         if (cands.isEmpty()) return
         synchronized(links) {
-            if (contacts.any { links.containsKey(hex(it.identity)) }) return
+            if (cache.contacts.any { links.containsKey(hex(it.identity)) }) return
         }
         synchronized(connectingAddr) { if (!connectingAddr.add(device.address)) return }
-        connectInitiator(device, cands.map { it.second }, contacts)
+        connectInitiator(device, cands.map { it.second }, cache.contacts)
     }
 
     // ---------------- 回连发起方（client） ----------------
@@ -334,7 +428,9 @@ object BleMesh {
         link.connect()
         link.whenReady { ok ->
             if (!ok) { link.close(); return@whenReady }
-            val me = runCatching { SignalCore.session(context).identityKey() }.getOrNull() ?: run { link.close(); return@whenReady }
+            val me = runCatching { SignalCore.session(context).identityKey() }
+                .onFailure { android.util.Log.w(TAG, "本端身份密钥读取失败，回连放弃", it) }
+                .getOrNull() ?: run { link.close(); return@whenReady }
             val body = me + byteArrayOf(candidateIds.size.toByte()) +
                 candidateIds.fold(ByteArray(0)) { a, b -> a + b }
             link.send(wireFrame(Wire.AUTH_CAND, body))
@@ -365,6 +461,7 @@ object BleMesh {
                 synchronized(connectingAddr) { connectingAddr.remove(device.address) }
                 handle.send(wireFrame(Wire.AUTH_RSP, FriendLink.hmac(contact.linkSecret, nonce)))
                 runCatching { SignalCore.contactStore(context).setVerified(contact.name, true) }
+                invalidateScanCache()
             }
             Wire.MSG -> dispatchIncoming(handle, frame, st.peerName)
             else -> Unit
@@ -404,6 +501,10 @@ object BleMesh {
                 val hit = contacts.firstOrNull { c ->
                     ids.any { id -> FriendLink.slotId(c.linkSecret, slot).contentEquals(id) || FriendLink.slotId(c.linkSecret, slot - 1).contentEquals(id) }
                 } ?: return // 假阳性入连：不回话，对端超时自断
+                // 自报身份必须与槽位 ID 命中的联系人一致（P2）：槽位 ID 只证
+                // 「对端持有某位好友的 S_i」，自报的 identity 未经证实——两者
+                // 不一致即冒充/张冠李戴，沉默拒绝
+                if (!theirId.contentEquals(hit.identity)) return
                 st.secret = hit.linkSecret
                 st.peerHex = hex(hit.identity)
                 st.peerName = hit.name
@@ -537,10 +638,15 @@ object BleMesh {
             }
         }
         adapter.onClosed = {
-            p.link = null
+            // 只清本链路持有的配对链路：重试产生的失败链接不得把在用链路打掉
+            // （旧码无条件 p.link = null，握手进行中被并发失败链接误判为断链）
+            val wasActive = p.link === handle
+            if (wasActive) p.link = null
             // QR 快连中途断链且未完成：标记失败（UI 提示重扫；完整身份仍可
-            // 经数据帧全集回退）。已完成/旧路径（无 challenge）不打扰
-            if (!p.finished && p.challenge != null && p.dialError == 0) p.dialError = 1
+            // 经数据帧全集回退）。已完成/旧路径（无 challenge）不打扰；
+            // 仅「已搭线在用」的链路断开才算失败——连接尝试本身失败只等
+            // 下轮限频重试，不算错
+            if (wasActive && !p.finished && p.challenge != null && p.dialError == 0) p.dialError = 1
             publishPairing()
         }
         link.connect()
@@ -561,35 +667,44 @@ object BleMesh {
 
     /** 身份就绪（旧路径 startPairingAsJoiner 直接就绪 / QR 快连 QR_ID 到齐）后：
      *  发 token-MAC 握手（SP-3 第 4 条：首条消息必须携带 token 派生确认），
-     *  随后进入 SAS 比对。 */
+     *  随后进入 SAS 比对。
+     *  在自有协程里发（P1）：旧码 runBlocking(Dispatchers.IO) 直接跑在 GATT
+     *  binder 回调线程，等 iroh 快照最长 4 秒会卡死同一 server 上所有设备的
+     *  GATT 回调。 */
     private fun sendJoinerHandshake(handle: ClientLinkHandle, p: PairingInternal) {
-        val context = ctx()
-        val name = p.peerName ?: return
-        val session = runCatching { SignalCore.session(context) }.getOrNull() ?: return
-        val token = p.token ?: return
-        val bucket = p.bucket ?: return
-        // 等 iroh 节点快照就绪（冷启动 onReady 可能滞后于 BLE 配对）。超时则降级
-        // 沿用当前快照（可能为空 → 退化为纯 BLE 握手），绝不因此阻塞 BLE 配对；
-        // 不静默把 naddr 写成空，否则联系人 node_naddr 被永久置空、跨网不可达（缺陷 D）
-        val myNaddr = runBlocking(Dispatchers.IO) {
-            withTimeoutOrNull(4000L) {
-                chat.dc.app.core.IrohNodeManager.state.first { it.naddr.isNotBlank() }
-            }?.naddr ?: chat.dc.app.core.IrohNodeManager.state.value.naddr
+        scope.launch {
+            // 链路已被其他连接接替 / 配对已完成：本次握手作废
+            if (p.finished || (p.link != null && p.link !== handle)) return@launch
+            withContext(Dispatchers.IO) {
+                val context = ctx()
+                val name = p.peerName ?: return@withContext
+                val session = runCatching { SignalCore.session(context) }.getOrNull() ?: return@withContext
+                val token = p.token ?: return@withContext
+                val bucket = p.bucket ?: return@withContext
+                // 等 iroh 节点快照就绪（冷启动 onReady 可能滞后于 BLE 配对）。超时则降级
+                // 沿用当前快照（可能为空 → 退化为纯 BLE 握手），绝不因此阻塞 BLE 配对；
+                // 不静默把 naddr 写成空，否则联系人 node_naddr 被永久置空、跨网不可达（缺陷 D）
+                val myNaddr = withTimeoutOrNull(4000L) {
+                    chat.dc.app.core.IrohNodeManager.state.first { it.naddr.isNotBlank() }
+                }?.naddr ?: chat.dc.app.core.IrohNodeManager.state.value.naddr
+                val plainPayload = if (myNaddr.isEmpty()) {
+                    "dc-hs".toByteArray()
+                } else {
+                    "dc-hs".toByteArray(Charsets.US_ASCII) + byteArrayOf(0) + myNaddr.toByteArray(Charsets.US_ASCII)
+                }
+                val wm = runCatching { session.encrypt(name, plainPayload) }.getOrNull() ?: return@withContext
+                val mac = runCatching { firstMessageMac(token, bucket, wm.ciphertext) }.getOrNull() ?: return@withContext
+                // 等待期间链路可能已被接替/配对完成：复查再发
+                if (p.finished || (p.link != null && p.link !== handle)) return@withContext
+                val nameBytes = name.toByteArray()
+                val body = byteArrayOf(nameBytes.size.toByte()) + nameBytes + mac + byteArrayOf(wm.msgType.toByte()) + wm.ciphertext
+                handle.send(wireFrame(Wire.HS, body))
+                p.link = handle
+                val idHex = p.peerIdentity?.let { hex(it) }
+                if (idHex != null) synchronized(links) { links[idHex] = handle }
+                publishPairing()
+            }
         }
-        val plainPayload = if (myNaddr.isEmpty()) {
-            "dc-hs".toByteArray()
-        } else {
-            "dc-hs".toByteArray(Charsets.US_ASCII) + byteArrayOf(0) + myNaddr.toByteArray(Charsets.US_ASCII)
-        }
-        val wm = runCatching { session.encrypt(name, plainPayload) }.getOrNull() ?: return
-        val mac = runCatching { firstMessageMac(token, bucket, wm.ciphertext) }.getOrNull() ?: return
-        val nameBytes = name.toByteArray()
-        val body = byteArrayOf(nameBytes.size.toByte()) + nameBytes + mac + byteArrayOf(wm.msgType.toByte()) + wm.ciphertext
-        handle.send(wireFrame(Wire.HS, body))
-        p.link = handle
-        val idHex = p.peerIdentity?.let { hex(it) }
-        if (idHex != null) synchronized(links) { links[idHex] = handle }
-        publishPairing()
     }
 
     /** QR 快连②：出示端回 PreKeyBundle（公开材料，明文与旧版二维码数据帧等价）。
@@ -699,9 +814,17 @@ object BleMesh {
         val theirId = p.peerIdentity ?: return
         val peerNodeId = runCatching { chat.dc.core.nodeIdFromNaddr(p.naddr) }.getOrDefault("")
         runCatching { SignalCore.contactStore(context).upsertContact(name, theirId, p.bucket ?: ByteArray(32), true, "", secret, peerNodeId, p.naddr) }
+            .onFailure { android.util.Log.w(TAG, "联系人（含 S_i）落库失败", it) }
+        invalidateCaches()
         p.finished = true
         p.link?.send(wireFrame(Wire.SAS_OK, ByteArray(0)))
         publishPairing()
+    }
+
+    /** 联系人落库后的缓存作废：扫描每槽缓存 + iroh nodeId 反查缓存（P2-8/P2-10）。 */
+    private fun invalidateCaches() {
+        invalidateScanCache()
+        runCatching { chat.dc.app.core.IrohNodeManager.invalidateNodeIdIndex() }
     }
 
     /** 出示页进入。[payload] = 本场动态码载荷（QR 快连用它应答 QR_DIAL/QR_REQ），
@@ -761,6 +884,18 @@ object BleMesh {
         publishPairing()
     }
 
+    /** 快连失败后重试（P3，UI「重试」按钮）：清错误标记与中途状态，常驻扫描
+     *  命中对方配对广播即重新回连（lastDialAtMs 归零解除限频等待）。 */
+    fun retryQrDial() {
+        val p = pairingObj?.takeIf { !it.asHost && !it.finished } ?: return
+        p.dialError = 0
+        p.link?.closeLink()
+        p.link = null
+        p.offerBundle = null // 作废中途会话材料，重走完整 QR_OFFER → QR_ID
+        p.lastDialAtMs = 0L
+        publishPairing()
+    }
+
     /** 本地点「一致」：立即本地 pin + 存联系人；host 生成并下发 S_i。 */
     fun confirmSas() {
         val p = pairingObj?.takeIf { !it.finished && !it.localConfirmed } ?: return
@@ -774,11 +909,19 @@ object BleMesh {
         if (p.asHost) {
             val secret = ByteArray(32).also(security::nextBytes)
             runCatching { SignalCore.contactStore(context).upsertContact(name, theirId, p.bucket ?: ByteArray(32), true, "", secret, peerNodeId, p.naddr) }
-            val wm = runCatching { session.encrypt(name, "DCS1".toByteArray(Charsets.US_ASCII) + secret) }.getOrNull()
+                .onFailure { android.util.Log.w(TAG, "联系人（含 S_i）落库失败", it) }
+            invalidateCaches()
+            val wm = runCatching { session.encrypt(name, "DCS1".toByteArray(Charsets.US_ASCII) + secret) }
+                .onFailure { android.util.Log.w(TAG, "DCS1 加密失败，S_i 未下发", it) }
+                .getOrNull()
             wm?.let { p.link?.send(wireFrame(Wire.MSG, byteArrayOf(it.msgType.toByte()) + it.ciphertext)) }
             p.finished = true
         } else {
-            runCatching { SignalCore.contactStore(context).upsertContact(name, theirId, p.bucket ?: ByteArray(32), true, "", ByteArray(32), peerNodeId, p.naddr) }
+            // 全零 linkSecret 不落库（P2）：旧码先以全零占位，DCS1 一旦丢失
+            // 就永久持零密钥——零密钥派生的槽位 ID 对所有零密钥联系人恒相同
+            //（污染布隆过滤器 + 可关联），聊天链路 HMAC 也全错。DCS1 到达
+            // （finishJoinerWithSecret 携真实 S_i）才落库；丢失则停留在
+            // 「已确认待下发」态，重新扫码即可恢复，不会写坏任何数据。
         }
         p.localConfirmed = true
         p.link?.send(wireFrame(Wire.SAS_OK, ByteArray(0)))
@@ -798,6 +941,7 @@ object BleMesh {
         if (plain.size == 4 + 32 && String(plain.copyOfRange(0, 4), Charsets.US_ASCII) == "DCS1") return // 聊天链路拒收下发格式
         val text = String(plain, Charsets.UTF_8)
         runCatching { SignalCore.contactStore(context).appendMessage(peerName, false, text) }
+            .onFailure { android.util.Log.w(TAG, "入站消息落库失败", it) }
         _incoming.tryEmit(Incoming(peerName, text))
     }
 

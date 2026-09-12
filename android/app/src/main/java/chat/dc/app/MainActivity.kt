@@ -50,9 +50,20 @@ import chat.dc.app.ui.theme.DCChatTheme
  * 每个功能区一律独立子页面，不在主页面堆砌功能。
  */
 class MainActivity : ComponentActivity() {
-    private val notifPermission = registerForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { startNodeService() }
+    // 批量请求：POST_NOTIFICATIONS（33+ 通知）与 BLUETOOTH_CONNECT（31+ 蓝牙操作）
+    private val permissionsLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { grants ->
+        // BLUETOOTH_CONNECT 未授权则不启动：API 34+ 对 connectedDevice 类型的
+        // 前台服务要求启动时已持有该权限，否则 startForeground 抛 SecurityException
+        // → Android 14+ 首启即崩（P0）。请求前已授权时该 key 不在结果里，故按
+        // 「当前实时状态 ∨ 本次结果」判定。通知权限被拒不阻塞——服务照跑，
+        // 只是常驻通知不显示（见 ensureNodeService 注释）。
+        val btOk = Build.VERSION.SDK_INT < 31 ||
+            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED ||
+            grants[Manifest.permission.BLUETOOTH_CONNECT] == true
+        if (btOk) startNodeService()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -67,12 +78,23 @@ class MainActivity : ComponentActivity() {
 
     /** 「人人即节点」：进入应用即启动前台服务（用户可关）。
      *  通知权限被拒也照常启动——服务照跑，只是常驻通知不显示。
-     *  启动动作只在权限回调里执行一次，避免双启动。 */
+     *  启动动作只在权限回调里执行一次，避免双启动。
+     *  API 34+ 前台服务类型 connectedDevice 要求启动前已持有 BLUETOOTH_CONNECT：
+     *  与 POST_NOTIFICATIONS 一起批量请求，蓝牙权限到手（或平台低于 31）才启动。 */
     private fun ensureNodeService() {
+        val needed = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
-            notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            needed += Manifest.permission.POST_NOTIFICATIONS
+        }
+        if (Build.VERSION.SDK_INT >= 31 &&
+            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
+        ) {
+            needed += Manifest.permission.BLUETOOTH_CONNECT
+        }
+        if (needed.isNotEmpty()) {
+            permissionsLauncher.launch(needed.toTypedArray())
         } else {
             startNodeService()
         }

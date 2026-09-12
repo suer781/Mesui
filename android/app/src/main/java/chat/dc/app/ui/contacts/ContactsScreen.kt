@@ -53,12 +53,17 @@ fun ContactsScreen(onOpenNearby: () -> Unit, onOpenAddFriend: () -> Unit, onOpen
     val peers by BleMesh.peers.collectAsState()
     val pairing by BleMesh.pairing.collectAsState()
 
+    // 列表读取挪 IO（P2，与聊天/消息页同纪律）：listContacts 走 SQLCipher，不进主线程
     LaunchedEffect(Unit) {
-        contacts = runCatching { SignalCore.contactStore(context).listContacts() }.getOrDefault(emptyList())
+        contacts = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching { SignalCore.contactStore(context).listContacts() }.getOrDefault(emptyList())
+        }
     }
     // 配对完成（有新联系人）后刷新列表
     LaunchedEffect(pairing) {
-        contacts = runCatching { SignalCore.contactStore(context).listContacts() }.getOrDefault(emptyList())
+        contacts = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching { SignalCore.contactStore(context).listContacts() }.getOrDefault(emptyList())
+        }
     }
 
     Column(modifier = Modifier.fillMaxSize()) {

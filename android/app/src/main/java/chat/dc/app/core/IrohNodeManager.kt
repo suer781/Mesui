@@ -45,6 +45,7 @@ data class IrohSnap(
  */
 object IrohNodeManager {
 
+    private const val TAG = "IrohNodeManager"
     private const val KEYSTORE_ALIAS = "dc-node-seed"
     private const val SEED_FILE = "dc.nodekey"
     private const val PREFS = "dc-settings"
@@ -139,9 +140,10 @@ object IrohNodeManager {
                     } catch (e: CancellationException) {
                         // 协程取消（如退出/重建）不是启动失败：不吞，交回结构化并发语义
                         throw e
-                    } catch (_: Exception) {
+                    } catch (e: Exception) {
                         // 本轮失败：退避后重试；重试耗尽则标「失败」，等
                         // setRelayUrlAndRestart 或服务重建（START_STICKY）再拉起
+                        android.util.Log.w(TAG, "iroh 节点启动失败（第 ${attempt + 1} 次）", e)
                         if (attempt == RETRY_MAX) _state.value = IrohSnap(status = IrohStatus.FAILED)
                     }
                 }
@@ -189,6 +191,15 @@ object IrohNodeManager {
                 .forEach { nodeIdIndex[it.nodeId] = it.name }
         }
         return nodeIdIndex[nodeIdHex]
+    }
+
+    /**
+     * 联系人删除/变更后作废 [nodeIdIndex]（P2）：缓存只在「未命中」时重建，
+     * 删联系人不会造成未命中——旧映射 nodeId→已删联系人名 一直命中，消息仍被
+     * 投递给已删联系人。SignalCore 的 store 删除钩子代调本方法。
+     */
+    fun invalidateNodeIdIndex() {
+        nodeIdIndex.clear()
     }
 
     // ---------------- 节点种子持久化（Keystore AES-GCM 包裹，同 SignalCore 库密钥模式） ----------------

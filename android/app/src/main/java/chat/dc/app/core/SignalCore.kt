@@ -5,6 +5,7 @@ import android.provider.Settings
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import chat.dc.core.ContactStore
+import chat.dc.core.ContactStoreInterface
 import chat.dc.core.SignalSession
 import java.io.File
 import java.security.KeyStore
@@ -34,6 +35,7 @@ object SignalCore {
     private const val KEYSTORE_ALIAS = "dc-sqlcipher"
     private const val KEY_FILE = "dc.dbkey"
     private const val DB_FILE = "dc-signal.db"
+    private const val NAME_FILE = "dc.devicename"
     private const val GCM_IV_LEN = 12
     private const val GCM_TAG_BITS = 128
 
@@ -44,7 +46,7 @@ object SignalCore {
     private var session: SignalSession? = null
 
     @Volatile
-    private var contacts: ContactStore? = null
+    private var contacts: ContactStoreInterface? = null
 
     // 解密失败自动重置的一次性提示位（UI consume 后清除）
     private var resetNoticePending = false
@@ -52,10 +54,28 @@ object SignalCore {
     fun deviceName(context: Context): String =
         cachedName ?: run {
             val id = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
-            val name = if (id != null && NAME_RE.matches(id)) id else "dc-" + UUID.randomUUID().toString().take(16)
+            val name = if (id != null && NAME_RE.matches(id)) id else persistedFallbackName(context)
             cachedName = name
             name
         }
+
+    /** ANDROID_ID 不可用机型（部分厂商/工作资料/测试环境返回 null）的兜底名：
+     *  随机生成一次后落盘复用（P3）。不持久化则每次进程重启换名——旧设备上的
+     *  ProtocolAddress / SAS / 会话全部失配，等于每重启一次丢一次身份。 */
+    @Synchronized
+    private fun persistedFallbackName(context: Context): String {
+        val file = File(context.filesDir, NAME_FILE)
+        if (file.exists()) {
+            runCatching { file.readText() }.getOrNull()
+                ?.trim()
+                ?.takeIf { NAME_RE.matches(it) }
+                ?.let { return it }
+        }
+        val name = "dc-" + UUID.randomUUID().toString().take(16)
+        runCatching { file.writeText(name) }
+            .onFailure { android.util.Log.w("SignalCore", "设备兜底名落盘失败", it) }
+        return name
+    }
 
     /** Keystore 里的 AES-GCM key（不存在则生成；不可导出）。 */
     private fun keystoreKey(): SecretKey {
@@ -125,11 +145,23 @@ object SignalCore {
         ).also { session = it }
     }
 
-    /** 联系人 + 聊天记录句柄：与 Signal store 同库同 key（不同表）。 */
+    /** 联系人 + 聊天记录句柄：与 Signal store 同库同 key（不同表）。
+     *  句柄外包一层删除钩子（P2-10）：删联系人必须同时作废 IrohNodeManager 的
+     *  nodeId→名 反查缓存与 BleMesh 的扫描每槽缓存，否则已删联系人的消息
+     *  仍按旧缓存命中被投递。委托作用于 ContactStoreInterface（接口）——
+     *  ContactStore 本身是 uniffi 生成的 final class，不可继承。 */
     @Synchronized
-    fun contactStore(context: Context): ContactStore =
+    fun contactStore(context: Context): ContactStoreInterface =
         contacts ?: ContactStore.open(
             File(context.filesDir, DB_FILE).absolutePath,
             dbKeyHex(context),
-        ).also { contacts = it }
+        ).let { store ->
+            object : ContactStoreInterface by store {
+                override fun deleteContact(name: String) {
+                    store.deleteContact(name)
+                    IrohNodeManager.invalidateNodeIdIndex()
+                    chat.dc.app.ble.BleMesh.invalidateScanCache()
+                }
+            }.also { contacts = it }
+        }
 }

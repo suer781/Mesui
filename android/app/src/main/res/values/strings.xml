@@ -42,6 +42,7 @@
     <string name="add_friend_safety_code">安全码：%1$s</string>
     <string name="add_friend_safety_code_full">完整校验串：%1$s</string>
     <string name="add_friend_establish_failed">密钥协商失败，请重新扫描</string>
+    <string name="add_friend_retry">重试蓝牙连接</string>
     <string name="add_friend_identity_changed">对方身份密钥与既有记录不一致；为防中间人，已拒绝添加</string>
     <string name="add_friend_waiting_link">等待对方进入蓝牙范围并连接…</string>
     <string name="add_friend_sas_confirm">我确认双方安全码一致</string>
