@@ -89,6 +89,20 @@ impl NodeKeyAnnouncement {
         }
         Ok(())
     }
+
+    /// CBOR 线上格式（SP-2.3 分发）：信箱信封 body 即本编码。
+    /// serde 用 Vec<u8> 存签名，无定长数组编解码坑。
+    pub fn to_cbor(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(160);
+        ciborium::ser::into_writer(self, &mut buf).map_err(|e| CoreError::Cbor(e.to_string()))?;
+        Ok(buf)
+    }
+
+    /// 从信箱信封 body 还原公告：收方先 from_cbor 再 `NodeKeyRing::upsert`
+    /// （内含验签，伪造/被篡改的公告在此被拒）。
+    pub fn from_cbor(bytes: &[u8]) -> Result<Self> {
+        ciborium::de::from_reader(bytes).map_err(|e| CoreError::Cbor(e.to_string()))
+    }
 }
 
 /// 联系人节点密钥环：按身份存各 serial 的公告，按 serial 选钥匙、按过期淘汰。
@@ -172,6 +186,65 @@ impl NodeKeyRing {
     }
 }
 
+/// 公告分发器（SP-2.3 发送侧）：为本端长期身份生成、签名并登记节点密钥
+/// 轮换公告。`rotate()` 产出签名公告 → 调用方经
+/// [`crate::maildrop::distribute_announcement`] 写入各联系人信箱桶
+/// （公告不加密——自带长期身份签名，中继只验信箱 MAC 不解内文）；
+/// 联系人侧由 [`NodeKeyRing`] 接收（upsert 验签 → current/accepts）。
+///
+/// serial 从 1 起单调递增（0 会被验签拒绝）；密钥环同时服务本端视图
+/// （`current_key` / `ring().accepts` 的过渡窗语义）与持久化（`ring().state()`）。
+#[derive(Default)]
+pub struct AnnouncementDispatcher {
+    ring: NodeKeyRing,
+    current_serial: u64,
+}
+
+impl AnnouncementDispatcher {
+    pub fn new() -> Self {
+        Self {
+            ring: NodeKeyRing::new(),
+            current_serial: 0,
+        }
+    }
+
+    /// 轮换节点密钥：serial 单调 +1 → 新公告 → 长期身份签名 → 入环。
+    /// 返回签名公告给调用方去分发（联系人信箱推送，SP-2.3）。
+    /// 入环走 `upsert`（内含验签），保证本端视图与分发出去的内容一致。
+    pub fn rotate(
+        &mut self,
+        identity: &Identity,
+        new_node_key: &NodeId,
+        now_ms: u64,
+    ) -> Result<NodeKeyAnnouncement> {
+        let serial = self
+            .current_serial
+            .checked_add(1)
+            .ok_or_else(|| CoreError::Crypto("announcement serial exhausted".into()))?;
+        let mut ann = NodeKeyAnnouncement::new(
+            &identity.node_id(),
+            new_node_key,
+            serial,
+            now_ms,
+            DEFAULT_OVERLAP_MS,
+        );
+        ann.sign(identity)?;
+        self.ring.upsert(&ann, now_ms)?;
+        self.current_serial = serial;
+        Ok(ann)
+    }
+
+    /// 当前应拨的节点密钥（委托密钥环：最高未过期 serial）。
+    pub fn current_key(&self, identity: &NodeId, now_ms: u64) -> Option<&NodeId> {
+        self.ring.current(identity, now_ms)
+    }
+
+    /// 只读访问密钥环（过渡窗判定 / 持久化导出共用同一类型）。
+    pub fn ring(&self) -> &NodeKeyRing {
+        &self.ring
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +305,163 @@ mod tests {
         let (_, ann) = make_ann(1, 1000);
         let mut ring = NodeKeyRing::new();
         assert!(ring.upsert(&ann, 1000 + DEFAULT_OVERLAP_MS + 1).is_err());
+    }
+
+    // ══════════ SP-2.3 分发（AnnouncementDispatcher + 信箱推送路径） ══════════
+
+    use crate::envelope::PayloadKind;
+    use crate::mailbox::{derive_mailbox_secret, generate_bucket_address};
+    use crate::maildrop::{distribute_announcement, BucketStorage, InMemoryBucketStorage};
+
+    /// 端到端：轮换 → 分发进联系人桶 → 对端读桶验 MAC → upsert → current = 新钥。
+    #[test]
+    fn rotate_distribute_peer_upsert_current_end_to_end() {
+        let alice = Identity::generate().unwrap();
+        let mut dispatcher = AnnouncementDispatcher::new();
+        let t0 = 10_000_000u64;
+        let k1 = Identity::generate().unwrap().node_id();
+
+        let ann = dispatcher.rotate(&alice, &k1, t0).unwrap();
+        assert_eq!(ann.serial, 1);
+
+        // 分发：写入 bob 的联系人信箱桶（双方经握手共享的 mailbox secret）
+        let bucket = generate_bucket_address().unwrap();
+        let secret = derive_mailbox_secret(b"sp2", &bucket, 1);
+        let mut storage = InMemoryBucketStorage::default();
+        distribute_announcement(&ann, &secret, &mut storage, &bucket, t0).unwrap();
+
+        // bob 侧收信：读桶 → 中继语义只验 MAC（不解内文）→ 解 CBOR → 入环
+        let writes = storage.fetch_after(&bucket, 0).unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].envelope.kind, PayloadKind::SessionMgmt);
+        writes[0].verify(&secret, t0).unwrap();
+        let received = NodeKeyAnnouncement::from_cbor(&writes[0].envelope.body).unwrap();
+        assert_eq!(received, ann, "信封 body 的 CBOR 必须无损还原公告");
+
+        let mut peer_ring = NodeKeyRing::new();
+        peer_ring.upsert(&received, t0).unwrap();
+        assert_eq!(peer_ring.current(&alice.node_id(), t0), Some(&k1));
+        // 分发端自身视图同步可见
+        assert_eq!(dispatcher.current_key(&alice.node_id(), t0), Some(&k1));
+    }
+
+    /// 旧票过渡窗：二次轮换分发后，对端 current 已切新钥、旧钥仍在过渡窗 accepts。
+    #[test]
+    fn distributed_rotation_keeps_old_key_acceptable_in_overlap() {
+        let alice = Identity::generate().unwrap();
+        let mut dispatcher = AnnouncementDispatcher::new();
+        let bucket = generate_bucket_address().unwrap();
+        let secret = derive_mailbox_secret(b"sp2-overlap", &bucket, 1);
+        let mut storage = InMemoryBucketStorage::default();
+        let mut peer_ring = NodeKeyRing::new();
+        let t0 = 10_000_000u64;
+
+        // 第 1 次轮换：bob 记下旧钥 k1
+        let k1 = Identity::generate().unwrap().node_id();
+        let ann1 = dispatcher.rotate(&alice, &k1, t0).unwrap();
+        distribute_announcement(&ann1, &secret, &mut storage, &bucket, t0).unwrap();
+
+        // 第 2 次轮换（过渡窗起点 t1）
+        let t1 = t0 + 1000;
+        let k2 = Identity::generate().unwrap().node_id();
+        let ann2 = dispatcher.rotate(&alice, &k2, t1).unwrap();
+        assert_eq!(ann2.serial, 2);
+        distribute_announcement(&ann2, &secret, &mut storage, &bucket, t1).unwrap();
+
+        // bob 按序收两条公告
+        for w in storage.fetch_after(&bucket, 0).unwrap() {
+            peer_ring
+                .upsert(&NodeKeyAnnouncement::from_cbor(&w.envelope.body).unwrap(), t1)
+                .unwrap();
+        }
+        // current 已切新钥；过渡窗内旧钥仍 accepts（对端未切换完的兼容期）
+        assert_eq!(peer_ring.current(&alice.node_id(), t1), Some(&k2));
+        assert!(peer_ring.accepts(&alice.node_id(), &k1, t1));
+        // 过渡窗结束：旧钥淘汰
+        assert!(!peer_ring.accepts(&alice.node_id(), &k1, ann1.not_after_ms + 1));
+        // 分发端密钥环同样保留过渡窗语义
+        assert!(dispatcher.ring().accepts(&alice.node_id(), &k1, t1));
+        assert_eq!(dispatcher.current_key(&alice.node_id(), t1), Some(&k2));
+    }
+
+    /// 伪造公告：分发端验签拒发；即便攻击者绕过分发端强行写桶，收方 upsert 仍验签拒绝。
+    #[test]
+    fn forged_announcement_rejected_at_dispatch_and_upsert() {
+        let alice = Identity::generate().unwrap();
+        let mallory = Identity::generate().unwrap();
+        let t0 = 10_000_000u64;
+        // 冒充 alice：身份字段填 alice、签名用 mallory 的钥匙现造（必不过验签）
+        let mut forged =
+            NodeKeyAnnouncement::new(&alice.node_id(), &[7; 32], 1, t0, DEFAULT_OVERLAP_MS);
+        forged.sig = mallory.sign(&forged.signing_payload()).to_bytes().to_vec();
+
+        let bucket = generate_bucket_address().unwrap();
+        let secret = derive_mailbox_secret(b"sp2-forge", &bucket, 1);
+        let mut storage = InMemoryBucketStorage::default();
+
+        // 分发端 fail-closed：验签不过，拒绝写入任何桶
+        assert!(distribute_announcement(&forged, &secret, &mut storage, &bucket, t0).is_err());
+        assert_eq!(storage.count(&bucket).unwrap(), 0, "伪造公告不得入桶");
+
+        // 纵深防御：Mallory 与 bob 另有信箱关系（能合法写 bob 的桶），把伪造
+        // 公告封进信箱写——信箱 MAC 可验（只证明「共享秘密的写入方」），
+        // 收方 upsert 仍必须被验签拒绝
+        let mut msg_id = [0u8; 16];
+        getrandom::fill(&mut msg_id).unwrap();
+        let env = crate::envelope::Envelope {
+            msg_id,
+            sender: mallory.node_id(),
+            recipient: None,
+            group: None,
+            kind: PayloadKind::SessionMgmt,
+            body: forged.to_cbor().unwrap(),
+            sent_at_ms: t0,
+            ttl_hops: 6,
+        };
+        let w = crate::mailbox::BucketWrite::seal(env, &secret, 1, t0, [3; 16]);
+        w.verify(&secret, t0).unwrap();
+        storage.store(&bucket, &w).unwrap();
+        let relayed = NodeKeyAnnouncement::from_cbor(
+            &storage.fetch_after(&bucket, 0).unwrap()[0].envelope.body,
+        )
+        .unwrap();
+        let mut peer_ring = NodeKeyRing::new();
+        assert!(peer_ring.upsert(&relayed, t0).is_err(), "伪造公告必须被验签拒绝");
+        assert_eq!(peer_ring.current(&alice.node_id(), t0), None);
+    }
+
+    /// 连续 3 次轮换：serial 严格递增、current 始终为最新、旧钥过渡窗内仍接受。
+    #[test]
+    fn three_consecutive_rotations_serial_increments_current_latest() {
+        let alice = Identity::generate().unwrap();
+        let mut dispatcher = AnnouncementDispatcher::new();
+        let bucket = generate_bucket_address().unwrap();
+        let secret = derive_mailbox_secret(b"sp2-three", &bucket, 1);
+        let mut storage = InMemoryBucketStorage::default();
+        let mut peer_ring = NodeKeyRing::new();
+        let t0 = 10_000_000u64;
+        let mut prev: Option<NodeKeyAnnouncement> = None;
+
+        for i in 1..=3u64 {
+            let now = t0 + (i - 1) * 1000;
+            let k = Identity::generate().unwrap().node_id();
+            let ann = dispatcher.rotate(&alice, &k, now).unwrap();
+            assert_eq!(ann.serial, i, "serial 严格递增");
+
+            // 轮换 → 分发 → 对端收 → current 双侧立即为最新
+            distribute_announcement(&ann, &secret, &mut storage, &bucket, now).unwrap();
+            let w = &storage.fetch_after(&bucket, i - 1).unwrap()[0];
+            peer_ring
+                .upsert(&NodeKeyAnnouncement::from_cbor(&w.envelope.body).unwrap(), now)
+                .unwrap();
+            assert_eq!(peer_ring.current(&alice.node_id(), now), Some(&k));
+            assert_eq!(dispatcher.current_key(&alice.node_id(), now), Some(&k));
+            if let Some(old) = &prev {
+                // 前一把钥在过渡窗内仍被接受
+                assert!(peer_ring.accepts(&alice.node_id(), &old.node_key, now));
+            }
+            prev = Some(ann);
+        }
+        assert_eq!(storage.count(&bucket).unwrap(), 3);
     }
 }

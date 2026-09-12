@@ -135,6 +135,90 @@ impl BucketWrite {
     }
 }
 
+/// 读桶请求（SP-1.6 读路径）：携带读取 MAC 证明身份 + 序号游标。
+/// 与写路径镜像：中继只见请求不见明文，验签不过 = 桶门口拒绝。
+/// 读取**无时间窗**（±5min 只限写入）；防重放完全交给 NonceCache
+/// （见 maildrop::MailboxManager::read_bucket）。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct MailboxRead {
+    /// 桶地址
+    pub bucket: [u8; 32],
+    /// mailbox secret 版本：桶主按它选 secret（已进 MAC，中继不可改）
+    pub serial: u32,
+    /// 防重放随机数（熵源生成；读取无时间戳，台账按受理时刻记账）
+    pub nonce: [u8; 16],
+    /// 从第 N 条开始读（返回桶内序号 > cursor 的消息；u64 结构性非负）
+    pub cursor: u64,
+    /// keyed-BLAKE3 读取 MAC
+    pub mac: [u8; 32],
+}
+
+impl MailboxRead {
+    /// 构造读取请求（默认 secret 版本 serial = 1）。
+    /// 钥匙轮换后的版本用 [`MailboxRead::seal_read_serial`]。
+    pub fn seal_read(bucket: [u8; 32], secret: &[u8; 32], cursor: u64, nonce: [u8; 16]) -> Self {
+        Self::seal_read_serial(bucket, secret, 1, cursor, nonce)
+    }
+
+    /// 同 [`MailboxRead::seal_read`]，但显式指定 mailbox secret 版本
+    /// （serial 只影响 MAC 绑定，不参与 secret 选择——secret 由调用方给定）。
+    pub fn seal_read_serial(
+        bucket: [u8; 32],
+        secret: &[u8; 32],
+        serial: u32,
+        cursor: u64,
+        nonce: [u8; 16],
+    ) -> Self {
+        let mut r = Self {
+            bucket,
+            serial,
+            nonce,
+            cursor,
+            mac: [0u8; 32],
+        };
+        r.mac = r.compute_mac(secret);
+        r
+    }
+
+    /// 规范化读取签名串：域分隔 + 绑定 bucket、serial、nonce、cursor。
+    /// 读取无时间戳字段（无时间窗），防重放由 nonce 台账承担；
+    /// cursor 进 MAC = 中继/旁观者改游标（提权多读）必然失配。
+    fn mac_input(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(64);
+        v.extend_from_slice(b"dc-bucket-read-v1\n");
+        v.extend_from_slice(&self.bucket);
+        v.extend_from_slice(&self.serial.to_be_bytes());
+        v.extend_from_slice(&self.nonce);
+        v.extend_from_slice(&self.cursor.to_be_bytes());
+        v
+    }
+
+    fn compute_mac(&self, secret: &[u8; 32]) -> [u8; 32] {
+        *blake3::Hasher::new_keyed(secret)
+            .update(&self.mac_input())
+            .finalize()
+            .as_bytes()
+    }
+
+    /// 桶主侧验证：读取 MAC（常量时间比较）+ 游标非负。
+    /// **不受 ±5min 时间窗限制**——now_ms 仅为与写路径统一的入口形状；
+    /// 重放防护在调用方的 NonceCache（maildrop::MailboxManager::read_bucket）。
+    pub fn verify_read(&self, secret: &[u8; 32], now_ms: u64) -> Result<()> {
+        let _ = now_ms; // 读取无时间窗：显式忽略，防未来误加窗口判定
+        // 游标非负：u64 结构性保证；越界游标由 storage 分页语义自然返回空
+        let expected = self.compute_mac(secret);
+        let diff = self
+            .mac
+            .iter()
+            .zip(expected.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+        if diff != 0 {
+            return Err(CoreError::Crypto("mailbox read mac mismatch".into()));
+        }
+        Ok(())
+    }
+}
+
 /// 重放防线从「nonce FIFO」改为「msg_id 过期台账」。
 /// FIFO 驱逐是可攻击的——窗内合法流量会把旧 nonce 挤出，嗅探重放即复活。
 /// 新语义：
@@ -335,5 +419,51 @@ mod tests {
         bad.envelope.body.push(1);
         bad.nonce = [9; 16];
         assert!(verify_inbound(&bad, &secret, &mut nonces, 1000).is_err());
+    }
+
+    // ══════════ 读桶（MailboxRead，SP-1.6） ══════════
+
+    #[test]
+    fn read_seal_verify_roundtrip_no_time_window() {
+        let bucket = generate_bucket_address().unwrap();
+        let secret = derive_mailbox_secret(b"hs", &bucket, 1);
+        let r = MailboxRead::seal_read(bucket, &secret, 0, [7; 16]);
+        // 任意时刻可验：读取不受 ±5min 窗限制（只有写入有窗）
+        r.verify_read(&secret, 0).unwrap();
+        r.verify_read(&secret, u64::MAX / 2).unwrap();
+        // serial 进 MAC：同输入不同版本的 MAC 必然不同
+        let r2 = MailboxRead::seal_read_serial(bucket, &secret, 2, 0, [7; 16]);
+        assert_ne!(r.mac, r2.mac, "serial 必须绑定进读取 MAC");
+        r2.verify_read(&secret, 1000).unwrap();
+    }
+
+    #[test]
+    fn read_mac_tamper_or_wrong_key_rejected() {
+        let bucket = generate_bucket_address().unwrap();
+        let secret = derive_mailbox_secret(b"hs", &bucket, 1);
+        // 篡改 MAC 本体
+        let mut r = MailboxRead::seal_read(bucket, &secret, 2, [7; 16]);
+        r.mac[0] ^= 1;
+        assert!(r.verify_read(&secret, 0).is_err());
+        // 篡改游标（提权多读）
+        let mut r = MailboxRead::seal_read(bucket, &secret, 2, [7; 16]);
+        r.cursor = 99;
+        assert!(r.verify_read(&secret, 0).is_err());
+        // 篡改桶地址（跨桶重放读取授权）
+        let mut r = MailboxRead::seal_read(bucket, &secret, 2, [7; 16]);
+        r.bucket = [1; 32];
+        assert!(r.verify_read(&secret, 0).is_err());
+        // 篡改 serial（重放到别的版本）
+        let mut r = MailboxRead::seal_read(bucket, &secret, 2, [7; 16]);
+        r.serial = 3;
+        assert!(r.verify_read(&secret, 0).is_err());
+        // 篡改 nonce（绕台账去重）
+        let mut r = MailboxRead::seal_read(bucket, &secret, 2, [7; 16]);
+        r.nonce = [8; 16];
+        assert!(r.verify_read(&secret, 0).is_err());
+        // 未授权 secret（跨桶/跨版本钥匙）
+        let r = MailboxRead::seal_read(bucket, &secret, 2, [7; 16]);
+        let other = derive_mailbox_secret(b"other", &bucket, 1);
+        assert!(r.verify_read(&other, 0).is_err());
     }
 }

@@ -79,7 +79,11 @@
    「按 Serial 取证书」同款）；7 天过渡窗内旧钥仍可拨（对端未切换的兼容期）
    【已实现】`current()`/`accepts()` + `state()`/`restore()`（恢复逐条验签）持久化接口
 3. 分发：公告经联系人信箱推送并由其节点代缓存；彻底失联 → 重新介绍信
-   【未实现——推送/代缓存路径未接】
+   【推送路径已实现】`nodekey::AnnouncementDispatcher`（rotate 产 serial+1 签名公告）
+   + `maildrop::seal_announcement_write`/`distribute_announcement`（公告 CBOR 作
+   SessionMgmt 信封 body 经联系人信箱桶推送，不加密、中继只验信箱 MAC）
+   + FFI `AnnouncementDispatcherHandle`（new/rotate/current_key/distribute）；
+   【未实现】节点代缓存（联系人代转发/离线缓存公告）与彻底失联的重新介绍信
 4. 危险操作约束：手动轮换 = 生物识别 + 冷却期（双因子兜底，见 SP-4）【未实现】
 5. UI 约束（模式借自「新设备登录提醒」，通用先例：SSH known-hosts 变更警告）：
    联系人节点密钥轮换生效时在会话内提示，并提供「重新核对安全码」入口【未实现】
