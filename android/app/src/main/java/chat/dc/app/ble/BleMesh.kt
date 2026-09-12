@@ -178,6 +178,10 @@ object BleMesh {
     private var advJob: Job? = null
     private var scanJob: Job? = null
     @Volatile private var advCallback: AdvertisingSetCallback? = null
+    // legacy 回退路径的回调：与扩展广播的 advCallback 分开持有——两条 API 的
+    // 回调类型互不通用，对应的 stop API 也不同（stopAdvertising vs stopAdvertisingSet），
+    // 混用既编不过也无法正确停掉在播的 legacy 广播
+    @Volatile private var legacyAdvCallback: android.bluetooth.le.AdvertiseCallback? = null
 
     @SuppressLint("MissingPermission")
     fun init(context: Context) {
@@ -208,6 +212,8 @@ object BleMesh {
         scanJob = null
         advCallback?.let { runCatching { advertiser?.stopAdvertisingSet(it) } }
         advCallback = null
+        legacyAdvCallback?.let { runCatching { advertiser?.stopAdvertising(it) } }
+        legacyAdvCallback = null
         runCatching { server?.stop() }
         server = null
         synchronized(links) { links.values.forEach { runCatching { it.closeLink() } }; links.clear() }
@@ -275,29 +281,60 @@ object BleMesh {
         val adv = advertiser ?: return
         val bloom = runCatching { currentBloom() }.getOrNull() ?: return
         val p = pairingObj?.takeIf { it.asHost && !it.finished && it.link == null }
-        val data = AdvertiseData.Builder()
-            .addServiceUuid(SERVICE_PU)
-            .addServiceData(SERVICE_PU, FriendLink.advertisePayload(bloom))
-            .setIncludeDeviceName(false)
-            .apply { p?.bleId?.let { addServiceUuid(PAIR_UUID); addServiceData(PAIR_UUID, it) } }
-            .build()
-        val params = AdvertisingSetParameters.Builder()
-            .setLegacyMode(false)
-            .setInterval(AdvertisingSetParameters.INTERVAL_LOW)
-            // AdvertisingSetParameters.TX_POWER_LOW = -15 dBm：扫码是约一臂之遥
-            // 的场景，必须保住这个量级。注意别和旧 API 面 AdvertiseSettings
-            // .ADVERTISE_TX_POWER_LOW（=-60）混用——那是 legacy 广播的常量，
-            // 挪到扩展广播上等于把射程压到厘米级，扫码端常驻扫描在正常距离
-            // 根本收不到配对广播，快连永远搭不起来
-            .setTxPowerLevel(AdvertisingSetParameters.TX_POWER_LOW)
-            .build()
+
         advCallback?.let { runCatching { adv.stopAdvertisingSet(it) } }
+        legacyAdvCallback?.let { runCatching { adv.stopAdvertising(it) } }
+        advCallback = null
+        legacyAdvCallback = null
         delay(250) // stop→start 栈内序列化留量
-        val cb = object : AdvertisingSetCallback() {
-            override fun onAdvertisingSetStarted(set: android.bluetooth.le.AdvertisingSet?, txPower: Int, status: Int) = Unit
+
+        // 红队盲审 P0-B 修复：扩展广播不支持的机型回退 legacy API。
+        // adapter 与 refreshRadios() 同源解析（经 BluetoothManager 动态获取）：
+        // 本对象不持有 adapter 句柄，蓝牙开关随时可能变更，不能只抓一次
+        val bt = (appContext?.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+        val useExtended = bt?.isLeExtendedAdvertisingSupported == true
+        if (useExtended) {
+            val data = AdvertiseData.Builder()
+                .addServiceUuid(SERVICE_PU)
+                .addServiceData(SERVICE_PU, FriendLink.advertisePayload(bloom))
+                .setIncludeDeviceName(false)
+                .apply { p?.bleId?.let { addServiceUuid(PAIR_UUID); addServiceData(PAIR_UUID, it) } }
+                .build()
+            val params = AdvertisingSetParameters.Builder()
+                .setLegacyMode(false)
+                .setInterval(AdvertisingSetParameters.INTERVAL_LOW)
+                .setTxPowerLevel(AdvertisingSetParameters.TX_POWER_LOW)
+                .build()
+            val cb = object : AdvertisingSetCallback() {
+                override fun onAdvertisingSetStarted(
+                    set: android.bluetooth.le.AdvertisingSet?, txPower: Int, status: Int,
+                ) {
+                    if (status != AdvertisingSetCallback.ADVERTISE_SUCCESS) {
+                        android.util.Log.w("BleMesh", "ext adv failed status=$status")
+                    }
+                }
+            }
+            advCallback = cb
+            runCatching { adv.startAdvertisingSet(params, data, null, null, null, cb) }
+        } else {
+            // legacy 回退：31B 上限内只放 service UUID + bleId（bloom 省略）
+            val legacyData = AdvertiseData.Builder()
+                .addServiceUuid(SERVICE_PU)
+                .apply { p?.bleId?.let { addServiceUuid(PAIR_UUID); addServiceData(PAIR_UUID, it) } }
+                .setIncludeDeviceName(false)
+                .build()
+            val settings = android.bluetooth.le.AdvertiseSettings.Builder()
+                .setAdvertiseMode(android.bluetooth.le.AdvertiseSettings.ADVERTISE_MODE_LOW_POWER)
+                .setConnectable(true)
+                .build()
+            val cb = object : android.bluetooth.le.AdvertiseCallback() {
+                override fun onStartFailure(errorCode: Int) {
+                    android.util.Log.w("BleMesh", "legacy adv failed errorCode=$errorCode")
+                }
+            }
+            legacyAdvCallback = cb
+            runCatching { adv.startAdvertising(settings, legacyData, cb) }
         }
-        advCallback = cb
-        runCatching { adv.startAdvertisingSet(params, data, null, null, null, cb) }
     }
 
     private fun currentBloom(): ByteArray {
@@ -319,7 +356,12 @@ object BleMesh {
                 }
             }
             val filters = listOf(ScanFilter.Builder().setServiceUuid(SERVICE_PU).build())
-            val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+            // 红队盲审 P0-A 修复：必须 setLegacy(false) 才能收到扩展广播（bloom 129B 超 legacy 31B 上限）。
+            // 不设此标志 = 扫描器永远收不到配对广播 = 加好友 100% 不可用。
+            val settings = ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .setLegacy(false)
+                .build()
             while (true) {
                 refreshRadios()
                 val sc = scanner
@@ -965,7 +1007,11 @@ object BleMesh {
 
     private fun dispatchIncoming(handle: LinkHandle, frame: ByteArray, peerNameHint: String?) {
         val body = frame.copyOfRange(Wire.HEADER_LEN, frame.size)
-        val name = peerNameHint ?: return
+        // 红队盲审 P1-B 修复：握手路径不走 AuthState，peerNameHint 为 null 时
+        // 从 PairingObj 兜底取 peerName（onHostHandshake 已写入）
+        val name = peerNameHint
+            ?: pairingObj?.peerName?.takeIf { it.isNotBlank() }
+            ?: return
         decryptAndStore(name, body)
     }
 

@@ -207,7 +207,10 @@ fun ShowMyCodeScreen(onBack: () -> Unit) {
     // Keystore/native 失败（厂商机型异常、测试环境）不能崩页面：降级为明确错误态
     val session = remember { runCatching { SignalCore.session(context) }.getOrNull() }
     val irohSnap by chat.dc.app.core.IrohNodeManager.state.collectAsState()
-    val myPayload = remember(session, irohSnap.naddr) {
+    // 红队盲审 P0-2 修复：payload 首次生成后冻结——不随 irohSnap.naddr 重生成。
+    // naddr 迟到/变化不影响 QR 载荷（BLE 是传输管道，iroh 地址走加密通道交换）。
+    // 随 naddr 重生成会导致 challenge/bleId 全换 → 已扫旧码的扫码端永久卡死。
+    val myPayload = remember(session) {
         session?.let {
             fun random(n: Int) = ByteArray(n).also(security::nextBytes)
             AddFriendPayload(
@@ -217,7 +220,7 @@ fun ShowMyCodeScreen(onBack: () -> Unit) {
                 bucket = random(32),
                 token = random(48),
                 ble = random(8),
-                naddr = irohSnap.naddr,
+                naddr = "",
             )
         }
     }
@@ -403,9 +406,10 @@ fun ScanToAddScreen(onBack: () -> Unit) {
     var bleInfo by remember { mutableStateOf<BleConnectInfo?>(null) }
     val pairSnap by BleMesh.pairing.collectAsState()
 
-    // 旧版回退路径：对端无蓝牙帧（f=2）时，数据帧集齐 + 3 秒仍可完成（原流程）。
-    // 蓝牙帧在手则快连路径接管，数据帧重组结果不再触发重复建会话。
-    val legacyPayload = collectorState?.takeIf { it.complete && it.ble == null }?.payload
+    // 旧版回退路径：数据帧集齐 + 3 秒仍可完成（无论是否扫到蓝牙帧）。
+    // 红队盲审 P1-A 修复：移除 `ble == null` 门——快连失败时数据帧兜底仍可用，
+    // 不再把扫码端锁死在「正在交换身份」死路径。
+    val legacyPayload = collectorState?.takeIf { it.complete }?.payload
     var peerPayload by remember { mutableStateOf<AddFriendPayload?>(null) }
     LaunchedEffect(legacyPayload) {
         if (peerPayload == null && legacyPayload != null) peerPayload = legacyPayload
@@ -480,8 +484,11 @@ fun ScanToAddScreen(onBack: () -> Unit) {
             style = MaterialTheme.typography.titleSmall,
             modifier = Modifier.padding(bottom = 4.dp),
         )
+        // 红队盲审 P0-1 修复：仅在有明确结果（SAS 或错误）时才用结果卡替换取景器；
+        // 扫描进行中取景器保持可见（相机继续采集 + 帧率不停），状态文字在下方
+        val fastDone = fastSnap?.let { it.sas != null || (it.dialError ?: 0) > 0 } == true
         when {
-            fastSnap != null -> Card(modifier = Modifier.fillMaxWidth().padding(top = 4.dp).testTag("pairing_card")) {
+            fastDone -> Card(modifier = Modifier.fillMaxWidth().padding(top = 4.dp).testTag("pairing_card")) {
                 Column(modifier = Modifier.padding(12.dp)) {
                     when (fastSnap.dialError) {
                         2 -> {
@@ -494,7 +501,7 @@ fun ScanToAddScreen(onBack: () -> Unit) {
                         }
                         1 -> {
                             Text(stringResource(R.string.add_friend_establish_failed), style = MaterialTheme.typography.bodySmall)
-                            // 快连失败就地重试（P3）：清错误态并解除限频，常驻扫描
+                            // 快连失败就地重试：清错误态并解除限频，常驻扫描
                             // 命中对方配对广播即重新回连，不必退出重扫
                             Button(
                                 onClick = { BleMesh.retryQrDial() },
@@ -504,15 +511,6 @@ fun ScanToAddScreen(onBack: () -> Unit) {
                             }
                             return@Card
                         }
-                    }
-                    if (fastSnap.sas == null) {
-                        // 已回连、正在等 3 秒门槛到期后交换完整身份（token 只走密文）
-                        Text(
-                            stringResource(R.string.add_friend_fast_exchanging),
-                            style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier.padding(vertical = 8.dp),
-                        )
-                        return@Card
                     }
                     Text(stringResource(R.string.add_friend_verify), style = MaterialTheme.typography.titleSmall)
                     Text(
