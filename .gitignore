@@ -21,3 +21,6 @@ android/app/src/main/uniffi/
 .kotlin/
 .workbuddy/
 .project-memory/
+
+# cargo-ndk 产物（CI 每次构建重新生成；本地备份产线也会产出）
+android/app/src/main/jniLibs/
