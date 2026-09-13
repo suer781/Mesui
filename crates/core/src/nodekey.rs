@@ -417,6 +417,7 @@ mod tests {
             body: forged.to_cbor().unwrap(),
             sent_at_ms: t0,
             ttl_hops: 6,
+            sig: None,
         };
         let w = crate::mailbox::BucketWrite::seal(env, &secret, 1, t0, [3; 16]);
         w.verify(&secret, t0).unwrap();

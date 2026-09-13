@@ -77,9 +77,16 @@ impl BucketWrite {
     /// 规范化签名串：
     /// 绑定版本、nonce、时间与**信封全部字段**（此前漏绑
     /// group/kind/sent_at_ms/ttl_hops，recipient=None 时整字段不绑定）。
+    ///
+    /// v2（2026-09-13，A0）：信封新增可选 `sig` 字段后，MAC 输入同步
+    /// 绑定该字段——MAC 绑定「信封全部字段」是本模块的既定不变量，
+    /// 若 sig 逃逸在 MAC 之外，信箱路径上可被无痕剥离/替换签名，
+    /// 破坏下游转发层（SP-7/群播）的验签凭据。域串升 v2：新旧版本
+    /// 的 MAC 输入不同，混版本对端会在 MAC 层显式失配（而非静默同域
+    /// 不同义）；在途影响被 ±5min 重放窗自然收敛（窗口外本就拒绝）。
     fn mac_input(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(160 + self.envelope.body.len());
-        v.extend_from_slice(b"dc-bucket-write-v1\n");
+        v.extend_from_slice(b"dc-bucket-write-v2\n");
         v.extend_from_slice(&self.serial.to_be_bytes());
         v.extend_from_slice(&self.nonce);
         v.extend_from_slice(&self.ts_ms.to_be_bytes());
@@ -103,6 +110,15 @@ impl BucketWrite {
         v.push(self.envelope.kind as u8);
         v.extend_from_slice(&self.envelope.sent_at_ms.to_be_bytes());
         v.push(self.envelope.ttl_hops);
+        // A0：sig 同为信封字段，长度前缀绑定（防边界歧义）
+        match &self.envelope.sig {
+            Some(s) => {
+                v.push(1);
+                v.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                v.extend_from_slice(s);
+            }
+            None => v.push(0),
+        }
         v.extend_from_slice(&self.envelope.body);
         v
     }
@@ -330,6 +346,7 @@ mod tests {
             body: vec![7; 64],
             sent_at_ms: 0,
             ttl_hops: 6,
+            sig: None,
         }
     }
 
@@ -423,6 +440,31 @@ mod tests {
         let mut w5 = w.clone();
         w5.envelope.group = None;
         assert!(w5.verify(&secret, 1000).is_err());
+    }
+
+    /// A0：sig 是信封字段，必须进 MAC（v2）——否则信箱路径上可无痕
+    /// 剥离/替换签名，破坏下游转发层的验签凭据。带签名写入正常验收；
+    /// 剥签名、换签名（等长翻转）必碎 MAC。
+    #[test]
+    fn mac_binds_sig_field() {
+        let sender = Identity::generate().unwrap();
+        let bucket = generate_bucket_address().unwrap();
+        let secret = derive_mailbox_secret(b"hs", &bucket, 1);
+        let mut e = sample_envelope(&sender);
+        e.sign(&sender).unwrap();
+        let w = BucketWrite::seal(e, &secret, 1, 1000, [1; 16]);
+        w.verify(&secret, 1000).unwrap();
+
+        // 剥签名（Some → None）
+        let mut stripped = w.clone();
+        stripped.envelope.sig = None;
+        assert!(stripped.verify(&secret, 1000).is_err(), "剥签名必须碎 MAC");
+        // 换签名（等长字节翻转）
+        let mut swapped = w.clone();
+        if let Some(s) = &mut swapped.envelope.sig {
+            s[0] ^= 1;
+        }
+        assert!(swapped.verify(&secret, 1000).is_err(), "换签名必须碎 MAC");
     }
 
     #[test]

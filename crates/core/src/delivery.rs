@@ -207,6 +207,7 @@ mod tests {
             body: vec![1, 2, 3],
             sent_at_ms: sent_at,
             ttl_hops: 6,
+            sig: None,
         }
     }
 

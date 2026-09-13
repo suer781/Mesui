@@ -61,7 +61,10 @@
    【已实现】`verify_inbound()` 在代码里强制该顺序
 4. 写桶 = `BucketWrite { envelope, serial, nonce, ts_ms, mac }`；MAC 为 keyed-BLAKE3
    规范化串（绑定 serial/nonce/时间/msg_id/发送方/收件方/正文）
-   【已实现】`mac_input()` 绑定信封全部字段（含 Option 存在标志），常量时间比较
+   【已实现】`mac_input()` 绑定信封全部字段（含 Option 存在标志），常量时间比较；
+   v2（2026-09-13，A0）：信封新增可选 `sig` 字段后 MAC 输入同步绑定该字段
+   （域串 `dc-bucket-write-v2`）——sig 若逃逸在 MAC 外，信箱路径上可被无痕剥离/
+   替换签名，破坏下游转发层验签凭据
 5. 中继侧：验 MAC（不过=门口拒绝）→ 验时间窗（±5min，B5：时间戳不作其他安全事实）
    → nonce 去重缓存 → **按写入方限速**（默认 ≤30 封/分钟/对，风控模式移植）→ 入桶
    【MAC/时间窗/nonce 台账已实现】（NonceCache 键=msg_id、逐过期条、满 fail-closed）；
@@ -177,6 +180,9 @@
 - ✅ SP-7 原语：`relay.rs`（转发票 + RelayGuard，8 测试）+ `governor.rs`（资源治理，
   9 测试）+ `settings.rs` scope 第三档；**转发传输路径未接**（mesh 多跳未实现）
 - ✅ SP-8：`clock.rs` 全部护栏已实现（12 测试），见该节状态标注
+- ✅ A0 信封签名（2026-09-13）：`envelope.rs` sig 字段 + sign/verify 原语（5 测试）
+  + `relay.rs` 转发准入闸门（2 测试）+ `mailbox.rs` MAC v2 绑定 sig（1 测试）；
+  按 SP-7 第 6 条的路径分流语义消费
 - 📋 SP-1 限速与读桶、SP-2 分发/双因子、SP-4 全部、SP-5 服务端伪装站、SP-9 整体未实现
 
 
@@ -204,6 +210,29 @@
 5. 设置档位接入：`NodeServiceCfg.scope` 扩展第 3 档 = 任何人（限额人群转发）
    【已实现】settings.rs scope 字段（0=关/1=联系人/2=联系人+二度/3=任何人）；
    传输层尚未按 scope 分流
+6. **信封签名（A0，2026-09-13 已补，代码原语：`envelope.rs` + `relay.rs`）**：
+   `Envelope.sig` = 可选 Ed25519 签名，覆盖除 sig 外全部信封字段（域分隔规范化串
+   `dc-envelope-sig-v1`），验证公钥 = `sender` 字段本身——陌生人路径填轮换节点钥
+   （化名不破，第 8 条/C4 语义不变），联系人路径填长期身份钥。**按路径消费的评估
+   结论**（逐路径论证见 BLE-RELAY-DESIGN 5.2 与 envelope.rs 模块注释）：
+   - **陌生人中继/群播多跳：转发准入凭据**——中继解不了内层 Signal 密文（无会话）、
+     验不了信箱 MAC（无私有密钥），而转发票只签票据字段不绑定信封本体（relay.rs
+     `signing_payload`），信封签名是转发层唯一可验凭据。`relay::verify_forward_credential`
+     = 「验签过=可转发，验签不过=丢弃」，**无签名=明确拒绝**（降级行为，不静默放行）
+     【已实现（原语+测试），转发传输路径接线待 A2 增补】
+   - **联系人直连：不消费**——内层 Double Ratchet AEAD 已认证内容（伪造 sender
+     的信封在棘轮解密层必败），外层元数据篡改至多有界 DoS（主动攻击者本可丢帧），
+     签名是冗余防线
+   - **信箱代存：不消费**——keyed-BLAKE3 MAC 已绑定信封全部字段（SP-1.4 v2），
+     且限速/台账键绑定桶对密钥而非可伪造的 sender（红队 A5 决议），签名冗余；
+     MAC v2 已把 sig 纳入绑定（防信箱路径上无痕剥离签名）
+   - **BLE 近场：不消费**——链路层 AUTH 挑战 + 内层 AEAD 已双重认证，信封层
+     重复认证无增益
+   向后兼容：无签名信封的线上字节（CBOR 与 FFI JSON）与 A0 之前完全同构
+   （`skip_serializing_if`）；带签名信封的 sig 字段被旧端 serde 默认忽略；
+   旧格式经 `#[serde(default)]` 解析为无签名。回归测试钉死双向兼容
+   （envelope.rs `pre_a0_cbor_without_sig_field_still_parses` /
+   `wire_compat_both_directions` / `json_roundtrip_preserves_sig_and_old_json_parses`）。
 
 
 ## SP-8 软件内部独立时钟（clock.rs 已实现；用户设计，2026-09-04 定稿）

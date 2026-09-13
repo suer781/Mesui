@@ -192,6 +192,9 @@ pub fn seal_announcement_write(
         body,
         sent_at_ms: now_ms,
         ttl_hops: ANNOUNCEMENT_TTL_HOPS,
+        // 联系人信箱路径不消费信封签名（A0 评估结论）：公告自带长期身份
+        // 签名（ann.verify 已强制），信封层再签是冗余
+        sig: None,
     };
     Ok(BucketWrite::seal(
         env,
@@ -464,6 +467,7 @@ mod tests {
             body: vec![7; 64],
             sent_at_ms: ts_ms,
             ttl_hops: 6,
+            sig: None,
         };
         BucketWrite::seal(env, secret, 1, ts_ms, [byte; 16])
     }

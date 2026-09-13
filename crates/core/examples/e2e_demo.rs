@@ -79,6 +79,7 @@ fn main() {
             body: format!("hello-{i}").into_bytes(),
             sent_at_ms: t,
             ttl_hops: 6,
+            sig: None,
         };
         envs.push(e);
     }

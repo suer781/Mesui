@@ -18,7 +18,7 @@
 |---|---|---|
 | identity.rs | Ed25519 长期身份 + 1024 位指纹 | 身份公钥**序列化后 33 字节**（1 字节类型前缀+32），全仓契约 = 33 |
 | entropy.rs | BLAKE3 熵池 + OS CSPRNG | OS 为主源，传感器为增强 |
-| envelope.rs | CBOR 信封 | msg_id 去重 + ttl_hops（为中转预留）；sender 按路径分流（联系人=长期钥/陌生人=化名节点钥）；单播/群播互斥校验；**无签名字段 = 已知缺口 A0** |
+| envelope.rs | CBOR 信封 | msg_id 去重 + ttl_hops（为中转预留）；sender 按路径分流（联系人=长期钥/陌生人=化名节点钥）；单播/群播互斥校验；可选 `sig` 字段（**A0 已补 2026-09-13**）：发送方 Ed25519 签名覆盖除 sig 外全字段（验证公钥=sender），**仅转发层消费**（SP-7 人群转发/群播多跳，`relay::verify_forward_credential`，无签名=拒转）；联系人直连/信箱路径不消费（内层 Signal AEAD/信箱 MAC 已认证，签名冗余）；旧信封双向兼容（无签名线上字节与旧格式同构） |
 | nodekey.rs | 节点密钥轮换公告 SP-2 | 长期钥签名 + 单调 serial + 7 天过渡窗 + 30 天有效期上限 + 密钥环持久化接口；**未接入传输** |
 | mailbox.rs | 信箱桶门禁 SP-1 | 256 位随机桶地址；写桶须 keyed-BLAKE3 MAC（绑定信封全部字段）；±5min 重放窗 + msg_id 过期台账（满 fail-closed） |
 | relay.rs | 陌生人中继票 SP-7 | 挑战哈希+nonce 缓存（逐过期/旧挑战逐出、活条目永不驱逐）+TTL≤2h；默认关闭 |

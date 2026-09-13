@@ -26,6 +26,19 @@ pub enum PayloadKind {
 /// - 联系人信箱路径：填长期身份公钥（收件方可验）
 /// - 人群转发/陌生人路径：**必须填来源轮换节点密钥**（化名），长期身份
 ///   永不出现在外层——绑定关系只存在于内层密文（Signal 会话）
+///
+/// `sig` 字段（A0，2026-09-13 补齐）：可选的发送方 Ed25519 签名，覆盖除
+/// `sig` 外的全部字段（见 [`Envelope::signing_payload`]），验证密钥 =
+/// `sender` 字段本身。**按路径消费**——
+/// - 陌生人中继/群播多跳（SP-7/SP-9）：转发准入凭据，无签名 = 拒转
+///   （`crate::relay::verify_forward_credential`；中继解不了内层、也无
+///   信箱 MAC 密钥，签名是转发层唯一可验凭据）
+/// - 联系人直连/信箱代存：**不消费**该字段——内层 Signal AEAD 与
+///   信箱 MAC 已完成认证，签名是冗余防线（历史讨论见 BLE-RELAY-DESIGN 5.2）
+///
+/// 向后兼容：`skip_serializing_if` 让无签名信封的线上字节与 A0 之前
+/// 完全一致（旧端无损解析）；带签名信封多出的字段被旧端 serde 默认
+/// 忽略。旧信封（无该字段）经 `#[serde(default)]` 解析为 `None`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     pub msg_id: MsgId,
@@ -39,6 +52,9 @@ pub struct Envelope {
     pub sent_at_ms: u64,
     /// 中继跳数预算：蓝牙互助/节点中继每跳 -1，0 则不再转发。
     pub ttl_hops: u8,
+    /// 发送方 Ed25519 签名（64 字节，A0）；无签名 = None（旧格式）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig: Option<Vec<u8>>,
 }
 
 impl Envelope {
@@ -59,6 +75,73 @@ impl Envelope {
             return Err(CoreError::Cbor("group envelope with zero ttl".into()));
         }
         Ok(e)
+    }
+
+    /// A0 签名负载：除 `sig` 外全部字段的域分隔规范化串。
+    /// 字段绑定方式与 `mailbox::BucketWrite::mac_input` 的信封段一致
+    /// （Option 带存在标志，None 与「缺字段」可区分）——签名无法覆盖自身，
+    /// 故 `sig` 是唯一不入负载的字段；伪造者改任何其余字段必碎签。
+    fn signing_payload(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(96 + self.body.len());
+        v.extend_from_slice(b"dc-envelope-sig-v1\n");
+        v.extend_from_slice(self.msg_id.as_slice());
+        v.extend_from_slice(&self.sender);
+        match &self.recipient {
+            Some(r) => {
+                v.push(1);
+                v.extend_from_slice(r);
+            }
+            None => v.push(0),
+        }
+        match &self.group {
+            Some(g) => {
+                v.push(1);
+                v.extend_from_slice(g);
+            }
+            None => v.push(0),
+        }
+        v.push(self.kind as u8);
+        v.extend_from_slice(&self.sent_at_ms.to_be_bytes());
+        v.push(self.ttl_hops);
+        v.extend_from_slice(&self.body);
+        v
+    }
+
+    /// 发送方签名（A0）：用 `identity` 签署除 `sig` 外的全部字段。
+    /// 契约：`identity.node_id()` 必须等于 `sender` 字段——联系人路径传
+    /// 长期身份，陌生人路径传轮换节点钥身份（`sender` 即验证公钥）。
+    /// 签名者与 sender 不符 = 拒签（冒名在源头 fail-closed）。
+    pub fn sign(&mut self, identity: &crate::identity::Identity) -> Result<()> {
+        if identity.node_id() != self.sender {
+            return Err(CoreError::Crypto("envelope signed by wrong sender key".into()));
+        }
+        self.sig = Some(identity.sign(&self.signing_payload()).to_bytes().to_vec());
+        Ok(())
+    }
+
+    /// 信封是否携带发送方签名（降级判定入口）。
+    /// 降级行为（A0 评估结论，代码即策略）：
+    /// - 陌生人中继/群播多跳：无签名 = 转发层拒绝（见
+    ///   `crate::relay::verify_forward_credential`），不静默放行；
+    /// - 联系人直连/信箱代存：从不检查本字段，`false` 无任何语义影响。
+    pub fn is_sender_signed(&self) -> bool {
+        self.sig.is_some()
+    }
+
+    /// 验证发送方签名：验证公钥 = `sender` 字段，负载 = 除 `sig` 外全字段。
+    /// 错误分类：无签名（"signature missing"）/ 长度非法 / 验签不过——
+    /// 调用方按路径处置，转发层三者一律拒绝。
+    pub fn verify_sender_sig(&self) -> Result<()> {
+        let Some(sig) = &self.sig else {
+            return Err(CoreError::Crypto("envelope sender signature missing".into()));
+        };
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&self.sender).map_err(CoreError::from)?;
+        let sig = ed25519_dalek::Signature::from_bytes(
+            sig.as_slice()
+                .try_into()
+                .map_err(|_| CoreError::Crypto("signature length must be 64".into()))?,
+        );
+        crate::identity::verify(&vk, &self.signing_payload(), &sig)
     }
 }
 
@@ -157,6 +240,7 @@ mod tests {
             body: vec![1, 2, 3, 4, 5],
             sent_at_ms: 1_724_000_000_000,
             ttl_hops: 6,
+            sig: None,
         }
     }
 
@@ -166,6 +250,168 @@ mod tests {
         let bytes = e.to_cbor().unwrap();
         let back = Envelope::from_cbor(&bytes).unwrap();
         assert_eq!(e, back);
+    }
+
+    // ══════════ A0：发送方签名（陌生人中继/群播多跳的转发凭据） ══════════
+
+    /// A0 之前的 9 字段线上格式必须永远可解析（向后兼容）：
+    /// 无 sig 字段的旧 CBOR → sig = None。
+    #[test]
+    fn pre_a0_cbor_without_sig_field_still_parses() {
+        #[derive(Serialize, Deserialize)]
+        struct LegacyEnvelope {
+            msg_id: MsgId,
+            sender: crate::identity::NodeId,
+            recipient: Option<crate::identity::NodeId>,
+            group: Option<crate::identity::NodeId>,
+            kind: PayloadKind,
+            body: Vec<u8>,
+            sent_at_ms: u64,
+            ttl_hops: u8,
+        }
+        let e = sample();
+        let legacy = LegacyEnvelope {
+            msg_id: e.msg_id,
+            sender: e.sender,
+            recipient: e.recipient,
+            group: e.group,
+            kind: e.kind,
+            body: e.body.clone(),
+            sent_at_ms: e.sent_at_ms,
+            ttl_hops: e.ttl_hops,
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&legacy, &mut bytes).unwrap();
+        let parsed = Envelope::from_cbor(&bytes).unwrap();
+        assert!(parsed.sig.is_none(), "旧格式必须解析为无签名");
+        assert_eq!(parsed.msg_id, e.msg_id);
+        assert_eq!(parsed.sender, e.sender);
+        assert_eq!(parsed.body, e.body);
+        assert!(!parsed.is_sender_signed());
+        assert!(parsed.verify_sender_sig().is_err());
+    }
+
+    /// 无签名信封的线上字节与 A0 之前完全一致（skip_serializing_if）；
+    /// 带签名信封被「A0 之前结构的解析」正常读取（serde 默认忽略未知字段）
+    /// ——旧端升级窗口期双向兼容。
+    #[test]
+    fn wire_compat_both_directions() {
+        #[derive(Serialize, Deserialize)]
+        struct LegacyShape {
+            msg_id: MsgId,
+            sender: crate::identity::NodeId,
+            recipient: Option<crate::identity::NodeId>,
+            group: Option<crate::identity::NodeId>,
+            kind: PayloadKind,
+            body: Vec<u8>,
+            sent_at_ms: u64,
+            ttl_hops: u8,
+        }
+        // 新端无签名 → 旧端解析：无 sig 字段（字节与旧格式同构）
+        let unsigned = sample();
+        let bytes = unsigned.to_cbor().unwrap();
+        let legacy: LegacyShape = ciborium::de::from_reader(&bytes[..]).unwrap();
+        assert_eq!(legacy.msg_id, unsigned.msg_id);
+
+        // 新端带签名 → 旧端解析：多余字段被忽略，9 字段无损
+        let mut signed = sample();
+        let signer = Identity::from_seed([3u8; 32]);
+        signed.sender = signer.node_id();
+        signed.sign(&signer).unwrap();
+        let bytes = signed.to_cbor().unwrap();
+        let legacy: LegacyShape = ciborium::de::from_reader(&bytes[..]).unwrap();
+        assert_eq!(legacy.msg_id, signed.msg_id);
+        assert_eq!(legacy.body, signed.body);
+        // 新端自己往返：签名无损、仍可验
+        let back = Envelope::from_cbor(&bytes).unwrap();
+        assert_eq!(back, signed);
+        assert!(back.is_sender_signed());
+        back.verify_sender_sig().unwrap();
+    }
+
+    /// 签名全字段绑定：改任一入签字段（body/msg_id/ttl/kind/recipient/
+    /// sent_at_ms）必碎签；签名者与 sender 不符在 sign 时即拒。
+    #[test]
+    fn sig_binds_every_field_and_wrong_signer_rejected() {
+        let alice = Identity::from_seed([1u8; 32]);
+        let mut e = sample();
+        e.sender = alice.node_id();
+        e.sign(&alice).unwrap();
+        e.verify_sender_sig().unwrap();
+
+        let expect_reject = |e: &Envelope| {
+            assert!(e.verify_sender_sig().is_err(), "篡改后必须验签失败");
+        };
+        let mut e1 = e.clone();
+        e1.body[0] ^= 1;
+        expect_reject(&e1);
+        let mut e2 = e.clone();
+        e2.msg_id = [8; 16];
+        expect_reject(&e2);
+        let mut e3 = e.clone();
+        e3.ttl_hops -= 1;
+        expect_reject(&e3);
+        let mut e4 = e.clone();
+        e4.kind = PayloadKind::SessionMgmt;
+        expect_reject(&e4);
+        let mut e5 = e.clone();
+        e5.recipient = None;
+        expect_reject(&e5);
+        let mut e6 = e.clone();
+        e6.sent_at_ms += 1;
+        expect_reject(&e6);
+        let mut e7 = e.clone();
+        e7.group = Some([4; 32]);
+        expect_reject(&e7);
+
+        // 冒名：Mallory 钥匙 + sender=alice → sign() 拒签（源头 fail-closed）
+        let mallory = Identity::from_seed([2u8; 32]);
+        let mut forged = sample();
+        forged.sender = alice.node_id();
+        assert!(forged.sign(&mallory).is_err(), "签名者 ≠ sender 必须拒签");
+        assert!(forged.sig.is_none());
+        // 即便绕过 sign 直接塞 Mallory 对同负载的签名：验证公钥 = sender，必不过
+        forged.sig = Some(mallory.sign(&forged.signing_payload()).to_bytes().to_vec());
+        expect_reject(&forged);
+    }
+
+    /// 缺失签名的降级行为：错误分类明确（missing ≠ 长度非法 ≠ 验签不过），
+    /// 长度非法的 sig 也必须被拒（不得当作无签名放行）。
+    #[test]
+    fn missing_or_malformed_sig_degradation_is_explicit() {
+        let mut e = sample();
+        let sender = Identity::from_seed([5u8; 32]);
+        e.sender = sender.node_id();
+        // 无签名：is_sender_signed=false + 专属错误文案（转发层据此拒转）
+        assert!(!e.is_sender_signed());
+        let err = e.verify_sender_sig().unwrap_err().to_string();
+        assert!(err.contains("missing"), "实际: {err}");
+        // 畸形长度：不能被当成「无签名」放过
+        e.sig = Some(vec![0u8; 63]);
+        assert!(e.verify_sender_sig().is_err());
+        e.sig = Some(Vec::new());
+        assert!(e.verify_sender_sig().is_err());
+        // 正常签名修复一切
+        e.sign(&sender).unwrap();
+        e.verify_sender_sig().unwrap();
+    }
+
+    /// FFI 队列路径信封走 serde_json：带签名往返无损；旧 JSON（无 sig）
+    /// 解析为 None（serde default）。
+    #[test]
+    fn json_roundtrip_preserves_sig_and_old_json_parses() {
+        let mut e = sample();
+        let signer = Identity::from_seed([9u8; 32]);
+        e.sender = signer.node_id();
+        let old_json = serde_json::to_string(&e).unwrap();
+        assert!(!old_json.contains("sig"), "无签名信封不得出现 sig 字段");
+        e.sign(&signer).unwrap();
+        let json = serde_json::to_string(&e).unwrap();
+        let back: Envelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sig, e.sig);
+        back.verify_sender_sig().unwrap();
+        let old_back: Envelope = serde_json::from_str(&old_json).unwrap();
+        assert!(old_back.sig.is_none(), "旧 JSON 必须解析为无签名");
     }
 
     #[test]

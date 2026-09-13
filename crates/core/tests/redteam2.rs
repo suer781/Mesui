@@ -36,6 +36,7 @@ fn env(msg_id: [u8; 16], sender: [u8; 32], body: Vec<u8>) -> Envelope {
         body,
         sent_at_ms: NOW,
         ttl_hops: 6,
+        sig: None,
     }
 }
 

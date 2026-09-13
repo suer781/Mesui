@@ -267,6 +267,7 @@ impl Db {
                     body,
                     sent_at_ms: created_ms.max(0) as u64,
                     ttl_hops: 6,
+                    sig: None,
                 })
             })
             .map_err(|e| CoreError::Db(e.to_string()))?;
@@ -467,6 +468,7 @@ mod tests {
             body: vec![1, 2, 3],
             sent_at_ms: 1000,
             ttl_hops: 6,
+            sig: None,
         }
     }
 
@@ -592,11 +594,11 @@ mod tests {
         let x = [0x42; 16];
         let first = Envelope {
             msg_id: x, sender: [1; 32], recipient: Some(bob), group: None,
-            kind: PayloadKind::Text, body: vec![1], sent_at_ms: 1000, ttl_hops: 6,
+            kind: PayloadKind::Text, body: vec![1], sent_at_ms: 1000, ttl_hops: 6, sig: None,
         };
         let second = Envelope {
             msg_id: x, sender: [2; 32], recipient: Some(mallory), group: None,
-            kind: PayloadKind::Text, body: vec![2, 2, 2], sent_at_ms: 2000, ttl_hops: 6,
+            kind: PayloadKind::Text, body: vec![2, 2, 2], sent_at_ms: 2000, ttl_hops: 6, sig: None,
         };
         db.enqueue_full(&first).unwrap();
         db.enqueue_full(&second).unwrap();

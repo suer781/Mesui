@@ -1156,6 +1156,7 @@ mod mailbox_ffi_tests {
             body: vec![7; 64],
             sent_at_ms: ts_ms,
             ttl_hops: 6,
+            sig: None,
         };
         BucketWrite::seal(env, secret, 1, ts_ms, [byte; 16])
     }
@@ -1509,6 +1510,7 @@ mod delivery_ffi_tests {
             body: vec![1, 2, 3],
             sent_at_ms: sent_at,
             ttl_hops: 6,
+            sig: None,
         };
         serde_json::to_string(&e).unwrap()
     }

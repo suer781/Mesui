@@ -12,6 +12,7 @@
 //! 另有身份伪装防护：票必须由**来源节点密钥**签署——陌生人可以重放旧票，
 //! 但造不出带新 challenge/nonce 的新票（没有私钥）。
 
+use crate::envelope::Envelope;
 use crate::identity::{verify, Identity, NodeId};
 use crate::{CoreError, Result};
 
@@ -200,6 +201,22 @@ impl RelayGuard {
     }
 }
 
+/// 转发准入闸门（A0，2026-09-13）：人群转发（SP-7）/群播多跳（SP-9）/
+/// 人群扩散层（BLE-RELAY-DESIGN 5.2）的「验签过 = 可转发，验签不过 = 丢弃」。
+///
+/// 为什么转发层需要它：中继/信箱节点既解不了内层 Signal 密文（无会话），
+/// 也验不了信箱 MAC（无私有密钥，`derive_mailbox_secret` 派生自握手秘密），
+/// 而 `RelayTicket` 只签名票据字段、不绑定信封本体——信封签名（来源
+/// 轮换节点钥 = `sender` 字段）是转发层唯一可验证的准入凭据。缺失签名
+/// 的降级行为 = **明确拒绝**（不静默放行），错误分类见
+/// `Envelope::verify_sender_sig`。
+///
+/// **联系人直连与信箱代存路径不得调用本闸门**：内层 Signal AEAD 与
+/// 信箱 MAC 已完成认证，签名是冗余防线（A0 逐路径评估结论）。
+pub fn verify_forward_credential(env: &Envelope) -> Result<()> {
+    env.verify_sender_sig()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +340,66 @@ mod tests {
         );
         t.sig = mallory.sign(&t.signing_payload()).to_bytes().to_vec();
         assert!(t.verify(10_000, [1; 32]).is_err());
+    }
+
+    // ══════════ A0：转发准入闸门（verify_forward_credential） ══════════
+
+    use crate::envelope::PayloadKind;
+
+    fn relay_envelope(origin: &Identity) -> Envelope {
+        Envelope {
+            msg_id: [0xB; 16],
+            // 陌生人路径语义：sender = 来源轮换节点密钥（化名）
+            sender: origin.node_id(),
+            recipient: None,
+            group: None,
+            kind: PayloadKind::Text,
+            body: vec![0xC; 48],
+            sent_at_ms: 1_000,
+            ttl_hops: 6,
+            sig: None,
+        }
+    }
+
+    #[test]
+    fn forward_credential_accepts_signed_rejects_unsigned_and_forged() {
+        let origin = Identity::generate().unwrap();
+        let mut env = relay_envelope(&origin);
+
+        // 无签名：转发层明确拒绝（降级行为，不静默放行）
+        assert!(verify_forward_credential(&env).is_err(), "无签名必须拒转");
+        assert!(!env.is_sender_signed());
+
+        // 来源钥签名：放行
+        env.sign(&origin).unwrap();
+        verify_forward_credential(&env).unwrap();
+
+        // 篡改正文后重放旧签名：碎签拒绝
+        let mut tampered = env.clone();
+        tampered.body[0] ^= 1;
+        assert!(verify_forward_credential(&tampered).is_err());
+
+        // 冒名：Mallory 只能产出自己钥下的签名——把签名嫁接到
+        // sender=origin 的信封上，验证公钥（=sender）不符，必拒
+        let mallory = Identity::generate().unwrap();
+        let mut mallory_env = relay_envelope(&origin);
+        mallory_env.sender = mallory.node_id();
+        mallory_env.sign(&mallory).unwrap();
+        let mut spoofed = relay_envelope(&origin);
+        spoofed.sig = mallory_env.sig;
+        assert!(verify_forward_credential(&spoofed).is_err(), "冒名签名必须拒转");
+    }
+
+    #[test]
+    fn forward_credential_never_blocks_mailbox_path_semantics() {
+        // 联系人信箱路径不消费该字段：无签名信封在信箱 MAC 门禁语义下照常
+        // 验收（MAC 绑定全部字段，签名是冗余防线）——本测试钉住「转发闸门
+        // 不得外溢到信箱/直连路径」的评估结论
+        let sender = Identity::generate().unwrap();
+        let env = relay_envelope(&sender);
+        assert!(verify_forward_credential(&env).is_err(), "前置：无签名在转发层被拒");
+        let secret = crate::mailbox::derive_mailbox_secret(b"a0", &[7; 32], 1);
+        let w = crate::mailbox::BucketWrite::seal(env, &secret, 1, 1000, [1; 16]);
+        w.verify(&secret, 1000).unwrap();
     }
 }

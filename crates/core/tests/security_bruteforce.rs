@@ -44,6 +44,7 @@ fn sample_envelope(sender: &Identity, i: u8) -> Envelope {
         body: vec![b'A' + (i % 20), 1, 2, 3, 4],
         sent_at_ms: 1_000_000,
         ttl_hops: 6,
+        sig: None,
     }
 }
 
@@ -216,6 +217,7 @@ fn adversarial_bruteforce_suite() {
                     body: vec![t, i as u8],
                     sent_at_ms: 1,
                     ttl_hops: 6,
+                    sig: None,
                 };
                 let db = db.lock().unwrap();
                 db.enqueue(&env).unwrap();

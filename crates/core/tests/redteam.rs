@@ -31,6 +31,7 @@ fn env_from(sender: [u8; 32], i: u8) -> Envelope {
         body: vec![b'A' + (i % 20), 1, 2, 3, 4],
         sent_at_ms: NOW,
         ttl_hops: 6,
+        sig: None,
     }
 }
 
@@ -427,6 +428,7 @@ fn green4_envelope_extreme_fields_survive() {
         body: vec![0xAB; 65_536],
         sent_at_ms: u64::MAX,
         ttl_hops: 255,
+        sig: None,
     };
     let cbor = e.to_cbor().unwrap();
     assert_eq!(Envelope::from_cbor(&cbor).unwrap(), e);

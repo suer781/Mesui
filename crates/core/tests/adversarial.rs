@@ -49,6 +49,7 @@ fn mk_env(sender: [u8; 32], msg_id: [u8; 16], body: Vec<u8>, ts: u64) -> Envelop
         body,
         sent_at_ms: ts,
         ttl_hops: 6,
+        sig: None,
     }
 }
 
@@ -205,11 +206,11 @@ fn red_a4_enqueue_full_same_msg_id_swaps_undelivered_content() {
 
     let first = Envelope {
         msg_id: x, sender: [1; 32], recipient: Some(bob), group: None,
-        kind: PayloadKind::Text, body: vec![1], sent_at_ms: 1000, ttl_hops: 6,
+        kind: PayloadKind::Text, body: vec![1], sent_at_ms: 1000, ttl_hops: 6, sig: None,
     };
     let second = Envelope {
         msg_id: x, sender: [2; 32], recipient: Some(mallory), group: None,
-        kind: PayloadKind::Text, body: vec![2, 2, 2], sent_at_ms: 2000, ttl_hops: 6,
+        kind: PayloadKind::Text, body: vec![2, 2, 2], sent_at_ms: 2000, ttl_hops: 6, sig: None,
     };
     db.enqueue_full(&first).unwrap();
     db.enqueue_full(&second).unwrap(); // 同 msg_id、完全不同的内容/收件人
