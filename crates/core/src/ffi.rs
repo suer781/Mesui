@@ -22,6 +22,61 @@ impl CoreInfo {
     }
 }
 
+// ══════════ A0 信封签名 / 验签 / 转发准入的 UniFFI 出口 ══════════
+// 盲审 2 裁决的缺口修复：Kotlin 应用此前无法产出或验证带签名信封——
+// envelope.rs 的 sign/verify_sender_sig/is_sender_signed 与 relay.rs 的
+// verify_forward_credential 只有 Rust 原语，没有 #[uniffi::export]。
+// 以下出口沿用 ffi.rs 既有模式：信封走 serde_json 过桥（字节数组即 JSON
+// 数字数组、kind 为 "Text" 等枚举名，与 enqueue(env_json) 同法），签名者
+// 身份种子经 hex 入参（Kotlin Keystore 解出后传入，与 rotate 同法）。
+
+/// 信封签名：输入无签名信封 JSON + 签名者身份种子（64 个 hex 字符），
+/// 返回带 `sig` 字段的信封 JSON（`sig` = 64 字节 Ed25519 签名，覆盖除
+/// sig 外的全部字段，域分隔 `dc-envelope-sig-v1`）。
+/// 契约同 [`crate::envelope::Envelope::sign`]：`identity.node_id()`
+/// 必须等于信封 `sender` 字段——联系人路径传长期身份，陌生人路径传
+/// 轮换节点钥身份（sender 即验证公钥）；冒名在源头 fail-closed。
+#[uniffi::export]
+pub fn envelope_sign(env_json: String, identity_seed_hex: String) -> Result<String, DcError> {
+    let mut env: crate::envelope::Envelope = serde_json::from_str(&env_json)
+        .map_err(|e| DcError::Core { msg: format!("env_json 解析失败: {e}") })?;
+    let seed = hex_arg_32(&identity_seed_hex, "identity_seed_hex")?;
+    let identity = crate::identity::Identity::from_seed(seed);
+    env.sign(&identity).map_err(map_sig)?;
+    serde_json::to_string(&env)
+        .map_err(|e| DcError::Core { msg: format!("信封序列化失败: {e}") })
+}
+
+/// 信封是否携带发送方签名（A0 降级判定入口）。
+/// 降级行为：陌生人中继/群播多跳无签名 = 拒转（见
+/// [`verify_forward_credential`]）；联系人直连/信箱代存从不消费本字段。
+#[uniffi::export]
+pub fn envelope_is_sender_signed(env_json: String) -> Result<bool, DcError> {
+    let env: crate::envelope::Envelope = serde_json::from_str(&env_json)
+        .map_err(|e| DcError::Core { msg: format!("env_json 解析失败: {e}") })?;
+    Ok(env.is_sender_signed())
+}
+
+/// 信封发送方签名验证：验签通过返回 Ok；否则抛 `DcError`，错误文案
+/// 分类：无签名（"signature missing"）/ 签名长度非法（"signature length"）
+/// / 验签不过（密码学错误）。转发层三者一律拒绝。
+#[uniffi::export]
+pub fn envelope_verify_sender_sig(env_json: String) -> Result<(), DcError> {
+    let env: crate::envelope::Envelope = serde_json::from_str(&env_json)
+        .map_err(|e| DcError::Core { msg: format!("env_json 解析失败: {e}") })?;
+    env.verify_sender_sig().map_err(map_sig)
+}
+
+/// 转发准入闸门（A0）：人群转发/群播多跳的「验签过 = 可转发，不过 =
+/// 丢弃」。无签名/篡改/冒名一律拒绝（不静默放行）。联系人直连与信箱
+/// 代存路径**不得调用**本闸门（内层 Signal AEAD 与信箱 MAC 已认证）。
+#[uniffi::export]
+pub fn verify_forward_credential(env_json: String) -> Result<(), DcError> {
+    let env: crate::envelope::Envelope = serde_json::from_str(&env_json)
+        .map_err(|e| DcError::Core { msg: format!("env_json 解析失败: {e}") })?;
+    crate::relay::verify_forward_credential(&env).map_err(map_sig)
+}
+
 /// 信箱写桶门禁的 UniFFI 出口（SP-1 第 3/5 条）：
 /// Kotlin 侧把线上收到的 BucketWrite 交给核心走完整验收——
 /// MAC → ±5min 时间窗 → msg_id 去重 → 按写入方限速（≤30 封/分/对）——
@@ -1584,5 +1639,149 @@ mod delivery_ffi_tests {
         assert!(h.revive("zz".repeat(16)).is_err());
         assert!(h.revive("ab".repeat(8)).is_err());
         assert!(h.dead_letters(10).unwrap().is_empty());
+    }
+}
+
+/// A0 信封签名 / 验签 / 转发准入的 FFI 往返测试：直接调用 free function
+///（与 Kotlin 经 UniFFI 调用走同一条签名路径——JSON 过桥 + hex 身份种子）。
+#[cfg(all(test, feature = "ffi"))]
+mod envelope_ffi_tests {
+    use super::*;
+    use crate::envelope::{Envelope, PayloadKind};
+    use crate::identity::Identity;
+
+    fn hex32(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// 生成 (种子, 身份) 对——签名入参必须是**种子**而非公钥（node_id），
+    /// 与 AnnouncementDispatcherHandle.rotate 的 identity_seed_hex 同语义。
+    fn seeded_identity() -> ([u8; 32], Identity) {
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).unwrap();
+        (seed, Identity::from_seed(seed))
+    }
+
+    /// 构造 sender = signer.node_id() 的无签名信封 JSON（联系人直连形态）。
+    fn unsigned_env_json(signer: &Identity) -> String {
+        let env = Envelope {
+            msg_id: [0xA0; 16],
+            sender: signer.node_id(),
+            recipient: Some([9; 32]),
+            group: None,
+            kind: PayloadKind::Text,
+            body: vec![1, 2, 3, 4, 5],
+            sent_at_ms: 1_724_000_000_000,
+            ttl_hops: 6,
+            sig: None,
+        };
+        serde_json::to_string(&env).unwrap()
+    }
+
+    /// 构造陌生人中继形态的无签名信封（sender = 来源轮换节点钥）。
+    fn relay_env_json(origin: &Identity) -> String {
+        let env = Envelope {
+            msg_id: [0xB0; 16],
+            sender: origin.node_id(),
+            recipient: None,
+            group: None,
+            kind: PayloadKind::Text,
+            body: vec![0xC; 48],
+            sent_at_ms: 1_000,
+            ttl_hops: 6,
+            sig: None,
+        };
+        serde_json::to_string(&env).unwrap()
+    }
+
+    #[test]
+    fn ffi_sign_then_verify_ok() {
+        let (seed, alice) = seeded_identity();
+        let json = unsigned_env_json(&alice);
+        // 前置：无签名
+        assert!(!envelope_is_sender_signed(json.clone()).unwrap());
+        assert!(envelope_verify_sender_sig(json.clone()).is_err());
+
+        // 签名 → 输出带 sig 的信封 JSON，验签通过
+        let signed = envelope_sign(json, hex32(&seed)).unwrap();
+        let parsed: Envelope = serde_json::from_str(&signed).unwrap();
+        assert!(parsed.is_sender_signed());
+        assert!(parsed.sig.is_some());
+        assert_eq!(parsed.sig.as_ref().unwrap().len(), 64, "Ed25519 签名 = 64 字节");
+        assert!(envelope_is_sender_signed(signed.clone()).unwrap());
+        envelope_verify_sender_sig(signed).unwrap();
+    }
+
+    #[test]
+    fn ffi_tampered_envelope_rejected() {
+        let (seed, alice) = seeded_identity();
+        let signed = envelope_sign(unsigned_env_json(&alice), hex32(&seed)).unwrap();
+        let mut parsed: Envelope = serde_json::from_str(&signed).unwrap();
+        // 篡改入签字段（body）后重放旧签名 → 验签必须拒绝
+        parsed.body[0] ^= 1;
+        let tampered = serde_json::to_string(&parsed).unwrap();
+        let err = envelope_verify_sender_sig(tampered.clone()).unwrap_err();
+        assert!(
+            !err.to_string().contains("missing"),
+            "篡改不是缺签名: {err}"
+        );
+        assert!(envelope_verify_sender_sig(tampered).is_err());
+    }
+
+    #[test]
+    fn ffi_unsigned_rejected_with_classification() {
+        let (_, alice) = seeded_identity();
+        let json = unsigned_env_json(&alice);
+        // 无签名：is_sender_signed=false + 专属错误文案（转发层据此拒转）
+        assert!(!envelope_is_sender_signed(json.clone()).unwrap());
+        let err = envelope_verify_sender_sig(json).unwrap_err().to_string();
+        assert!(err.contains("missing"), "无签名必须分类为 missing: {err}");
+    }
+
+    #[test]
+    fn ffi_sign_wrong_sender_fail_closed() {
+        // 签名者身份种子 ≠ sender → sign() 拒签（源头 fail-closed）
+        let (_, alice) = seeded_identity();
+        let (mallory_seed, _mallory) = seeded_identity();
+        let err = envelope_sign(unsigned_env_json(&alice), hex32(&mallory_seed))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("wrong sender"), "实际: {err}");
+        // 坏 hex / 坏 JSON 各自被拒
+        assert!(envelope_sign(unsigned_env_json(&alice), "zz".repeat(32)).is_err());
+        assert!(envelope_sign("not json".into(), hex32(&alice.node_id())).is_err());
+        assert!(envelope_verify_sender_sig("not json".into()).is_err());
+        assert!(envelope_is_sender_signed("{}".into()).is_err());
+    }
+
+    #[test]
+    fn ffi_forward_credential_three_branches() {
+        let (origin_seed, origin) = seeded_identity();
+
+        // 分支 1：无签名 → 拒绝（不静默放行）
+        let unsigned = relay_env_json(&origin);
+        assert!(!envelope_is_sender_signed(unsigned.clone()).unwrap());
+        let err = verify_forward_credential(unsigned.clone()).unwrap_err().to_string();
+        assert!(err.contains("missing"), "无签名必须分类为 missing: {err}");
+
+        // 分支 2：来源钥签名 → 放行
+        let signed = envelope_sign(unsigned, hex32(&origin_seed)).unwrap();
+        verify_forward_credential(signed.clone()).unwrap();
+
+        // 分支 3：篡改正文后重放旧签名 → 拒绝
+        let mut tampered: Envelope = serde_json::from_str(&signed).unwrap();
+        tampered.body[0] ^= 1;
+        assert!(verify_forward_credential(serde_json::to_string(&tampered).unwrap()).is_err());
+
+        // 分支 4（冒名）：Mallory 签名嫁接到 sender=origin 的信封 → 验证公钥
+        // = sender 不符，必拒
+        let (_mallory_seed, mallory) = seeded_identity();
+        let mut mallory_env: Envelope =
+            serde_json::from_str(&relay_env_json(&mallory)).unwrap();
+        mallory_env.sign(&mallory).unwrap();
+        let mut spoofed: Envelope =
+            serde_json::from_str(&relay_env_json(&origin)).unwrap();
+        spoofed.sig = mallory_env.sig;
+        assert!(verify_forward_credential(serde_json::to_string(&spoofed).unwrap()).is_err());
     }
 }
