@@ -20,7 +20,10 @@
 //! - 发送方收到 NAK / 短帧 / 超时一律 Err → 上层（DeliveryManager）走
 //!   fail_and_reschedule 重试，不再出现假「已送达」。
 
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr, endpoint::presets};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr,
+    endpoint::{QuicTransportConfig, VarInt, presets},
+};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::{Arc, Mutex};
@@ -30,6 +33,10 @@ use std::time::Duration;
 pub const ALPN: &[u8] = b"dc-chat/msg/1";
 /// 单条消息上限：聊天文本远小于此；防恶意超长占内存。
 pub const MAX_MSG_LEN: usize = 256 * 1024;
+/// 每对端最多同时存在的活动双向流数（P1-3）：远程对端可开任意多并发流消耗
+/// 资源——在 QUIC 层限制每连接入站双向流上限，并在应用层跨连接累计拦截。
+/// 超出上限的新流被 QUIC 流控阻塞/直接关闭（对端写入失败自行退避）。
+pub const MAX_ACTIVE_STREAMS_PER_PEER: u32 = 16;
 /// 建连兜底超时（send 的 timeout_ms 另行约束读写）。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// ACK 帧判定字节：0x01 = 应用层受理；0x00 = NAK（拒收/超时/解密失败）。
@@ -94,7 +101,14 @@ impl Node {
                     .map_err(|e| crate::CoreError::Config(format!("relay url: {e}")))?;
                 builder.relay_mode(RelayMode::custom([url]))
             };
-            builder.alpns(vec![ALPN.to_vec()])
+            builder = builder.alpns(vec![ALPN.to_vec()]);
+            // P1-3：并发流上限——每连接最多同时 [MAX_ACTIVE_STREAMS_PER_PEER] 条
+            // 入站双向流，超出由 QUIC 流控拒绝（对端 open_bi 阻塞/失败），
+            // 防止恶意对端开任意多并发流耗尽内存与调度资源。
+            let transport = QuicTransportConfig::builder()
+                .max_concurrent_bidi_streams(VarInt::from_u32(MAX_ACTIVE_STREAMS_PER_PEER))
+                .build();
+            builder.transport_config(transport)
         };
         let ep = rt
             .block_on(builder.bind())
@@ -107,10 +121,13 @@ impl Node {
         let ep2 = ep.clone();
         let pending: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
         let pending_task = pending.clone();
+        // P1-3：每对端活动流计数（跨连接累计，应用层硬上限）。
+        let active_streams: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
         let accept_task = rt.spawn(async move {
             while let Some(incoming) = ep2.accept().await {
                 let cb = cb.clone();
                 let pending = pending_task.clone();
+                let active = active_streams.clone();
                 tokio::spawn(async move {
                     let conn = match incoming.accept() {
                         Ok(accepting) => match accepting.await {
@@ -125,39 +142,19 @@ impl Node {
                             Ok(pair) => pair,
                             Err(_) => return, // 对端关流/关连接
                         };
-                        let payload = match recv.read_to_end(MAX_MSG_LEN).await {
-                            Ok(bytes) => bytes,
-                            Err(_) => return,
+                        // P1-3：超出每对端活动流上限的新流直接关闭（对端写入失败
+                        // 自行退避），不进入应用层处理，防止单对端多连接并发流耗尽资源。
+                        let Some(slot) = StreamSlot::acquire(active.clone(), remote.clone()) else {
+                            drop(send);
+                            drop(recv);
+                            continue;
                         };
-                        // 红队 R2-2：本条消息的回执句柄 + 应用层受理判定。
-                        // 无句柄（解析失败/空载荷）直接断流：发送方 ack 超时失败重试。
-                        let mut ack_id = [0u8; ACK_ID_LEN];
-                        if getrandom::fill(&mut ack_id).is_err() {
+                        let outcome =
+                            process_stream(remote.clone(), send, recv, cb.clone(), pending.clone()).await;
+                        drop(slot);
+                        if outcome.is_err() {
                             return;
                         }
-                        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-                        pending.lock().expect("pending acks poisoned").insert(ack_id, tx);
-                        let decision = cb.on_message(remote.clone(), hex(&ack_id), payload);
-                        let verdict = match decision {
-                            Some(ok) => {
-                                pending.lock().expect("pending acks poisoned").remove(&ack_id);
-                                ok
-                            }
-                            // 异步判定：应用层在超时窗内经 Node::ack 回执，过期按 NAK
-                            None => match tokio::time::timeout(APP_ACK_TIMEOUT, rx).await {
-                                Ok(Ok(ok)) => ok,
-                                _ => {
-                                    pending.lock().expect("pending acks poisoned").remove(&ack_id);
-                                    false // 超时/回调丢失 = NAK：宁重投不假送达
-                                }
-                            },
-                        };
-                        // ACK 帧 = 1 字节判定 + 8 字节句柄回显（忽略写失败，连接即将关闭）
-                        let mut reply = [0u8; ACK_FRAME_LEN];
-                        reply[0] = if verdict { ACK_OK } else { ACK_NAK };
-                        reply[1..].copy_from_slice(&ack_id);
-                        let _ = send.write_all(&reply).await;
-                        let _ = send.finish();
                     }
                 });
             }
@@ -254,6 +251,84 @@ impl Node {
 impl Drop for Node {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// 处理一条入站双向流：读载荷 → 应用层判定 → 回 ACK/NAK 帧（红队 R2-2）。
+/// 返回 `Err` 表示连接级错误（对端关流/读失败/回执句柄生成失败），调用方应
+/// 终止连接任务，与旧实现语义一致。
+async fn process_stream(
+    remote: String,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    cb: Arc<dyn NodeSink>,
+    pending: PendingAcks,
+) -> Result<(), ()> {
+    let payload = match recv.read_to_end(MAX_MSG_LEN).await {
+        Ok(bytes) => bytes,
+        Err(_) => return Err(()),
+    };
+    // 红队 R2-2：本条消息的回执句柄 + 应用层受理判定。
+    // 无句柄（解析失败/空载荷）直接断流：发送方 ack 超时失败重试。
+    let mut ack_id = [0u8; ACK_ID_LEN];
+    if getrandom::fill(&mut ack_id).is_err() {
+        return Err(());
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+    pending.lock().expect("pending acks poisoned").insert(ack_id, tx);
+    let decision = cb.on_message(remote.clone(), hex(&ack_id), payload);
+    let verdict = match decision {
+        Some(ok) => {
+            pending.lock().expect("pending acks poisoned").remove(&ack_id);
+            ok
+        }
+        // 异步判定：应用层在超时窗内经 Node::ack 回执，过期按 NAK
+        None => match tokio::time::timeout(APP_ACK_TIMEOUT, rx).await {
+            Ok(Ok(ok)) => ok,
+            _ => {
+                pending.lock().expect("pending acks poisoned").remove(&ack_id);
+                false // 超时/回调丢失 = NAK：宁重投不假送达
+            }
+        },
+    };
+    // ACK 帧 = 1 字节判定 + 8 字节句柄回显（忽略写失败，连接即将关闭）
+    let mut reply = [0u8; ACK_FRAME_LEN];
+    reply[0] = if verdict { ACK_OK } else { ACK_NAK };
+    reply[1..].copy_from_slice(&ack_id);
+    let _ = send.write_all(&reply).await;
+    let _ = send.finish();
+    Ok(())
+}
+
+/// 每对端活动流槽位（P1-3）：占用一个计数，Drop 时释放。
+/// 获取失败 = 该对端活动流已达 [MAX_ACTIVE_STREAMS_PER_PEER] 上限。
+struct StreamSlot {
+    active: Arc<Mutex<HashMap<String, usize>>>,
+    peer: String,
+}
+
+impl StreamSlot {
+    fn acquire(active: Arc<Mutex<HashMap<String, usize>>>, peer: String) -> Option<Self> {
+        let mut guard = active.lock().expect("active streams poisoned");
+        let count = guard.entry(peer.clone()).or_insert(0);
+        if *count >= MAX_ACTIVE_STREAMS_PER_PEER as usize {
+            return None;
+        }
+        *count += 1;
+        drop(guard); // 释放对 active 的借用后再移动所有权（E0505）
+        Some(Self { active, peer })
+    }
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        let mut guard = self.active.lock().expect("active streams poisoned");
+        if let Some(c) = guard.get_mut(&self.peer) {
+            *c -= 1;
+            if *c == 0 {
+                guard.remove(&self.peer);
+            }
+        }
     }
 }
 
@@ -599,6 +674,86 @@ mod tests {
         b.ack("00", true);
         b.ack(&"ab".repeat(8), true);
         a.stop();
+        b.stop();
+    }
+
+    // ══════════ P1-3 回归：并发流上限 ══════════
+
+    /// 接收端 sink 阻塞在 release 通道上：让已打开的流保持活动，
+    /// 验证超出 [MAX_ACTIVE_STREAMS_PER_PEER] 的新流被 QUIC 流控挡住。
+    struct BlockingSink {
+        got: mpsc::Sender<()>,
+        release: Arc<Mutex<mpsc::Receiver<()>>>,
+    }
+
+    impl NodeSink for BlockingSink {
+        fn on_message(&self, _from: String, _ack: String, _payload: Vec<u8>) -> Option<bool> {
+            let _ = self.got.send(());
+            let rx = self.release.lock().unwrap();
+            let _ = rx.recv_timeout(Duration::from_secs(15));
+            Some(true)
+        }
+        fn on_ready(&self, _node_id_hex: String, _naddr: String) {}
+    }
+
+    #[test]
+    fn concurrent_stream_limit_blocks_excess() {
+        let max = MAX_ACTIVE_STREAMS_PER_PEER as usize;
+        let (got_tx, got_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let sink = Arc::new(BlockingSink {
+            got: got_tx,
+            release: Arc::new(Mutex::new(release_rx)),
+        });
+        let b = Node::start("", &seed(20), sink).unwrap();
+        let naddr_b = naddr_string(&b.ep, true);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let sender = Endpoint::builder(presets::Minimal)
+                .relay_mode(RelayMode::Disabled)
+                .alpns(vec![ALPN.to_vec()])
+                .bind()
+                .await
+                .expect("sender bind");
+            let addr = parse_naddr(&naddr_b).expect("naddr");
+            let conn = sender.connect(addr, ALPN).await.expect("connect");
+            // 打开上限条流并写入——接收端 sink 阻塞，流保持打开不关闭。
+            // 关键：不能 drop recv——drop 会向对端发 STOP_SENDING，使对端的
+            // send.finish() 变成 no-op（不发 FIN）、流永远半开，QUIC 流控槽位
+            // 不释放，本测试「释放槽位后新流可打开」将永远无法成立。真实发送方
+            // （Node::send）会读 ACK，因此这里保持 recv 存活模拟真实行为。
+            let mut recvs = Vec::new();
+            for _ in 0..max {
+                let (mut send, recv) = conn.open_bi().await.expect("open stream");
+                send.write_all(b"blocked-payload").await.expect("write");
+                send.finish().expect("finish");
+                recvs.push(recv);
+            }
+            // 等接收端确认已开始处理（sink 阻塞在第一条消息上，流不会关闭）
+            got_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("receiver started processing");
+            // 上限之外的新流应被 QUIC 流控挡住：open_bi 阻塞直到有流关闭
+            let excess = tokio::time::timeout(Duration::from_millis(300), conn.open_bi()).await;
+            assert!(
+                excess.is_err(),
+                "GREEN: 超出并发流上限的新流必须被阻塞/拒绝"
+            );
+            // 释放消息腾出流槽位。noq 的 MAX_STREAMS 帧有批量阈值：只有
+            // max_remote - sent_max_remote > max_concurrent/8 时才通知对端
+            // （16/8 = 2，即至少释放 3 条）。这里一次性释放全部槽位，
+            // 确保阈值必然跨过、MAX_STREAMS 帧被及时冲刷，让对端收到后
+            // 新流可以打开。
+            for _ in 0..max {
+                release_tx.send(()).expect("release slots");
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(30), conn.open_bi())
+                .await
+                .expect("GREEN: 释放槽位后新流可以打开");
+            conn.close(0u32.into(), b"bye");
+            sender.close().await;
+        });
         b.stop();
     }
 }

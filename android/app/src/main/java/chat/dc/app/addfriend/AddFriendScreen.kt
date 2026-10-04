@@ -60,6 +60,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import androidx.compose.runtime.snapshotFlow
 import java.security.SecureRandom
 
@@ -188,6 +189,10 @@ private const val SHOW_PHASE_FALLBACK = 0
  *  须覆盖对端 3 秒防偷拍时长门槛 + BLE 连接/握手耗时，再留余量。 */
 private const val HANDSHAKE_PHASE_MS = 8_000L
 
+/** 出示码前等待 iroh 节点地址就绪的最长时间（P0）：QR 载荷必须携带真实 naddr，
+ *  扫码端落库后跨 WiFi 才能直连。超过仍未就绪进入可重试的降级态，不出示空地址载荷。 */
+private const val IROH_NADDR_WAIT_MS = 8_000L
+
 /**
  * 「别人扫我」：两阶段出示（蓝牙/身份信息防混暴露）——
  *  阶段 1（蓝牙搭线）：只滚蓝牙连接帧（f=2，少量重复），对方读到即经常驻
@@ -218,11 +223,20 @@ fun ShowMyCodeScreen(onBack: () -> Unit) {
     // （厂商机型异常、测试环境）置 identityFailed 降级为明确错误态，不崩页面。
     var myPayload by remember { mutableStateOf<AddFriendPayload?>(null) }
     var identityFailed by remember { mutableStateOf(false) }
-    LaunchedEffect(Unit) {
+    // P0 修复：QR 载荷必须携带真实 iroh 节点地址（扫码端落库后跨 WiFi 可直连）。
+    // 节点冷启动可能滞后于页面进入——等待 naddr 就绪；超时则进入可重试的降级态，
+    // 不再出示 naddr 为空的「残废」载荷。
+    var naddrFailed by remember { mutableStateOf(false) }
+    var retryKey by remember { mutableStateOf(0) }
+    LaunchedEffect(retryKey) {
+        naddrFailed = false
         val loaded = withContext(Dispatchers.IO) {
             runCatching {
                 val session = SignalCore.session(context)
                 fun random(n: Int) = ByteArray(n).also(security::nextBytes)
+                val naddr = withTimeoutOrNull(IROH_NADDR_WAIT_MS) {
+                    chat.dc.app.core.IrohNodeManager.state.first { it.naddr.isNotBlank() }
+                }?.naddr ?: ""
                 AddFriendPayload(
                     name = SignalCore.deviceName(context),
                     identity = session.identityKey(),
@@ -230,14 +244,18 @@ fun ShowMyCodeScreen(onBack: () -> Unit) {
                     bucket = random(32),
                     token = random(48),
                     ble = random(8),
-                    naddr = "",
+                    naddr = naddr,
                     // 红队 R2-7：token 时效界 = 生成时刻 + 10 分钟（覆盖一次出示
                     // 会话；进 token-MAC 输入并受验方过期检查——拍摄物不是永久能力）
                     expiresAtMs = System.currentTimeMillis() + 10 * 60_000L,
                 )
             }.getOrNull()
         }
-        if (loaded == null) identityFailed = true else myPayload = loaded
+        when {
+            loaded == null -> identityFailed = true
+            loaded.naddr.isEmpty() -> naddrFailed = true
+            else -> myPayload = loaded
+        }
     }
     // 蓝牙连接帧的当场挑战：与配对登记共用同一份（回连方须原样回传才获应答），
     // 载荷重生成（节点地址就绪等）时随之重生成
@@ -339,6 +357,22 @@ fun ShowMyCodeScreen(onBack: () -> Unit) {
                 style = MaterialTheme.typography.bodyMedium,
                 modifier = Modifier.padding(vertical = 24.dp).testTag("identity_unavailable"),
             )
+            return@Column
+        }
+        if (naddrFailed) {
+            // P0：iroh 节点地址未就绪——出示空 naddr 载荷会让扫码端联系人
+            // node_naddr 为空、跨 WiFi 不可达。降级为可重试错误态，不出码。
+            Text(
+                stringResource(R.string.add_friend_naddr_unavailable),
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.padding(vertical = 24.dp).testTag("naddr_unavailable"),
+            )
+            Button(
+                onClick = { retryKey++ },
+                modifier = Modifier.fillMaxWidth().testTag("naddr_retry"),
+            ) {
+                Text(stringResource(R.string.add_friend_naddr_retry))
+            }
             return@Column
         }
         if (myPayload == null) {

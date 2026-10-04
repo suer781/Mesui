@@ -84,7 +84,7 @@ inbox_seen 会放松去重窗口，需与 TTL 联动）。
 | A3 n0 中继移除 | ✅ 已落地 | node.rs presets::Minimal（见上） |
 | Release R8 混淆验证 | ✅ CI 已加 | assembleRelease 步骤 + proguard keep `chat.dc.core`（`976e311`/`dbd0dde`） |
 
-仍开放：A4 清理调度接线、P1-3/P1-4/P2-1/P2-2/P2-3 等（台账见
+仍开放：A4 清理调度接线（其余 P1-3/P1-4/P2-1/P2-2/P2-3 已修复，见第十轮与
 docs/APP-OVERVIEW.md 第五节）。
 
 ## 已接受的剩余风险（复审确认，维持原判）
@@ -219,7 +219,7 @@ C1/C3 这两个 P0/P1，盲审一次命中。
 | C4 外层化名 | ✅(规格) | envelope.rs sender 字段语义分流写死；SP-7 第 6 条 |
 | A3 限速接线 | ✅(原语+入口) | verify_inbound() 强制 MAC→窗口→nonce 顺序；prune_seen() 裁剪；governor 已就绪待传输层调用 |
 
-**当前全仓**：70 lib 测试 + iroh 对连 + 暴力验证 = 全绿；clippy 0 警告。
+**当前全仓（2026-09-13 复核）**：默认特性 lib 152 测试（--features ffi 下 165）+ 集成测试 52（adversarial 18 / redteam 20 / redteam2 12 / bruteforce 1 / iroh_pair 1）= 217 全绿；clippy 0 警告。
 剩余未实现项均为「等核心接入」的功能项（Signal 会话、RFCOMM、UniFFI），无安全缺口。
 
 **做得好（子 Agent 确认）**：verify_strict、指纹域分隔、MAX_FRAME_SIZE 先检后缓冲、
@@ -230,7 +230,7 @@ full-jitter 退避、DB 损坏行报错、时钟残余风险的诚实注释。
 # 第九轮：红队二轮（BLE/QR/iroh/投递链，2026-09-13）
 
 > 应用户「后端也要找」要求，红队 Agent 从全新角度攻击传输链与投递链。
-> 产出 crates/core/tests/redteam2.rs（12 测试：7 RED + 5 GREEN）。
+> 产出 crates/core/tests/redteam2.rs（12 个测试，修复后已全部改写为 GREEN 防御回归：green1~green12，无 RED 残留）。
 
 | 编号 | 严重度 | 发现 | 处置 |
 |---|---|---|---|
@@ -243,8 +243,8 @@ full-jitter 退避、DB 损坏行报错、时钟残余风险的诚实注释。
 | R2-7 | P2 | 首条握手 token-MAC 无一次性/无上下文绑定，拍下载荷=永久握手能力 | ✅ 域分隔 v2：长度前缀 name + expiry 大端进 MAC 输入；过期先拒；无 v1 回退门 |
 
 **独立验证官裁决（2026-09-13，新开 Agent、不带修复者结论）**：8/8 修复项真实、完整、
-无绕过、无回归；208 测试通过（lib 156 / redteam2 12 / redteam 20 / adversarial 18 /
-bruteforce 1 / iroh_pair 1）、clippy 0 错误。**通过**。
+无绕过、无回归；204 测试通过（lib 152 / redteam2 12 / redteam 20 / adversarial 18 /
+bruteforce 1 / iroh_pair 1；--features ffi 下 lib 164）、clippy 0 错误。**通过**。
 
 验证官附带 P3 登记（均不重开攻击路径）：
 - P3-1 ~~文档状态未回写~~（本节即回写）
@@ -261,3 +261,37 @@ bruteforce 1 / iroh_pair 1）、clippy 0 错误。**通过**。
 
 最狠两条：K2-1（AUTH_CAND 解析无上界 → 未认证远程崩溃于 GATT binder 线程）、
 K2-2（joiner 配对完成后 MSG 静默丢弃 → 单向聊天失效）。
+
+---
+
+# 第十轮：盲审批次（2026-09-13）
+
+> 用户质疑文档「概念偷换」后，派出第一批 10 个全新会话 Agent 盲审。每个 Agent
+> 只拿到项目路径，不带本文档结论。裁决口径：
+> **成立**=声称与代码事实一致；**偷换**=原语/测试真实但把「原语就绪」表述成「已实现/已接线」（App 零调用）；
+> **不可信**=0 次工具调用的幻觉报告；**部分成立**=结论方向对但表述越界。
+
+| # | 被检声称 | 裁决 | 关键发现 |
+|---|---|---|---|
+| 1 | 身份 1024 位指纹/常量时间/域分隔 + 熵传感器增强 | 身份**成立**（常量时间归属 mailbox/handshake，identity_fingerprint 未接 UI 但文档已披露）；熵=**概念偷换** | 传感器搅拌只有 mix() API+测试，Kotlin 零接线（无 SensorManager/无 FFI 绑定/无权限）＝E1a 未完成但文档标已实现 |
+| 2 | A0 信封签名已补齐 | **概念偷换** | sign/verify/verify_forward_credential 生产零调用；FFI 无导出，Kotlin 产不出带签名信封；原语层实现正确+测试充分 |
+| 3 | SP-1 信箱节点服务已实现 | **概念偷换** | SP-1 原语+FFI 全真实（21+12 测试绿），但 App 零调用；NodeService.kt 自写「信箱/中继为后续阶段」；NodeServiceCfg 纯模型无 UI |
+| 4 | SP-2 公告/SP-7 转发票/governor 治理 | **概念偷换** | 三条全是原语+测试，App 零调用；nodekey 有 FFI 出口但 App 不用；relay/governor 连 FFI 出口都没有；APP-OVERVIEW:25「全部已实现勿报缺失」=偷换点 |
+| 5 | SP-8 独立时钟 | **概念偷换** | 算法原语+16 测试全真实，但网络双源/蓝牙共识/信任名单生产零接线；唯一接线 MailboxManagerHandle.submit（App 不用）；文档自认未内置 NTP 客户端 |
+| 6 | SQLCipher 加密队列+投递已接线 | **概念偷换** | queue/delivery 是孤立原语（12+13 测试绿），App 发送/接收**零调用**：消息失败不落库不重试直接丢；文档自认「未接入 Android 发送路径」（A4 待办） |
+| 7 | PQXDH（X25519+Kyber-1024） | **不可信（幻觉报告，0 次工具调用）** | 五项指控全被源码推翻：handshake 真实用 process_prekey_bundle+kem+KyberPreKeyRecord（PQXDH 真实）；cargo build --features ffi 实测成功；is_trusted_identity 异钥返回 false（signal_store.rs:261-271）；open 支持 PRAGMA key；E0433 不存在。**教训：盲审必须实际跑命令读代码，0 工具调用=不可信** |
+| 8 | iroh 远程 P2P + ACK + 自愈 | **概念偷换（接线缺陷 P0 级）** | 原语+ACK/NAK+NodeService 接线全真实（node.rs 18 单测绿），但**配对只交换单向地址**：断点 A=出示端 QR `naddr=""` 且握手不回传自己地址→扫码端 node_naddr 为空发不起 iroh；断点 B=扫码端 node_id=""→host 来信反查失败被 NAK→**用户实际流程双向投递都不可用**。修复：QR 载荷填真实 naddr + 握手双向交换地址 |
+| 9 | BLE mesh 编排 + SP-9 多跳 | **部分成立** | 直连链路代码完整（布隆广播/AUTH/配对/Signal/落库，60 协议单测绿）但「真机可互通」无实机证据；SP-9 多跳=设计稿未实现，「BLE mesh」措辞概念偷换（真实=1对1 直连+iroh 兜底） |
+| 10 | 文档代码一致性全扫 | **偏差清单** | 见下「盲审10 要点」 |
+
+**修复状态：修复批进行中。** 已落地部分：
+① 文档降级（本批：MEMORY/APP-OVERVIEW/PROJECT-WIKI/ARCHITECTURE-RISKS/README 的「已实现/已接线」改为「原语就绪/未接线」，已修项回写，测试数字更新为实测 152/164+52）；
+② 盲审8 的 P0 接线缺陷（QR naddr 空 + 握手单向地址）已列入修复批；
+③ 传感器搅拌接线（E1a）仍为待办；
+④ A5 剩余 4 项（P1-3/P1-6/P2-5/6/P2-3）仍开放；
+⑤ FFI 补 sign/verify 出口（A2 接线前置）仍为待办。
+
+**盲审10 要点（文档一致性全扫）**：
+- 最严重 3 条偷换：①信箱/公告「已接线」是假接线（Kotlin 零调用，只有 smoke_test 探针）；②**A5 修复批标 ✅ 过头：实际只修 3/7（P1-4/P2-1/P2-2），P1-3 node.rs 并发流上限、P1-6 joiner 收 DCS1 仍自动 verified=true、P2-5/6 配对单槽竞态、P2-3 ANDROID_ID 设备名仍开放**；③传感器熵（同盲审1）。
+- 过时项：README 测试数字（85+22 → 实际 152+52）、APP-OVERVIEW P1-4/P2-1/P2-2 仍列开放（已修）、PROJECT-WIKI AUTH_B 死代码/非常量时间条目过时、ARCHITECTURE-RISKS 第九轮仍写「7 RED+5 GREEN」（现 12 全 GREEN）、「70 lib 测试」过时（现 152/164）。
+- 文档整体诚实度高：队列未接 Android、mesh 未实现、真机未验证均如实披露。

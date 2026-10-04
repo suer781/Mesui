@@ -24,16 +24,16 @@
 | `identity.rs` | Ed25519 长期身份密钥；域分隔 BLAKE3-XOF 1024 位指纹 | 常开 |
 | `entropy.rs` | 熵源：内核 CSPRNG 为主 + 传感器噪声 BLAKE3 搅拌增强 | 常开 |
 | `envelope.rs` | CBOR 信封 + 4 字节大端长度分帧（4MiB 上限）+ FIFO 去重 + zstd 压缩；单播/群播互斥与群信封 ttl 校验；sender 语义分流（联系人=长期钥/陌生人=化名节点钥） | 常开（压缩需 `compress`） |
-| `nodekey.rs` | 节点密钥轮换公告：长期钥签名、单调 serial、7 天过渡窗、30 天有效期上限、按 serial 取钥匙、单身份公告数上限、state()/restore() 持久化接口（未接传输） | 常开 |
-| `mailbox.rs` | 信箱桶门禁：256 位随机桶地址、keyed-BLAKE3 MAC（绑定信封全部字段）、±5min 重放窗、msg_id 过期台账（满 fail-closed）、verify_inbound 强制「先验签后去重」顺序 | 常开 |
-| `queue.rs` | SQLCipher 整库加密的待发队列 + 收件去重；重试调度；u64→i64 钳制 | `db` |
-| `maildrop.rs` | 信箱节点服务（SP-1 v9.2）：MailboxManager 按 SP-1 顺序执行「MAC→窗口→nonce 去重→限速→入库」；per-pair 分区 NonceCache + per-pair 限速（≤30 写/分/对）；pair_key 派生 | `db` |
-| `delivery.rs` | DeliveryManager：把 queue.rs 接到实际发送回调（SendFn）；tick 驱动重试/退避（catch_unwind 包裹回调）；cleanup（prune_seen 7 天 + prune_dead 30 天）；revive 复活死信 | `db` |
+| `nodekey.rs` | 节点密钥轮换公告：长期钥签名、单调 serial、7 天过渡窗、30 天有效期上限、按 serial 取钥匙、单身份公告数上限、state()/restore() 持久化接口（FFI 有出口，App 零调用，未接传输） | 常开 |
+| `mailbox.rs` | 信箱桶门禁：256 位随机桶地址、keyed-BLAKE3 MAC（绑定信封全部字段）、±5min 重放窗、msg_id 过期台账（满 fail-closed）、verify_inbound 强制「先验签后去重」顺序（原语+FFI 就绪，App 零调用） | 常开 |
+| `queue.rs` | SQLCipher 整库加密的待发队列 + 收件去重；重试调度；u64→i64 钳制（原语+FFI 就绪，App 零调用，A4 接线） | `db` |
+| `maildrop.rs` | 信箱节点服务（SP-1 v9.2）：MailboxManager 按 SP-1 顺序执行「MAC→窗口→nonce 去重→限速→入库」；per-pair 分区 NonceCache + per-pair 限速（≤30 写/分/对）；pair_key 派生（FFI 就绪，App 零调用） | `db` |
+| `delivery.rs` | DeliveryManager：把 queue.rs 接到实际发送回调（SendFn）；tick 驱动重试/退避（catch_unwind 包裹回调）；cleanup（prune_seen 7 天 + prune_dead 30 天）；revive 复活死信（FFI 有出口，App 零调用，A4 接线） | `db` |
 | `contacts.rs` | 联系人 + 聊天记录落库（identity 33 字节契约、link_secret、node_id/node_naddr 跨网快照列）；与 Signal store 同库双连接（busy_timeout 串行） | `db` |
-| `relay.rs` | 陌生人人群转发票：握手挑战绑定 + 指纹缓存（活条目永不驱逐、满 fail-closed）+ TTL ≤2h 强制 | 常开 |
+| `relay.rs` | 陌生人人群转发票：握手挑战绑定 + 指纹缓存（活条目永不驱逐、满 fail-closed）+ TTL ≤2h 强制（App 零调用，无 FFI 出口） | 常开 |
 | `adaptive.rs` | 负载三档引擎（轻/中/重）：升档即时可跳级、降档逐级防抖；NaN 指标 fail-closed | 常开 |
-| `governor.rs` | 陌生人中继资源治理：令牌桶；电量/负载 smoothstep 连续曲线降份额；保底 6 条/分/发送者 | 常开 |
-| `clock.rs` | 内部单调时钟：网络双源交叉验证（≤5s）+ 蓝牙 3 人法定人数共识 + 高水位防回拨 + 采纳限幅（±2min/次、10min 冷却）+ 仅信任已验证联系人 | 常开 |
+| `governor.rs` | 陌生人中继资源治理：令牌桶；电量/负载 smoothstep 连续曲线降份额；保底 6 条/分/发送者（allow_send/allow_recv 仅自测调用，生产限速路径未接线） | 常开 |
+| `clock.rs` | 内部单调时钟：网络双源交叉验证（≤5s）+ 蓝牙 3 人法定人数共识 + 高水位防回拨 + 采纳限幅（±2min/次、10min 冷却）+ 仅信任已验证联系人（原语+测试就绪，App 零调用） | 常开 |
 | `retry.rs` | 指数退避 + 全抖动（纯计算） | 常开 |
 | `settings.rs` | serde JSON 设置持久化（strict_crypto、scope 三档等） | 常开 |
 | `handshake.rs` | **Signal 会话层**：PQXDH 初始协商 + Double Ratchet + SAS + TOFU + bundle 上线格式；后端统一 SQLCipher（generate=内存库，open=文件库） | `signal` |
@@ -52,7 +52,7 @@ Feature：`default = ["db","compress","signal","iroh-net"]`；`ffi` 与 `vendore
 |---|---|---|
 | `MainActivity.kt` | Compose 底部三 tab（消息/联系人/我的）+ 导航图；启动前台 `NodeService`（通知权限回调里启动，拒绝也照跑） | 导航含 `add_friend`(选角色)/`add_friend_show`/`add_friend_scan`/`nearby`/`chat/{id}`；资料卡 QR 直达 `add_friend_show` |
 | `service/NodeService.kt` | 前台常驻服务（START_STICKY，connectedDevice 类型） | 真实宿主：初始化 Signal 会话（先合规占位再后台初始化，规避 Android 12+ 5 秒死线）+ `BleMesh.init` + `IrohNodeManager.start`；onDestroy 步骤边界取消 |
-| `ble/BleMesh.kt` | BLE 编排常驻单例：布隆广播（10 分钟槽 + 配对期临时 id）、占空比扫描、回连 + 双向 HMAC 挑战、配对状态机（含 QR 快连）、聊天收发（BLE 优先→iroh 兜底）、`deliverRemote` 统一入站 | 功能完整；真机射频待验证 |
+| `ble/BleMesh.kt` | BLE 一对一直连编排常驻单例（mesh 多跳=设计稿，SP-9 未实现）：布隆广播（10 分钟槽 + 配对期临时 id）、占空比扫描、回连 + 双向 HMAC 挑战、配对状态机（含 QR 快连）、聊天收发（BLE 优先→iroh 兜底）、`deliverRemote` 统一入站 | 功能完整；真机射频待验证 |
 | `ble/BleChannel.kt` | Wire 帧协议（[type:1][bodyLen:2]，body≤4KB require）+ FrameSink 重组 + GATT client/server 链路（MTU 517、分片泵） | 纯逻辑部分有 JVM 测试 |
 | `friendlink/FriendLink.kt` | 匿名回连匹配：HKDF(S_i)→每日钥→10 分钟槽位 4B ID→1024bit 布隆 + 随机填充至固定 set-bit 目标；HMAC 挑战应答 | 纯 JVM，有单测 |
 | `core/SignalCore.kt` | SignalSession/ContactStore 应用级单例 | Keystore AES-GCM 包裹 SQLCipher 库密钥（dc.dbkey→dc-signal.db）；解不开=重置+一次性 UI 提示；deviceName=ANDROID_ID（已知 P2-3） |
@@ -76,8 +76,8 @@ Feature：`default = ["db","compress","signal","iroh-net"]`；`ffi` 与 `vendore
 4. 定位预装 NDK（fail-fast：查 ANDROID_NDK_HOME/ANDROID_NDK_ROOT 与 SDK ndk/*，找不到立即报错，不静默带空路径）。
 5. 补齐 vendored 依赖（`third_party/` 不入库）：libsignal 按 SHA `eb7864c4d15435ee33681ce828930d9a4296f155` 浅抓取；iroh/iroh-relay 从 crates.io 取 1.1.0 解包。
 6. `cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o android/app/src/main/jniLibs build --release --lib -p dc-core --features vendored-openssl,ffi`（OPENSSL_DIR 指到空目录满足存在性检查，真实头文件由 vendored-openssl 提供）。
-7. `cargo test --lib -p dc-core --features vendored-openssl`。
-8. `cargo test --tests -p dc-core --features vendored-openssl`（集成测试全量：redteam / security_bruteforce / iroh_pair，进程内确定性、不依赖外网）。
+7. `cargo test --lib -p dc-core --features vendored-openssl,ffi`（lib 内 164 测试，含 ffi 出口）。
+8. `cargo test --tests -p dc-core --features vendored-openssl,ffi`（集成测试全量 5 文件 52 例：adversarial 18 / redteam 20 / redteam2 12 / security_bruteforce 1 / iroh_pair 1，进程内确定性、不依赖外网）。
 9. 构建 host（x86_64-linux）cdylib + `uniffi-bindgen generate --library` 生成 Kotlin 绑定到 `android/app/src/main/uniffi`（不入库，每次构建重新生成；build.gradle.kts sourceSets 纳入）。
 10. JDK 17 → `gradlew assembleDebug` → `gradlew testDebugUnitTest`（Kotlin/Robolectric 单测）→ `gradlew assembleRelease`（R8 混淆路径验证，proguard keep `chat.dc.core` + `-dontwarn java.awt.**`）→ 上传 APK 制品。
 
@@ -133,7 +133,7 @@ Feature：`default = ["db","compress","signal","iroh-net"]`；`ffi` 与 `vendore
 | 阶段 2 · 第二刀 | CI 生成 Kotlin 绑定 + gradle 接入（JNA） | ✅ 已完成 | CI 第 9 步 + `dc_core.kt` + `jna:5.13.0@aar` |
 | 阶段 0 | QR 载荷换真实密钥/真 SAS | ✅ 已完成 | `AddFriendPayload`(v=2 真实字段) + `SignalCore`/`BleMesh` 配对流程 |
 | 阶段 3 | BLE GATT 传输 + SQLCipher 持久化 store + 联系人落盘 + 串起整条链 | ✅ 已完成（GLM-Zcode 分支） | `ble/BleChannel.kt`/`ble/BleMesh.kt` + `signal_store.rs` + `contacts.rs` |
-| 增量 | iroh 远程链路（dc://node 快照 + 应用层 ACK + 生命周期自愈）+ 动态码蓝牙快连（f=2 帧）+ 竞品安全修复（时钟/门禁/轮换/转发票/治理器） | ✅ 已在 GLM-Zcode 分支 | `node.rs`/`IrohNodeManager.kt`/`AddFriendPayload.kt`/`clock.rs`/`mailbox.rs`/`nodekey.rs`/`relay.rs`/`governor.rs` |
+| 增量 | iroh 远程链路（dc://node 快照 + 应用层 ACK + 生命周期自愈）+ 动态码蓝牙快连（f=2 帧）+ 竞品安全修复（时钟/门禁/轮换/转发票/治理器） | ✅ iroh 链路已接线；⚠️ 时钟/门禁/轮换/转发票/治理器为 Rust 原语+测试，Android 壳零调用（未接线） | `node.rs`/`IrohNodeManager.kt`/`AddFriendPayload.kt`/`clock.rs`/`mailbox.rs`/`nodekey.rs`/`relay.rs`/`governor.rs` |
 | 阶段 4 | 两台真机实测蓝牙射频 + 跨网连通 | ⬜ 待做（需硬件） | — |
 | 阶段 7/8 | 群聊两类 + 自适应接线；代理/无障碍/arti/自毁计时器 | ⬜ 未开工 | — |
 
@@ -152,7 +152,7 @@ Feature：`default = ["db","compress","signal","iroh-net"]`；`ffi` 与 `vendore
 1. **队列补投接线**：`queue.rs`（outbox/重试/死信）未接 Android 发送路径；BLE 路径无应用层 ack（iroh 路径已有 1 字节 ACK）。P2-8。
 2. **mesh 多跳中转**：设计见 docs/BLE-RELAY-DESIGN.md 与 SP-9；转发票/治理器原语已备（relay.rs/governor.rs），传输未接。
 3. **信箱/轮换接线**：mailbox.rs 门禁与 nodekey.rs 轮换公告为原语，读桶/公告推送未接传输。
-4. **台账遗留缺陷**：P1-3 node.rs 无并发流上限、P1-4 配对链路收不了 MSG、P1-6 joiner 收 DCS1 即落库、P2-1 非常量时间比较、P2-2 AUTH_B 死代码、P2-3 ANDROID_ID 设备名、P2-5/6 配对竞态（完整台账见 docs/INDUSTRY-COMPARISON-2026-09-09.md 第 3 节，行号以编号检索为准）。
+4. **台账遗留缺陷**：P1-3 node.rs 无并发流上限、P1-6 joiner 收 DCS1 即落库、P2-3 ANDROID_ID 设备名、P2-5/6 配对竞态（P1-4 配对链路 MSG、P2-1 非常量时间、P2-2 AUTH_B 死代码已修复，2026-09-13；完整台账见 docs/INDUSTRY-COMPARISON-2026-09-09.md 第 3 节，行号以编号检索为准）。
 5. **设置中心**：settings.rs 模型已建（十二类字段中 strict_crypto/scope 等已生效），UI 仅「我的」页节点/存储/关于三块真实数据，其余子页面未铺开。
 6. **SP-4 本地敏感操作**（生物识别双因子/自毁计时器）、SP-9 多跳推进、gossip 扇出/OpenMLS/arti——均设计意图，未实现。
 
@@ -166,11 +166,11 @@ Feature：`default = ["db","compress","signal","iroh-net"]`；`ffi` 与 `vendore
 - **BLE 射频未实测**：GATT/广播/扫描链路逻辑完整且有 JVM 单测，但两台真机的射频连通性未验证（阶段 4）。
 - **队列补投未接**：`queue.rs` 已建但发送路径不经过它；BLE 发送无应用层 ack（对端不在线即失败返回，不落库）。
 - **mesh 多跳/人群转发/信箱代存未接传输**：协议原语（relay.rs/governor.rs/mailbox.rs/nodekey.rs）齐备。
-- **`AUTH_B` 反向认证为死代码**（P2-2）、**配对链路收不了聊天 MSG**（P1-4）、**node.rs 无并发流上限**（P1-3）——见台账。
+- **`AUTH_B` 反向认证死代码**（P2-2）、**配对链路收不了聊天 MSG**（P1-4）、**node.rs 无并发流上限**（P1-3）、**joiner 自动 verified**（P1-6）、**ANDROID_ID 设备名**（P2-3）与**配对单槽竞态**（P2-5/6）均已修复（2026-09-13 盲审修复批，验证官通过）。
 - **群聊、OpenMLS、gossip 扇出、arti、SP-4 敏感操作、自毁计时器**：未开工。
 
 工程债：
-- **非常量时间 HMAC 比较**（P2-1）：FriendLink 挑战应答用 `contentEquals`。
+- **非常量时间 HMAC 比较**（P2-1）✅ 已修：FriendLink 提供 `constantTimeEquals`，BleMesh 的 HMAC 挑战应答已切换，不再用 `contentEquals`。
 - **deviceName 用 ANDROID_ID**（P2-3）：待改随机名（改名会影响既有 ProtocolAddress 会话，需迁移方案）。
 - **配对竞态**（P2-5/6）：配对对象为单槽（pairingObj），并发配对行为未定义。
 - **NDK/CI action 版本未固定**：build.yml 用 runner 预装 NDK 与 `@v5` action 标签，属 CI 脆弱点。

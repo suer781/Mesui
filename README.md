@@ -62,7 +62,7 @@ cargo test
 ## 开发状态
 
 - [x] 阶段 0：工程骨架 + 环境搭建（Rust GNU + MSYS2 gcc + Android SDK 命令行版，全程免提权免 Android Studio，详见 docs/ENVIRONMENT.md）
-- [x] 核心纯逻辑层：身份/熵源/信封/自适应引擎/加密队列/设置 —— 核心逻辑层单测（src 内 85 + 集成测试 22；本机缺 protoc / dlltool，未实跑验证）
+- [x] 核心纯逻辑层：身份/熵源/信封/自适应引擎/加密队列/设置 —— 核心逻辑层单测（src 内 #[test] 默认特性 152 / `--features ffi` 下 165；集成测试 5 文件 52 个：adversarial 18 / redteam 20 / redteam2 12 / bruteforce 1 / iroh_pair 1；本机已实测通过）
 - [x] Spike A ✅：signalapp/libsignal 官方 monorepo（锁定 commit eb7864c，vendored）构建链接成功
 - [x] Spike B ✅：iroh 两 endpoint 进程内按公钥对连、QUIC 双向流互发成功
 - [x] Spike C ✅：UniFFI 脚手架编译通过；**APK 构建链路 ✅（已产出 `C:/Users/13682/dc-build/app/outputs/apk/debug/app-debug.apk`）**

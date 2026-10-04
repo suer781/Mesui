@@ -79,8 +79,11 @@ data class AddFriendPayload(
             val bucket = b64(params["bucket"]) ?: return null
             val token = b64(params["token"]) ?: return null
             val ble = b64(params["ble"]) ?: return null
-            // 可选：iroh 节点地址快照（文本字段经 b64 穿越 URI）
-            val naddr = b64(params["naddr"])?.toString(Charsets.UTF_8) ?: ""
+            // 可选：iroh 节点地址快照（文本字段经 b64 穿越 URI）。
+            // fail-closed：字段存在但非法 base64 → 整体载荷拒绝（防止坏地址
+            // 落库成空联系人导致 iroh 投递静默失效）；字段缺失 → 空串兼容旧载荷。
+            val naddrRaw = params["naddr"]
+            val naddr = if (naddrRaw == null) "" else b64(naddrRaw)?.toString(Charsets.UTF_8) ?: return null
             // 可选：token 时效界（红队 R2-7；旧版载荷缺省 0 = 验方 fail-closed 拒绝）
             val expiresAtMs = params["exp"]?.toLongOrNull() ?: 0L
             return runCatching { AddFriendPayload(name, id, bundle, bucket, token, ble, naddr, expiresAtMs) }.getOrNull()

@@ -90,6 +90,25 @@ internal class ClientLinkHandle(val link: BleClientLink) : LinkHandle() {
 /** 已解密的入站聊天消息。 */
 data class Incoming(val peerName: String, val text: String)
 
+/**
+ * 解析 DCS1（S_i 下发）明文，兼容两种格式：
+ * - 旧版：`"DCS1" + secret(32)`——无节点快照；
+ * - 新版：`"DCS1" + secret(32) + 0x00 + host_naddr`——host 在 DCS1 密文里追加
+ *   自己的 iroh 节点地址（P0 握手双向交换地址，保持密文内交换）。
+ * 返回 `(secret, hostNaddr)`；非法格式返回 null。hostNaddr 为空串 = 旧版载荷。
+ */
+internal fun parseDcs1(plain: ByteArray): Pair<ByteArray, String>? {
+    if (plain.size < 4 + 32) return null
+    if (String(plain.copyOfRange(0, 4), Charsets.US_ASCII) != "DCS1") return null
+    if (plain.size == 4 + 32) return plain.copyOfRange(4, plain.size) to ""
+    if (plain.size > 4 + 32 + 1 && plain[4 + 32] == 0.toByte()) {
+        val secret = plain.copyOfRange(4, 4 + 32)
+        val naddr = String(plain.copyOfRange(4 + 32 + 1, plain.size), Charsets.US_ASCII)
+        return secret to naddr
+    }
+    return null
+}
+
 private class AuthState {
     @Volatile var initiatorIdentity: ByteArray? = null
     @Volatile var nonce: ByteArray? = null
@@ -119,6 +138,9 @@ private class PairingInternal(val asHost: Boolean) {
     @Volatile var qrPayload: AddFriendPayload? = null
     @Volatile var offerBundle: ByteArray? = null
     @Volatile var dialError = 0 // 0 无 / 1 快连失败 / 2 对方身份变更（仅扫码端）
+    // P1-6：DCS1（S_i）是否已到达并落库。host 先确认时 DCS1 先到，本端尚未
+    // 显式确认 SAS——此时不能标记 finished，须保持配对态等用户比对确认。
+    @Volatile var secretReceived = false
     // token 时效界（红队 R2-7）：QR 载荷携带，进首条消息 token-MAC 输入。
     // 旧数据帧路径经 startPairingAsJoiner 传入；0 = 未知（验方 fail-closed 拒绝）
     @Volatile var expiresAtMs = 0L
@@ -968,27 +990,41 @@ object BleMesh {
         if (body.isEmpty()) return
         val context = ctx() ?: return
         val name = p.peerName ?: return
-        if (p.finished) {
+        // K2-2：配对完成后（finished）或 S_i 已下发（secretReceived，本端尚未点
+        // 确认时配对数据面已就绪）——本链路就是双方聊天主链路，MSG 须转
+        // decryptAndStore 正常解密落库；DCS1 由 decryptAndStore 拒收（parseDcs1）。
+        if (p.finished || p.secretReceived) {
             decryptAndStore(name, body)
             return
         }
         val session = runCatching { SignalCore.session(context) }.getOrNull() ?: return
         val plain = runCatching { session.decrypt(name, WireMessage(body[0].toUByte(), body.copyOfRange(1, body.size))) }.getOrNull() ?: return
-        if (plain.size == 4 + 32 && String(plain.copyOfRange(0, 4), Charsets.US_ASCII) == "DCS1") {
-            finishJoinerWithSecret(p, plain.copyOfRange(4, plain.size))
+        parseDcs1(plain)?.let { (secret, hostNaddr) ->
+            finishJoinerWithSecret(p, secret, hostNaddr)
         }
     }
 
-    private fun finishJoinerWithSecret(p: PairingInternal, secret: ByteArray) {
+    private fun finishJoinerWithSecret(p: PairingInternal, secret: ByteArray, hostNaddr: String = "") {
         val context = ctx() ?: return // K2-9：shutdown 后迟到 DCS1 静默退出
         val name = p.peerName ?: return
         val theirId = p.peerIdentity ?: return
+        // P0：host 在 DCS1 密文里追加的真实节点地址优先于 QR 载荷里的快照——
+        // 旧版载荷（naddr 为空）也能拿到 host 地址，联系人跨 WiFi 可达。
+        if (hostNaddr.isNotEmpty()) p.naddr = hostNaddr
         val peerNodeId = runCatching { chat.dc.core.nodeIdFromNaddr(p.naddr) }.getOrDefault("")
-        runCatching { SignalCore.contactStore(context).upsertContact(name, theirId, p.bucket ?: ByteArray(32), true, "", secret, peerNodeId, p.naddr) }
+        // P1-6：verified 只能来自本端 SAS 显式确认（confirmSas 置 true），
+        // 不能因收到 DCS1 自动置真——host 先确认时本端仍须人工比对安全码。
+        val verified = p.localConfirmed
+        runCatching { SignalCore.contactStore(context).upsertContact(name, theirId, p.bucket ?: ByteArray(32), verified, "", secret, peerNodeId, p.naddr) }
             .onFailure { android.util.Log.w(TAG, "联系人（含 S_i）落库失败", it) }
         invalidateCaches()
-        p.finished = true
-        p.link?.send(wireFrame(Wire.SAS_OK, ByteArray(0)))
+        p.secretReceived = true
+        // 双向确认语义（P1-6）：本端已显式确认才标记 finished 并回 SAS_OK；
+        // 未确认则保持配对态，UI 上的「确认」按钮继续可用。
+        if (p.localConfirmed) {
+            p.finished = true
+            p.link?.send(wireFrame(Wire.SAS_OK, ByteArray(0)))
+        }
         publishPairing()
     }
 
@@ -998,9 +1034,20 @@ object BleMesh {
         runCatching { chat.dc.app.core.IrohNodeManager.invalidateNodeIdIndex() }
     }
 
+    /** 配对槽位互斥（P2-5/6）：同一时刻只允许一个活跃配对流程。 */
+    @Synchronized
+    private fun canStartNewPairing(): Boolean {
+        val existing = pairingObj
+        return existing == null || existing.finished
+    }
+
     /** 出示页进入。[payload] = 本场动态码载荷（QR 快连用它应答 QR_DIAL/QR_REQ），
      *  [challenge] = 蓝牙连接帧（f=2）的当场随机挑战。 */
+    @Synchronized
     fun startPairingAsHost(payload: AddFriendPayload, challenge: ByteArray) {
+        // 配对槽位互斥（P2-5/6）：同一时刻只允许一个活跃配对流程。已有未完成
+        // 配对时拒绝新配对，防止并发配对互相覆盖 pairingObj 状态。
+        if (!canStartNewPairing()) return
         pairingObj = PairingInternal(asHost = true).apply {
             token = payload.token; bucket = payload.bucket; bleId = payload.ble
             qrPayload = payload
@@ -1023,7 +1070,11 @@ object BleMesh {
 
     /** 扫码页采集完成（UI 已 processBundle）。expiresAtMs = token 时效界
      *  （红队 R2-7，QR 载荷携带；旧版载荷缺省 0 → 握手 fail-closed）。 */
+    @Synchronized
     fun startPairingAsJoiner(peerName: String, peerIdentity: ByteArray, token: ByteArray, bucket: ByteArray, bleId: ByteArray, naddr: String, expiresAtMs: Long = 0) {
+        // 配对槽位互斥（P2-5/6）：已有未完成配对（如 QR 快连已登记）时拒绝，
+        // 防止双路径/并发配对互相覆盖 pairingObj。
+        if (!canStartNewPairing()) return
         pairingObj = PairingInternal(asHost = false).apply {
             this.peerName = peerName; this.peerIdentity = peerIdentity
             this.token = token; this.bucket = bucket; this.bleId = bleId
@@ -1040,14 +1091,13 @@ object BleMesh {
      * [identityReadyAtMs] = 本端 3 秒时长门槛到期时刻（FrameCollector 锚定）——
      * 到点才发 QR_REQ 索要完整身份，与出示端门槛共同维持防偷拍时长语义。
      */
+    @Synchronized
     fun startQrDialAsJoiner(peerName: String, bleId: ByteArray, challenge: ByteArray, identityReadyAtMs: Long) {
-        // 双路径互踩守卫（P2）：降级序列下数据帧可能先集齐（startPairingAsJoiner
-        // 已建配对、SAS 进行中），之后才读到 f=2 蓝牙帧——旧码无条件覆盖
-        // pairingObj，正在 SAS 的旧配对被孤儿化（其链路回调仍写旧对象，UI 快照
-        // 却换成空壳新对象，状态机与界面脱钩）。已有活跃配对在 SAS 阶段即拒绝
-        // 新搭线，先到先得
-        val existing = pairingObj
-        if (existing != null && !existing.finished && existing.sas != null) return
+        // 双路径互踩守卫（P2）+ 单槽互斥（P2-5/6）：已有未完成配对（无论旧数据帧
+        // 路径还是快连路径）一律拒绝新搭线，先到先得——防止并发配对互相覆盖
+        // pairingObj，正在 SAS 的配对被孤儿化（其链路回调仍写旧对象，UI 快照
+        // 却换成空壳新对象，状态机与界面脱钩）。
+        if (!canStartNewPairing()) return
         pairingObj = PairingInternal(asHost = false).apply {
             this.peerName = peerName
             this.bleId = bleId
@@ -1091,7 +1141,16 @@ object BleMesh {
             runCatching { SignalCore.contactStore(context).upsertContact(name, theirId, p.bucket ?: ByteArray(32), true, "", secret, peerNodeId, p.naddr) }
                 .onFailure { android.util.Log.w(TAG, "联系人（含 S_i）落库失败", it) }
             invalidateCaches()
-            val wm = runCatching { session.encrypt(name, "DCS1".toByteArray(Charsets.US_ASCII) + secret) }
+            // P0：DCS1 密文里追加本端 iroh 节点地址——joiner 即使拿到的是旧版
+            // 空 naddr 载荷，也能在落库时写入 host 真实地址（握手双向交换地址，
+            // 保持密文内交换；旧版 DCS1 不带 naddr 仍可解析）。
+            val hostNaddr = chat.dc.app.core.IrohNodeManager.state.value.naddr
+            val dcs1Plain = if (hostNaddr.isEmpty()) {
+                "DCS1".toByteArray(Charsets.US_ASCII) + secret
+            } else {
+                "DCS1".toByteArray(Charsets.US_ASCII) + secret + byteArrayOf(0) + hostNaddr.toByteArray(Charsets.US_ASCII)
+            }
+            val wm = runCatching { session.encrypt(name, dcs1Plain) }
                 .onFailure { android.util.Log.w(TAG, "DCS1 加密失败，S_i 未下发", it) }
                 .getOrNull()
             wm?.let { p.link?.send(wireFrame(Wire.MSG, byteArrayOf(it.msgType.toByte()) + it.ciphertext)) }
@@ -1102,6 +1161,11 @@ object BleMesh {
             //（污染布隆过滤器 + 可关联），聊天链路 HMAC 也全错。DCS1 到达
             // （finishJoinerWithSecret 携真实 S_i）才落库；丢失则停留在
             // 「已确认待下发」态，重新扫码即可恢复，不会写坏任何数据。
+            // P1-6：本端显式确认后升级 verified=true（DCS1 先到场景，联系人已以
+            // verified=false 落库；未到则此处是 no-op，落库时读 localConfirmed=true）。
+            runCatching { SignalCore.contactStore(context).setVerified(name, true) }
+                .onFailure { android.util.Log.w(TAG, "联系人 verified 升级失败", it) }
+            if (p.secretReceived) p.finished = true
         }
         p.localConfirmed = true
         p.link?.send(wireFrame(Wire.SAS_OK, ByteArray(0)))
@@ -1119,7 +1183,7 @@ object BleMesh {
         val plain = runCatching {
             session.decrypt(peerName, WireMessage(body[0].toUByte(), body.copyOfRange(1, body.size)))
         }.getOrNull() ?: return false // 解密失败：NAK，发送方重试
-        if (plain.size == 4 + 32 && String(plain.copyOfRange(0, 4), Charsets.US_ASCII) == "DCS1") return false // 聊天链路拒收下发格式
+        if (parseDcs1(plain) != null) return false // 聊天链路拒收下发格式（旧版/追加 naddr 的新版）
         val text = String(plain, Charsets.UTF_8)
         val stored = runCatching { SignalCore.contactStore(context).appendMessage(peerName, false, text) }.isSuccess
         if (!stored) return false // 落库失败：NAK，发送方重试（不假送达）

@@ -18,20 +18,20 @@
 |---|---|---|
 | identity.rs | Ed25519 长期身份 + 1024 位指纹 | 身份公钥**序列化后 33 字节**（1 字节类型前缀+32），全仓契约 = 33 |
 | entropy.rs | BLAKE3 熵池 + OS CSPRNG | OS 为主源，传感器为增强 |
-| envelope.rs | CBOR 信封 | msg_id 去重 + ttl_hops（为中转预留）；sender 按路径分流（联系人=长期钥/陌生人=化名节点钥）；单播/群播互斥校验；可选 `sig` 字段（**A0 已补 2026-09-13**）：发送方 Ed25519 签名覆盖除 sig 外全字段（验证公钥=sender），**仅转发层消费**（SP-7 人群转发/群播多跳，`relay::verify_forward_credential`，无签名=拒转）；联系人直连/信箱路径不消费（内层 Signal AEAD/信箱 MAC 已认证，签名冗余）；旧信封双向兼容（无签名线上字节与旧格式同构） |
-| nodekey.rs | 节点密钥轮换公告 SP-2 | 长期钥签名 + 单调 serial + 7 天过渡窗 + 30 天有效期上限 + 密钥环持久化接口；**未接入传输** |
-| mailbox.rs | 信箱桶门禁 SP-1 | 256 位随机桶地址；写桶须 keyed-BLAKE3 MAC（绑定信封全部字段）；±5min 重放窗 + msg_id 过期台账（满 fail-closed） |
-| relay.rs | 陌生人中继票 SP-7 | 挑战哈希+nonce 缓存（逐过期/旧挑战逐出、活条目永不驱逐）+TTL≤2h；默认关闭 |
-| governor.rs | 转发份额治理 | **15% 顶、电量 40→5 smoothstep 到 3% 地板、每发送者 6 条/分保底、双曲线取 min、NaN fail-closed——全部已实现，勿报缺失** |
-| clock.rs | 软件内部独立时钟 SP-8 | 网络双源交叉验证(≤5s) + 蓝牙 3 人法定人数 + 采纳限幅±2min/冷却10min + 高水位防回拨 + 仅信任已验证联系人 |
+| envelope.rs | CBOR 信封 | msg_id 去重 + ttl_hops（为中转预留）；sender 按路径分流（联系人=长期钥/陌生人=化名节点钥）；单播/群播互斥校验；可选 `sig` 字段（**A0 已补 2026-09-13**）：发送方 Ed25519 签名覆盖除 sig 外全字段（验证公钥=sender），**仅转发层消费**（SP-7 人群转发/群播多跳，`relay::verify_forward_credential`，无签名=拒转）；联系人直连/信箱路径不消费（内层 Signal AEAD/信箱 MAC 已认证，签名冗余）；旧信封双向兼容（无签名线上字节与旧格式同构）。**注意：sign/verify 目前无 FFI 导出，生产/App 零调用，属原语就绪（A2 接线前置）** |
+| nodekey.rs | 节点密钥轮换公告 SP-2 | 长期钥签名 + 单调 serial + 7 天过渡窗 + 30 天有效期上限 + 密钥环持久化接口；FFI 有 AnnouncementDispatcher 出口，但 **App 零调用，未接入传输** |
+| mailbox.rs | 信箱桶门禁 SP-1 | 256 位随机桶地址；写桶须 keyed-BLAKE3 MAC（绑定信封全部字段）；±5min 重放窗 + msg_id 过期台账（满 fail-closed）；**原语+FFI 就绪，App 零调用（未接线）** |
+| relay.rs | 陌生人中继票 SP-7 | 挑战哈希+nonce 缓存（逐过期/旧挑战逐出、活条目永不驱逐）+TTL≤2h；默认关闭；**App 零调用（无 FFI 出口），原语就绪未接线** |
+| governor.rs | 转发份额治理 | **15% 顶、电量 40→5 smoothstep 到 3% 地板、每发送者 6 条/分保底、双曲线取 min、NaN fail-closed——原语+测试就绪；生产限速路径未接线（全仓无模块调用 allow_send/allow_recv，Kotlin 零调用）** |
+| clock.rs | 软件内部独立时钟 SP-8 | 网络双源交叉验证(≤5s) + 蓝牙 3 人法定人数 + 采纳限幅±2min/冷却10min + 高水位防回拨 + 仅信任已验证联系人；**原语+16 测试就绪，网络双源/蓝牙共识/信任名单生产零接线（App 零调用）** |
 | adaptive.rs | 负载三档引擎 | 升档即时可跳级、降档逐级防抖、锁档、NaN fail-closed；只产出档位，传输策略未接 |
 | handshake.rs | Signal 会话（PQXDH+Double Ratchet+SAS+TOFU） | vendored libsignal eb7864c；`Device::generate`=内存库，`open`=SQLCipher 持久；TOFU 拒绝单独成类（IdentityChanged） |
 | signal_store.rs | SQLCipher store | strict 模式必须给 key；`save_identity` 拒绝异钥覆盖（P1-1 已修） |
 | contacts.rs | 联系人/消息落库 | identity 接受 33 字节（32 保留兼容），bucket/link_secret 固定 32；node_id/node_naddr 为跨网快照列（旧库自动迁移） |
 | node.rs | iroh endpoint + NodeSink 回调 | presets::Minimal（零 n0 依赖）；一消息一流 + 1 字节 ACK；dc://node 快照编解码；无并发流上限 = 已知 P1-3 |
 | queue.rs | 加密队列+重试调度 | 已实现但**未接入 Android 发送路径**（已知待办，勿重复报） |
-| maildrop.rs | 信箱节点服务 SP-1 v9.2 | MailboxManager 按「MAC→窗口→nonce 去重→限速→入库」强制顺序；per-pair 分区 NonceCache + ≤30 写/分/对限速 |
-| delivery.rs | DeliveryManager 投递管理 | 把 queue.rs 接到实际发送回调；tick 重试/退避（catch_unwind）；cleanup（seen 7 天/死信 30 天）；revive 复活死信 |
+| maildrop.rs | 信箱节点服务 SP-1 v9.2 | MailboxManager 按「MAC→窗口→nonce 去重→限速→入库」强制顺序；per-pair 分区 NonceCache + ≤30 写/分/对限速；**FFI 就绪但 App 零调用（Android 壳 MailboxManager 无宿主接线）** |
+| delivery.rs | DeliveryManager 投递管理 | 把 queue.rs 接到实际发送回调；tick 重试/退避（catch_unwind）；cleanup（seen 7 天/死信 30 天）；revive 复活死信；**FFI 有出口但 App 零调用（A4 待办）** |
 | retry.rs | 指数退避+全抖动（纯计算） | 驱动方为通道状态机（未接） |
 | settings.rs | serde JSON 设置模型 | 含 strict_crypto（默认开）、NodeServiceCfg.scope 三档等；UI 仅部分接入 |
 | ffi.rs | UniFFI 导出 | SignalSession/ContactStore/IrohNode/NodeCallback/DcError(RemoteIdentityChanged 单独成类)/first_message_mac 等；`smoke_test_all_modules` 是防链接器裁剪的探针，**不是功能** |
@@ -39,7 +39,7 @@
 ### Kotlin（android/app/src/main/java/chat/dc/app）
 | 模块 | 职责 | 关键事实 |
 |---|---|---|
-| ble/BleMesh.kt | BLE mesh 编排常驻单例 | 广播=布隆过滤器；占空比扫描；命中回连；HMAC 挑战；配对状态机（含 QR 快连 QR_DIAL/QR_OFFER/QR_REQ/QR_ID）；聊天收发（BLE 优先→iroh 兜底）；`deliverRemote` 为 iroh 入站统一入口 |
+| ble/BleMesh.kt | BLE 一对一直连编排常驻单例（mesh 多跳=设计稿，SP-9 未实现） | 广播=布隆过滤器；占空比扫描；命中回连；HMAC 挑战；配对状态机（含 QR 快连 QR_DIAL/QR_OFFER/QR_REQ/QR_ID）；聊天收发（BLE 优先→iroh 兜底）；`deliverRemote` 为 iroh 入站统一入口 |
 | ble/BleChannel.kt | Wire 帧协议 + GATT 链路 | 帧 = [type:1][bodyLen:2 BE]，body ≤4KB（超限 require 快速失败）；BleClientLink/BleServer、MTU 517、分片泵 |
 | friendlink/FriendLink.kt | 匿名发现 | HKDF(好友共享秘密 S_i)→每日钥→10 分钟槽位 4 字节 ID→布隆+随机填充至固定 set-bit 目标 |
 | core/SignalCore.kt | 密钥管理单例 | Keystore AES-GCM 包裹 SQLCipher 库密钥（解不开=重置+一次性 UI 提示，非静默）；deviceName=ANDROID_ID（已知 P2-3，待改随机名） |
@@ -81,7 +81,7 @@
 8. 队列补投未接 = 已知待办；「无 ack」仅指 **BLE 路径**（iroh 路径已有 1 字节应用层
    ACK 并在 send 返回前确认）——报缺陷只在接受任务时引用编号，不重复展开
 
-## 五、已知问题台账（2026-09-11 核对；勿重复报，引用编号即可）
+## 五、已知问题台账（2026-09-13 核对；勿重复报，引用编号即可）
 
 **已修（回归测试/提交在树，勿再报）**：
 P0-1 BLE AUTH 32/33 契约统一（修于 befb1d8，BleMesh IDENTITY_LEN=33）｜
@@ -91,15 +91,14 @@ P1-1 TOFU pin 静默换钥（修于 7a195a3，save_identity 拒绝异钥覆盖�
 C 每消息全表反查联系人（c58d466，nodeIdIndex 缓存）｜D 配对早于 onReady 致 naddr
 永久空（d07a458，sendJoinerHandshake 等快照最多 4s）｜E 本人二维码入口误绑（d07a458，
 直达 add_friend_show）｜P2-7 4KB 静默失败（wireFrame 改 require 快速失败；QR_OFFER
-超限主动放弃快连走数据帧回退）。
+超限主动放弃快连走数据帧回退）｜P1-4 配对链路收不了 MSG（已修：finished 后 MSG 转
+decryptAndStore，见 K2-2）｜P2-1 AUTH HMAC 非常量时间（已修：FriendLink.constantTimeEquals，
+BleMesh HMAC 校验已切换）｜P2-2 AUTH_B 死代码（已修：AUTH_B_CHA→AUTH_B_RSP 双向闭环）。
 
 **仍开放**：
-P1-3 node.rs 无并发流上限｜P1-4 配对链路收不了 MSG（聊天消息到达经 AUTH/配对建立
-的链路时被丢弃）｜P1-5（部分）Keystore 失败清库现有一次性提示，但自动重置本身仍是
-兜底行为｜P1-6 joiner 收 DCS1 即自动落库 verified=true（早于本端 SAS 确认）｜
-P2-1 AUTH HMAC 比较非常量时间（FriendLink.hmac 后 contentEquals）｜
-P2-2 AUTH_B 反向认证死代码（initiator 不处理 AUTH_B_CHA）｜P2-3 ANDROID_ID 设备名｜
-P2-5/6 配对竞态｜P2-8 BLE 路径无 ack。
+P1-5（部分）Keystore 失败清库现有一次性提示，但自动重置本身仍是
+兜底行为｜P2-8 BLE 路径无 ack。
+（P1-3/P1-6/P2-3/P2-5/6 已修复：2026-09-13 盲审修复批，验证官通过）
 完整台账与行号：docs/INDUSTRY-COMPARISON-2026-09-09.md 第 3 节（其中行号基于
 2026-09-09 代码，此后已有漂移，以编号检索为准）。
 
