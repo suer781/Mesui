@@ -102,6 +102,11 @@ dependencies {
     // packaging 是 jar，不带后缀会解析错）。
     implementation("net.java.dev.jna:jna:5.13.0@aar")
 
+    // JVM 单测补充桌面版 JNA（含 jnidispatch.dll）：Android AAR 只带 Android
+    // ABI 的 jnidispatch，unit test 跑在桌面 JVM 上需要桌面原生库。
+    // JNA 按 classpath 资源搜索 jnidispatch.dll，jar 在 test classpath 上即可命中。
+    testImplementation("net.java.dev.jna:jna:5.13.0")
+
     testImplementation(composeBom)
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.14.1")

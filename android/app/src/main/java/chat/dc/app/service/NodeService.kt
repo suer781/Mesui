@@ -8,6 +8,7 @@ import android.content.Intent
 import android.os.IBinder
 import chat.dc.app.R
 import chat.dc.app.ble.BleMesh
+import chat.dc.app.core.DeliveryBridge
 import chat.dc.app.core.IrohNodeManager
 import chat.dc.app.core.SignalCore
 import kotlinx.coroutines.CoroutineScope
@@ -18,10 +19,10 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 
 /**
- * 前台服务：Rust 节点（iroh endpoint）与蓝牙链路的常驻宿主。
+ * 前台服务：Rust 节点（iroh endpoint）、蓝牙链路与加密投递队列的常驻宿主。
  * 保活策略：常驻通知，用户可关（默认开）。
- * BLE mesh（广播/扫描/回连/配对）与 iroh 远程收发均由此常驻驱动；
- * 离线信箱补投、联系人间中继为后续阶段。
+ * BLE mesh（广播/扫描/回连/配对）、iroh 远程收发与离线消息补投
+ * （DeliveryBridge 周期 tick）均由此常驻驱动。
  */
 class NodeService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
@@ -61,14 +62,24 @@ class NodeService : Service() {
             // 启动失败的自愈退避重试由 IrohNodeManager 内部负责
             runCatching { IrohNodeManager.start(this@NodeService) }
                 .onFailure { android.util.Log.w("NodeService", "iroh 节点启动失败（内部有退避重试）", it) }
+            ensureActive()
+            // 加密投递队列：离线消息落 outbox 不丢，周期 tick 补投。
+            // 发送通道由 BleMesh 提供（sendEnvelope 按信封 recipient 反查联系人）。
+            // 周期任务与「上线即 tick」在 DeliveryBridge 内部启动。
+            runCatching {
+                DeliveryBridge.start(this@NodeService) { recipient, payload ->
+                    BleMesh.sendEnvelope(recipient, payload)
+                }
+            }.onFailure { android.util.Log.w("NodeService", "投递队列启动失败", it) }
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        // 先取消在途初始化协程，再停 mesh/iroh，避免销毁后仍被拉起
+        // 先取消在途初始化协程，再停 mesh/iroh/投递队列，避免销毁后仍被拉起
         initScope.cancel()
         // START_STICKY 重建时 mesh/iroh 随新实例 init；进程真退出则无线程可留
+        runCatching { DeliveryBridge.stop() }
         runCatching { BleMesh.shutdown() }
         runCatching { IrohNodeManager.stop() }
     }

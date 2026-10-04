@@ -35,6 +35,7 @@ object SignalCore {
     private const val KEY_FILE = "dc.dbkey"
     private const val DB_FILE = "dc-signal.db"
     private const val NAME_FILE = "dc.devicename"
+    private const val OUTBOX_KEY_FILE = "dc.outboxkey"
     private const val GCM_IV_LEN = 12
     private const val GCM_TAG_BITS = 128
 
@@ -130,6 +131,33 @@ object SignalCore {
     @Synchronized
     fun consumeIdentityResetNotice(): Boolean =
         resetNoticePending.also { resetNoticePending = false }
+
+    /** 投递队列库密钥（hex）：与 Signal 库同一 Keystore 包裹，但独立文件、
+     *  独立重置——outbox 只是密文暂存，Signal 库重置时不应连带清空待发消息。 */
+    @Synchronized
+    internal fun outboxKeyHex(context: Context): String {
+        val file = File(context.filesDir, OUTBOX_KEY_FILE)
+        val key = keystoreKey()
+        if (file.exists()) {
+            val blob = file.readBytes()
+            val plain = runCatching {
+                if (blob.size <= GCM_IV_LEN) error("outbox key truncated")
+                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, blob, 0, GCM_IV_LEN))
+                cipher.doFinal(blob, GCM_IV_LEN, blob.size - GCM_IV_LEN)
+            }.getOrNull()
+            if (plain != null) return String(plain, Charsets.US_ASCII) // 存的就是 hex ASCII
+            // Keystore 密钥轮换（恢复出厂等）：旧密文解不开，生成新密钥。
+            // 旧 outbox 库将无法打开——DeliveryBridge.open 失败时由调用方兜底删除重建。
+            file.delete()
+        }
+        val hex = ByteArray(32).also(SecureRandom()::nextBytes)
+            .joinToString("") { "%02x".format(it) }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, key)
+        file.writeBytes(cipher.iv + cipher.doFinal(hex.toByteArray(Charsets.US_ASCII)))
+        return hex
+    }
 
     /** 持久化 SignalSession：身份/会话/TOFU pin 落盘，重启沿用。 */
     @Synchronized

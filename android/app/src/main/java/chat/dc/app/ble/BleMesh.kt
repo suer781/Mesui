@@ -1220,7 +1220,9 @@ object BleMesh {
     /**
      * 发送文本：BLE 在线链路优先（近场免费直发）；无链路且有对方节点快照
      * 则走 iroh 跨网络（阻塞等对端应用层确认，调用方须在 IO 线程）。
-     * 两条路都不通返回 false（UI 显示「对方不在线」），不落库（队列补投为后续阶段）。
+     * 两条路都不通：把已加密载荷写入投递队列（DeliveryBridge.enqueue），
+     * 消息不丢，周期 tick / 对方上线时自动补投。返回值仍为 false——
+     * UI 保持「对方不在线」提示（入队成功与否只影响后台补投，不改变界面语义）。
      */
     fun sendText(peerName: String, text: String): Boolean {
         val context = ctx() ?: return false // K2-9：shutdown 后无链路可发
@@ -1230,13 +1232,46 @@ object BleMesh {
         val session = runCatching { SignalCore.session(context) }.getOrNull() ?: return false
         val wm = runCatching { session.encrypt(peerName, text.toByteArray()) }.getOrNull() ?: return false
         val payload = byteArrayOf(wm.msgType.toByte()) + wm.ciphertext
-        val sent = synchronized(links) { links[hex(contact.identity)] }?.let {
+        if (sendPayloadToContact(contact, payload)) {
+            runCatching { SignalCore.contactStore(context).appendMessage(peerName, true, text) }
+            return true
+        }
+        // 两路都不通：离线消息入队（不丢），UI 仍提示对方不在线
+        runCatching { chat.dc.app.core.DeliveryBridge.enqueue(peerName, payload) }
+            .onFailure { android.util.Log.w(TAG, "离线消息入队失败", it) }
+        return false
+    }
+
+    /**
+     * 投递队列补投入口（DeliveryBridge 的 EnvelopeSender 通道）：按信封
+     * recipient（联系人 identity 去掉 libsignal 类型前缀的 32 字节）反查
+     * 联系人，走 BLE / iroh 实际发送。返回 true = 已送达；false = 不可达
+     * （Rust 侧按退避节奏自动重试，此处不重试）。
+     */
+    fun sendEnvelope(recipientNodeId: ByteArray, payload: ByteArray): Boolean {
+        val context = appContext ?: return false
+        val contact = runCatching {
+            SignalCore.contactStore(context).listContacts().firstOrNull { c ->
+                val key = when (c.identity.size) {
+                    33 -> c.identity.copyOfRange(1, 33)
+                    32 -> c.identity
+                    else -> null
+                }
+                key != null && key.contentEquals(recipientNodeId)
+            }
+        }.getOrNull() ?: return false
+        return sendPayloadToContact(contact, payload)
+    }
+
+    /** 共用发送逻辑：BLE 在线链路优先，否则 iroh 跨网络。 */
+    private fun sendPayloadToContact(contact: Contact, payload: ByteArray): Boolean {
+        val bleSent = synchronized(links) { links[hex(contact.identity)] }?.let {
             it.send(wireFrame(Wire.MSG, payload))
             true
-        } ?: (contact.nodeNaddr.isNotEmpty() && chat.dc.app.core.IrohNodeManager.isRunning() &&
-            chat.dc.app.core.IrohNodeManager.send(contact.nodeNaddr, payload))
-        if (sent) runCatching { SignalCore.contactStore(context).appendMessage(peerName, true, text) }
-        return sent
+        }
+        if (bleSent != null) return true
+        return contact.nodeNaddr.isNotEmpty() && chat.dc.app.core.IrohNodeManager.isRunning() &&
+            chat.dc.app.core.IrohNodeManager.send(contact.nodeNaddr, payload)
     }
 
     fun isOnline(peerName: String): Boolean {
