@@ -671,7 +671,7 @@ object BleMesh {
                 val ok = body.size == FriendLink.HMAC_TRUNC && FriendLink.constantTimeEquals(body, expected)
                 if (!ok) link.drop()
             }
-            Wire.HS -> onHostHandshake(handle, body)
+            Wire.HS -> onHostHandshake(handle, body, st)
             Wire.QR_DIAL -> onHostQrDial(link, body)
             Wire.QR_REQ -> onHostQrReq(handle, link, body)
             Wire.SAS_OK -> pairingObj?.takeIf { it.asHost && !it.finished }?.let {
@@ -725,7 +725,7 @@ object BleMesh {
         link.send(wireFrame(Wire.QR_ID, byteArrayOf(wm.msgType.toByte()) + wm.ciphertext))
     }
 
-    private fun onHostHandshake(handle: ServerLinkHandle, body: ByteArray) {
+    private fun onHostHandshake(handle: ServerLinkHandle, body: ByteArray, st: AuthState) {
         val p = pairingObj?.takeIf { it.asHost && !it.finished } ?: return
         if (body.size < 1 + 1 + 32 + 1) return
         val nameLen = body[0].toInt() and 0xFF
@@ -764,6 +764,10 @@ object BleMesh {
         p.link = handle
         p.sas = runCatching { session.sasWith(SignalCore.deviceName(context), name, theirId) }.getOrNull()
         val hexKey = hex(theirId)
+        // P2（B2 盲审）：配对链路也必须记入 AuthState.peerHex，否则 handleIncomingLink
+        // 的 onClosed 只在 st.peerHex != null 时清理 links——不设则配对链路断线后
+        // 死句柄残留，sendText 命中死链静默丢消息、iroh 兜底被挡（与 joiner 侧对称）
+        st.peerHex = hexKey
         synchronized(links) { links[hexKey] = handle }
         // K2-7：update{} 原子读改写（同上）
         _peers.update { it + (hexKey to PeerState.ONLINE) }
@@ -793,6 +797,13 @@ object BleMesh {
             // （旧码无条件 p.link = null，握手进行中被并发失败链接误判为断链）
             val wasActive = p.link === handle
             if (wasActive) p.link = null
+            // 对称清理 links 中的死链接（对齐 handleIncomingLink 的语义）：
+            // joiner 侧配对链路断线后若不清 links，sendText 会命中死链接返回
+            // 成功、消息静默丢弃，iroh 兜底分支被永久挡住（二批盲审 B1 发现）
+            p.peerIdentity?.let { id ->
+                val idHex = hex(id)
+                synchronized(links) { if (links[idHex] === handle) links.remove(idHex) }
+            }
             // QR 快连中途断链且未完成：标记失败（UI 提示重扫；完整身份仍可
             // 经数据帧全集回退）。已完成/旧路径（无 challenge）不打扰；
             // 仅「已搭线在用」的链路断开才算失败——连接尝试本身失败只等
