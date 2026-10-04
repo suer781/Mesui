@@ -74,6 +74,9 @@ android {
                 // Robolectric 的 android-all 运行时镜像走国内源
                 test.systemProperty("robolectric.dependency.repo.url", "https://maven.aliyun.com/repository/public")
                 test.systemProperty("robolectric.dependency.repo.id", "aliyun")
+                // CI 注入 dc_core 库路径（-Ddc.core.lib=... 传给测试 JVM；测试内
+                // 也会读 DC_CORE_LIB 环境变量，未设置时回退本机 Windows 默认路径）
+                test.systemProperty("dc.core.lib", System.getProperty("dc.core.lib") ?: "")
                 // 项目路径含中文：worker JVM 默认按 GBK 解码路径导致测试类 CNFE
                 //（本项目第三次撞 Windows 编码墙：GNU ld / aapt2 之后是 test worker）
                 test.jvmArgs("-Dfile.encoding=UTF-8", "-Dsun.jnu.encoding=UTF-8")

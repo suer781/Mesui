@@ -56,6 +56,7 @@ object DeliveryBridge {
     @Volatile private var sender: EnvelopeSender? = null
     @Volatile private var tickJob: Job? = null
     private val watchJobs = mutableListOf<Job>()
+    @Volatile private var watchersStarted = false
     @Volatile private var lastCleanupMs = System.currentTimeMillis()
 
     /** 是否已启动（NodeService 生命周期内）。 */
@@ -85,6 +86,7 @@ object DeliveryBridge {
         tickJob = null
         watchJobs.forEach { it.cancel() }
         watchJobs.clear()
+        watchersStarted = false
         val h = handle
         handle = null
         h?.close()
@@ -179,13 +181,20 @@ object DeliveryBridge {
         return open()
     }
 
-    /** 返回句柄；未启动或打开失败时尝试补开一次（NodeService 启动顺序错位自愈）。 */
+    /** 返回句柄；未启动或打开失败时尝试补开一次（NodeService 启动顺序错位自愈）。
+     *  补开成功时同步启动周期 tick 与上线 watcher——初始 start() 打开失败
+     *  （handle=null）时它们尚未启动，不能因为补开成功而一直缺失。 */
     private fun handleOrOpenLazy(): DeliveryManagerHandle? {
         handle?.let { return it }
         synchronized(this) {
             handle?.let { return it }
             if (appContext == null || sender == null) return null
-            return openHandle().also { handle = it }
+            val h = openHandle()
+            if (h == null) return null
+            handle = h
+            startTicker()
+            startWatchers()
+            return h
         }
     }
 
@@ -204,8 +213,12 @@ object DeliveryBridge {
         }
     }
 
-    /** 上线/就绪事件 → 立即补投（任务要求的「重连时 tick」）。 */
+    /** 上线/就绪事件 → 立即补投（任务要求的「重连时 tick」）。
+     *  幂等：只在首次调用时挂 watcher，重复调用（补开路径与 start 路径可能重叠）
+     *  不会叠加出多份 watcher。 */
     private fun startWatchers() {
+        if (watchersStarted) return
+        watchersStarted = true
         // BLE 链路从「无人上线」 → 「有人上线」：立即补投
         watchJobs += scope.launch {
             var wasOnline = false

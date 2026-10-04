@@ -146,7 +146,8 @@ private class PairingInternal(val asHost: Boolean) {
     @Volatile var expiresAtMs = 0L
     // 出示端：配对开始时刻（QR_REQ 时长门槛——偷拍者拍单帧+回连同样要等满
     // 3 秒才能拿到 token，与拍全数据帧的门槛等价）。扫码端：identityReadyAtMs
-    // = 本端时长门槛到期时刻，到点才发 QR_REQ。
+    // = 本端时长门槛到期时刻，到点才发 QR_REQ。所有配对路径统一记录开始时刻，
+    // 兼作配对单槽超时释放的起点（canStartNewPairing 超 3 分钟未完成自动复位）。
     @Volatile var startedAtMs = -1L
     @Volatile var identityReadyAtMs = -1L
     // 扫码端上次回连发起时刻：常驻扫描回调高频到达（LOW_LATENCY 下每秒十余次），
@@ -215,6 +216,11 @@ object BleMesh {
     private const val QR_OFFER_PER_NAME_WINDOW_MS = 30_000L
     private const val QR_OFFER_SEEN_SOFT_CAP = 256
     private val qrOfferSeen = java.util.concurrent.ConcurrentHashMap<String, Pair<Int, Long>>()
+
+    /** 配对单槽超时：未完成配对超过该时长即视为僵死，`canStartNewPairing`
+     *  自动复位允许新配对（3 分钟足够完成扫码 + SAS 确认，不打扰进行中的
+     *  合法配对）。 */
+    private const val PAIRING_SLOT_TIMEOUT_MS = 3 * 60 * 1000L
 
     @SuppressLint("MissingPermission")
     fun init(context: Context) {
@@ -1045,11 +1051,23 @@ object BleMesh {
         runCatching { chat.dc.app.core.IrohNodeManager.invalidateNodeIdIndex() }
     }
 
-    /** 配对槽位互斥（P2-5/6）：同一时刻只允许一个活跃配对流程。 */
+    /** 配对槽位互斥（P2-5/6）：同一时刻只允许一个活跃配对流程。
+     *  未完成配对超过 [PAIRING_SLOT_TIMEOUT_MS] 仍未收尾（用户离开/扫码中断/
+     *  快连失败未重试等）视为僵死，自动释放单槽并允许新配对——避免一次没
+     *  做完的配对永久占用配对槽、后续配对全被拒。 */
     @Synchronized
     private fun canStartNewPairing(): Boolean {
-        val existing = pairingObj
-        return existing == null || existing.finished
+        val existing = pairingObj ?: return true
+        if (existing.finished) return true
+        val started = existing.startedAtMs
+        if (started >= 0 && System.currentTimeMillis() - started > PAIRING_SLOT_TIMEOUT_MS) {
+            android.util.Log.w(TAG, "配对超过 ${PAIRING_SLOT_TIMEOUT_MS / 1000}s 未完成，自动释放配对单槽")
+            existing.link?.closeLink()
+            pairingObj = null
+            _pairing.value = null
+            return true
+        }
+        return false
     }
 
     /** 出示页进入。[payload] = 本场动态码载荷（QR 快连用它应答 QR_DIAL/QR_REQ），
@@ -1091,6 +1109,7 @@ object BleMesh {
             this.token = token; this.bucket = bucket; this.bleId = bleId
             this.naddr = naddr
             this.expiresAtMs = expiresAtMs
+            startedAtMs = System.currentTimeMillis()
         }
         publishPairing()
     }
@@ -1114,6 +1133,7 @@ object BleMesh {
             this.bleId = bleId
             this.challenge = challenge
             this.identityReadyAtMs = identityReadyAtMs
+            startedAtMs = System.currentTimeMillis()
         }
         publishPairing()
     }
@@ -1138,6 +1158,7 @@ object BleMesh {
     }
 
     /** 本地点「一致」：立即本地 pin + 存联系人；host 生成并下发 S_i。 */
+    @Synchronized
     fun confirmSas() {
         val p = pairingObj?.takeIf { !it.finished && !it.localConfirmed } ?: return
         val context = ctx() ?: return // K2-9：shutdown 后静默退出

@@ -21,15 +21,26 @@ import java.io.File
 class DeliveryManagerHandleTest {
 
     companion object {
-        private const val LIB_DIR = "C:/Users/13682/cargo-target/dc-chat/debug"
+        /** 核心库所在目录。CI 可经 DC_CORE_LIB 环境变量（或 -Ddc.core.lib 系统属性）
+         *  注入 Linux 的 libdc_core.so 所在目录；未注入时回退本机 Windows 默认
+         *  构建路径。 */
+        private val LIB_DIR: String = run {
+            val injected = System.getenv("DC_CORE_LIB")?.takeIf { it.isNotBlank() }
+                ?: System.getProperty("dc.core.lib")?.takeIf { it.isNotBlank() }
+            injected ?: "C:/Users/13682/cargo-target/dc-chat/debug"
+        }
         private const val MINGW_BIN = "C:/Users/13682/msys64/mingw64/bin"
 
+        /** 当前平台的核心库文件名：Windows 为 dc_core.dll，Linux/macOS 为 libdc_core.so。 */
+        private val LIB_NAME =
+            if ((System.getProperty("os.name") ?: "").lowercase().contains("windows")) "dc_core.dll" else "libdc_core.so"
+
         init {
-            // 让 JNA 找到 dc_core.dll（及 OpenSSL 依赖库所在目录）
+            // 让 JNA 找到核心库（及 OpenSSL 依赖库所在目录）
             val dirs = listOf(LIB_DIR, MINGW_BIN).filter { File(it).isDirectory }
             System.setProperty("jna.library.path", dirs.joinToString(";"))
-            // 预加载 OpenSSL 依赖：Windows LoadLibrary 对依赖库按 PATH 解析，
-            // 先加载可避免 dc_core.dll 因依赖缺失而加载失败
+            // 预加载 OpenSSL 依赖（仅 Windows 需要）：Windows LoadLibrary 对依赖库
+            // 按 PATH 解析，先加载可避免 dc_core.dll 因依赖缺失而加载失败
             runCatching { com.sun.jna.Native.load("libcrypto-3-x64", com.sun.jna.Library::class.java) }
             runCatching { com.sun.jna.Native.load("libssl-3-x64", com.sun.jna.Library::class.java) }
         }
@@ -42,8 +53,8 @@ class DeliveryManagerHandleTest {
     @Before
     fun setUp() {
         assumeTrue(
-            "dc_core.dll 未构建（需先 cargo build -p dc-core --features ffi），跳过 native 用例",
-            File(LIB_DIR, "dc_core.dll").exists(),
+            "核心库未构建（需先 cargo build -p dc-core --features ffi；CI 可用 DC_CORE_LIB 注入 libdc_core.so 目录），跳过 native 用例",
+            File(LIB_DIR, LIB_NAME).exists(),
         )
         fail = false
         delivered.clear()
